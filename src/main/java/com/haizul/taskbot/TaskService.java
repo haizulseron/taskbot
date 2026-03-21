@@ -52,10 +52,18 @@ public class TaskService {
     public AddTaskRequest parseAddCommand(String rawInput) {
         String input = rawInput == null ? "" : rawInput.trim();
         if (input.isBlank()) {
-            throw new IllegalArgumentException("Use: /add title | priority | category | yyyy-MM-dd HH:mm | recurrence\n"
-                    + "Example: /add Submit report | high | school | 2026-03-25 20:00 | weekly");
+            throw new IllegalArgumentException(
+                    "Use /add followed by a task title. Send /add for examples."
+            );
         }
 
+        if (input.contains("|")) {
+            return parseLegacyAddCommand(input);
+        }
+
+        return parseNaturalAddCommand(input);
+    }
+    private AddTaskRequest parseLegacyAddCommand(String input) {
         String[] parts = input.split("\\|");
         String title = parts.length > 0 ? parts[0].trim() : "";
         if (title.isBlank()) {
@@ -80,6 +88,116 @@ public class TaskService {
                 : Task.Recurrence.NONE;
 
         return new AddTaskRequest(title, priority, category, dueAt, recurrence);
+    }
+
+    private AddTaskRequest parseNaturalAddCommand(String input) {
+        List<String> tokens = new ArrayList<>(Arrays.asList(input.split("\\s+")));
+        if (tokens.isEmpty()) {
+            throw new IllegalArgumentException("Task title cannot be empty.");
+        }
+
+        Task.Priority priority = Task.Priority.MEDIUM;
+        String category = DEFAULT_CATEGORY;
+        Task.Recurrence recurrence = Task.Recurrence.NONE;
+
+        List<String> titleTokens = new ArrayList<>();
+        List<String> dateTokens = new ArrayList<>();
+
+        Set<String> weekdayTokens = new HashSet<>(Arrays.asList(
+                "mon", "monday",
+                "tue", "tues", "tuesday",
+                "wed", "wednesday",
+                "thu", "thur", "thurs", "thursday",
+                "fri", "friday",
+                "sat", "saturday",
+                "sun", "sunday"
+        ));
+
+        for (int i = 0; i < tokens.size(); i++) {
+            String token = tokens.get(i);
+            String lower = token.toLowerCase(Locale.ROOT);
+
+            if (lower.startsWith("#") && lower.length() > 1) {
+                category = normalizeCategory(lower.substring(1));
+                continue;
+            }
+
+            if (lower.equals("!high") || lower.equals("!medium") || lower.equals("!low")) {
+                priority = Task.Priority.fromText(lower.substring(1));
+                continue;
+            }
+
+            if (lower.equals("every") && i + 1 < tokens.size()) {
+                String next = tokens.get(i + 1).toLowerCase(Locale.ROOT);
+                recurrence = switch (next) {
+                    case "day", "daily" -> Task.Recurrence.DAILY;
+                    case "week", "weekly" -> Task.Recurrence.WEEKLY;
+                    case "month", "monthly" -> Task.Recurrence.MONTHLY;
+                    default -> recurrence;
+                };
+                if (!next.equals("day") && !next.equals("daily")
+                        && !next.equals("week") && !next.equals("weekly")
+                        && !next.equals("month") && !next.equals("monthly")) {
+                    titleTokens.add(token);
+                } else {
+                    i++;
+                }
+                continue;
+            }
+
+            if (lower.equals("today") || lower.equals("tomorrow")) {
+                dateTokens.add(token);
+                if (i + 1 < tokens.size() && looksLikeTimeToken(tokens.get(i + 1))) {
+                    dateTokens.add(tokens.get(i + 1));
+                    i++;
+                }
+                continue;
+            }
+
+            if (weekdayTokens.contains(lower)) {
+                dateTokens.add(token);
+                if (i + 1 < tokens.size() && looksLikeTimeToken(tokens.get(i + 1))) {
+                    dateTokens.add(tokens.get(i + 1));
+                    i++;
+                }
+                continue;
+            }
+
+            if (looksLikeDateToken(token)) {
+                dateTokens.add(token);
+                if (i + 1 < tokens.size() && looksLikeTimeToken(tokens.get(i + 1))) {
+                    dateTokens.add(tokens.get(i + 1));
+                    i++;
+                }
+                continue;
+            }
+
+            titleTokens.add(token);
+        }
+
+        String title = String.join(" ", titleTokens).trim();
+        if (title.isBlank()) {
+            throw new IllegalArgumentException("Task title cannot be empty.");
+        }
+
+        LocalDateTime dueAt = null;
+        if (!dateTokens.isEmpty()) {
+            dueAt = parseDateTime(String.join(" ", dateTokens));
+        }
+
+        return new AddTaskRequest(title, priority, category, dueAt, recurrence);
+    }
+
+    private boolean looksLikeDateToken(String token) {
+        String value = token.toLowerCase(Locale.ROOT);
+        return value.matches("\\d{4}-\\d{2}-\\d{2}");
+    }
+
+    private boolean looksLikeTimeToken(String token) {
+        String value = token.toLowerCase(Locale.ROOT);
+        return value.matches("\\d{1,2}:\\d{2}")
+                || value.matches("\\d{1,2}(am|pm)")
+                || value.matches("\\d{1,2}:\\d{2}(am|pm)");
     }
 
     public Task createTask(long userId, long chatId, AddTaskRequest request) {
@@ -489,7 +607,7 @@ public class TaskService {
                 Available commands:
                 /start - intro
                 /help - command list
-                /add title | priority | category | yyyy-MM-dd HH:mm | recurrence
+                /add - show add examples
                 /tasks - active tasks
                 /today - tasks due today
                 /overdue - overdue tasks
@@ -503,8 +621,14 @@ public class TaskService {
                 /review - summary counts
                 /cancel - cancel the current edit prompt
 
-                Example:
-                /add Finish CPM assignment | high | school | 2026-03-25 20:00 | weekly
+                Add tasks in either of these styles:
+                /add Finish CPM assignment
+                /add Finish CPM assignment tomorrow 8pm
+                /add Finish CPM assignment #school !high tomorrow 8pm every week
+                /add Pay rent #finance 2026-03-25 09:00 every month
+
+                Legacy format still works:
+                /add Title | high | school | 2026-03-25 20:00 | weekly
                 """;
     }
 
@@ -713,20 +837,70 @@ public class TaskService {
     }
 
     private LocalDateTime parseDateTime(String input) {
+        String value = input.trim();
+        String lower = value.toLowerCase(Locale.ROOT);
+        LocalDate today = LocalDate.now(zoneId);
+
         try {
-            return LocalDateTime.parse(input, DATE_TIME_FORMATTER);
+            return LocalDateTime.parse(value, DATE_TIME_FORMATTER);
         } catch (DateTimeParseException ignored) {
         }
 
-        String lower = input.toLowerCase(Locale.ROOT);
-        LocalDate today = LocalDate.now(zoneId);
-        if (lower.startsWith("today ")) {
-            return LocalDateTime.of(today, parseTime(lower.substring(6)));
+        try {
+            LocalDate date = LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE);
+            return LocalDateTime.of(date, LocalTime.of(9, 0));
+        } catch (DateTimeParseException ignored) {
         }
-        if (lower.startsWith("tomorrow ")) {
-            return LocalDateTime.of(today.plusDays(1), parseTime(lower.substring(9)));
+
+        if (lower.startsWith("today")) {
+            String remainder = value.length() > 5 ? value.substring(5).trim() : "";
+            LocalTime time = remainder.isBlank() ? LocalTime.of(9, 0) : parseTime(remainder);
+            return LocalDateTime.of(today, time);
         }
-        throw new IllegalArgumentException("Invalid date format. Use yyyy-MM-dd HH:mm, or 'today HH:mm', or 'tomorrow HH:mm'. Use 'none' to clear.");
+
+        if (lower.startsWith("tomorrow")) {
+            String remainder = value.length() > 8 ? value.substring(8).trim() : "";
+            LocalTime time = remainder.isBlank() ? LocalTime.of(9, 0) : parseTime(remainder);
+            return LocalDateTime.of(today.plusDays(1), time);
+        }
+
+        LocalDate weekdayDate = tryParseWeekday(lower, today);
+        if (weekdayDate != null) {
+            String[] parts = value.split("\\s+", 2);
+            LocalTime time = parts.length > 1 ? parseTime(parts[1].trim()) : LocalTime.of(9, 0);
+            return LocalDateTime.of(weekdayDate, time);
+        }
+
+        throw new IllegalArgumentException(
+                "Invalid date format. Use yyyy-MM-dd HH:mm, yyyy-MM-dd, today 8pm, tomorrow 8pm, mon 3pm, or friday 14:00."
+        );
+    }
+
+    private LocalDate tryParseWeekday(String input, LocalDate today) {
+        String[] parts = input.split("\\s+", 2);
+        String day = parts[0];
+
+        int targetDay = switch (day) {
+            case "mon", "monday" -> 1;
+            case "tue", "tues", "tuesday" -> 2;
+            case "wed", "wednesday" -> 3;
+            case "thu", "thur", "thurs", "thursday" -> 4;
+            case "fri", "friday" -> 5;
+            case "sat", "saturday" -> 6;
+            case "sun", "sunday" -> 7;
+            default -> -1;
+        };
+
+        if (targetDay == -1) {
+            return null;
+        }
+
+        int todayValue = today.getDayOfWeek().getValue();
+        int daysAhead = (targetDay - todayValue + 7) % 7;
+        if (daysAhead == 0) {
+            daysAhead = 7;
+        }
+        return today.plusDays(daysAhead);
     }
 
     private LocalTime parseTime(String raw) {
