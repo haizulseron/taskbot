@@ -1,0 +1,26 @@
+# Maven
+/target/
+
+# IDE / editor
+/.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Secrets / local overrides
+.env
+application-local.properties
+src/main/resources/application-local.properties
+supervisor/taskbot.local.conf
+
+# Database
+*.db
+*.db-journal
+/data/
