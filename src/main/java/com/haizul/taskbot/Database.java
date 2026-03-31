@@ -17,8 +17,9 @@ public class Database {
     }
 
     public void initialize() {
-        try (Connection connection = getConnection(); Statement statement = connection.createStatement()) {
-            statement.executeUpdate("""
+        try (Connection c = getConnection(); Statement s = c.createStatement()) {
+
+            s.executeUpdate("""
                     CREATE TABLE IF NOT EXISTS tasks (
                         id TEXT PRIMARY KEY,
                         user_id INTEGER NOT NULL,
@@ -38,7 +39,7 @@ public class Database {
                     )
                     """);
 
-            statement.executeUpdate("""
+            s.executeUpdate("""
                     CREATE TABLE IF NOT EXISTS categories (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         user_id INTEGER NOT NULL,
@@ -47,8 +48,48 @@ public class Database {
                         UNIQUE(user_id, name)
                     )
                     """);
+
+            s.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS user_settings (
+                        user_id INTEGER PRIMARY KEY,
+                        quiet_start TEXT,
+                        quiet_end TEXT,
+                        weekly_digest INTEGER DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """);
+
+            s.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS templates (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        priority TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        recurrence TEXT NOT NULL,
+                        notes TEXT,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(user_id, name)
+                    )
+                    """);
+
         } catch (SQLException e) {
             throw new RuntimeException("Failed to initialize database", e);
+        }
+
+        // Safe column migrations — SQLite silently fails if column exists
+        migrate("ALTER TABLE tasks ADD COLUMN notes TEXT");
+        migrate("ALTER TABLE tasks ADD COLUMN reminder_interval_minutes INTEGER");
+        migrate("ALTER TABLE tasks ADD COLUMN repeat_reminder INTEGER DEFAULT 0");
+    }
+
+    private void migrate(String sql) {
+        try (Connection c = getConnection(); Statement s = c.createStatement()) {
+            s.executeUpdate(sql);
+        } catch (SQLException ignored) {
+            // Column already exists — safe to ignore
         }
     }
 }

@@ -15,13 +15,35 @@ public class ClaudeService {
 
     public record ParsedTask(
             String type,
+            // task creation
             String title,
             LocalDateTime dueAt,
             Task.Priority priority,
             String category,
             Task.Recurrence recurrence,
+            String notes,
+            // targeting a specific task
             String targetTitle,
+            // list filters (optional on any list_* intent)
+            String filterPriority,
+            String filterCategory,
+            String filterDueRange,
+            // snooze / reschedule
             int snoozeHours,
+            LocalDateTime newDueDate,
+            // search
+            String searchQuery,
+            // bulk actions
+            String bulkTarget,
+            String bulkOp,
+            // quiet hours
+            String quietStart,
+            String quietEnd,
+            // per-task reminder interval
+            int reminderIntervalMinutes,
+            // templates
+            String templateName,
+            // clarification for unknown
             String clarification
     ) {}
 
@@ -29,42 +51,71 @@ public class ClaudeService {
     private static final String MODEL   = "claude-haiku-4-5-20251001";
 
     private static final String SYSTEM_PROMPT = """
-            You are a smart task bot assistant. The user sends casual natural language messages.
-            Detect intent and respond ONLY with a JSON object — no explanation, no markdown, no backticks.
+            You are a smart task bot. Parse the user's message and return ONLY a JSON object — no markdown, no backticks.
 
-            Intent types and when to use them:
-            - "task"          : user wants to add a new task or reminder
-            - "list_tasks"    : user wants to see all active tasks ("show my tasks", "what do I have", "open tasks")
-            - "list_today"    : user wants tasks due today ("what's due today", "today's tasks")
-            - "list_overdue"  : user wants overdue tasks ("what's overdue", "what am I late on")
-            - "list_stale"    : user wants stale tasks ("what have I been ignoring", "stale tasks")
-            - "list_done"     : user wants completed tasks ("show done", "what did I finish")
-            - "list_categories": user wants to see their categories ("show categories", "my categories")
-            - "review"        : user wants a summary overview ("review", "how am I doing", "give me a summary")
-            - "mark_done"     : user wants to mark a specific task done ("mark gym as done", "finish the report task", "I did X")
-            - "mark_all_done" : user wants ALL tasks marked done ("clear everything", "mark all done", "reset my tasks", "I'm done with everything")
-            - "delete_all_done": user wants to delete/clear all completed tasks ("clear my done tasks", "wipe completed", "delete finished tasks")
-            - "delete_task"   : user wants to delete a specific task ("delete gym task", "remove the report", "drop X")
-            - "snooze_task"   : user wants to snooze a specific task ("snooze the report by 2 hours", "push gym to later")
-            - "unknown"       : message is unclear, a greeting, or unrelated to tasks
+            INTENT TYPES:
+            task          — add a new task/reminder
+            list_tasks    — show active tasks (optionally filtered)
+            list_today    — tasks due today
+            list_overdue  — overdue tasks
+            list_stale    — stale/ignored tasks
+            list_done     — completed tasks
+            list_categories — show categories
+            list_templates — show saved templates
+            review        — summary with productivity score and category breakdown
+            search_tasks  — search tasks by keyword
+            mark_done     — mark a specific task done
+            mark_all_done — mark ALL tasks done
+            delete_task   — delete a specific task
+            delete_all_done — delete all completed tasks
+            snooze_task   — snooze a specific task
+            reschedule_task — move a task to a new date/time
+            duplicate_task  — copy a task (optionally with new due date)
+            bulk_action   — act on a group (overdue/stale/all)
+            add_notes     — add/update notes on a task
+            set_reminder_interval — set how often a task reminds you
+            set_quiet_hours — configure no-reminder window
+            save_template — save a task as a reusable template
+            use_template  — create a task from a saved template
+            undo          — undo the last action
+            unknown       — unclear or unrelated message
 
-            JSON fields:
-            - type: one of the intent types above (string, required)
-            - title: for "task" — the task title (string or null)
-            - due_date: for "task" — ISO-8601 datetime like "2026-04-01T20:00:00", or null
-            - priority: for "task" — "high", "medium", or "low" (default "medium")
-            - category: for "task" — slug like "school", "finance", "work", or "none"
-            - recurrence: for "task" — "none", "daily", "weekly", or "monthly"
-            - target_title: for mark_done, delete_task, snooze_task — key words from the task title the user mentioned (string or null)
-            - snooze_hours: for snooze_task — number of hours to snooze (integer, default 24)
-            - clarification: if "unknown" — a short friendly reply; otherwise null
+            JSON FIELDS (include only what's relevant):
+            type                  string   required
+            title                 string   for "task"
+            due_date              string   ISO-8601 e.g. "2026-04-02T20:00:00", for "task", "use_template", "reschedule_task", "duplicate_task"
+            priority              string   "high"/"medium"/"low", for "task" (default "medium")
+            category              string   slug e.g. "school", "work", "none"
+            recurrence            string   "none"/"daily"/"weekly"/"monthly"
+            notes                 string   extra details, for "task" or "add_notes"
+            target_title          string   keywords from task title, for task-targeting intents
+            filter_priority       string   "high"/"medium"/"low", for list intents
+            filter_category       string   category name, for list intents
+            filter_due_range      string   "today"/"this_week"/"overdue", for list intents
+            snooze_hours          int      hours to snooze (default 24)
+            search_query          string   for "search_tasks"
+            bulk_target           string   "overdue"/"stale"/"all_done", for "bulk_action"
+            bulk_op               string   "snooze"/"delete"/"mark_done", for "bulk_action"
+            quiet_start           string   "HH:mm" e.g. "22:00"
+            quiet_end             string   "HH:mm" e.g. "07:00"
+            reminder_interval_minutes int  e.g. 30, 60, 120, for "set_reminder_interval"
+            template_name         string   for "save_template"/"use_template"
+            clarification         string   friendly reply only for "unknown"
 
-            Rules:
-            - "ASAP", "urgent", "important" → high priority
-            - "soon", "eventually", "whenever" → low priority
-            - "tonight", "this evening" = today ~8pm, "next week" = 7 days from now
-            - Greetings alone ("hi", "hello", "hey") → unknown with friendly clarification
-            - If the user says something like "could you open my tasks" or "can you show me what I have" → list_tasks
+            RULES:
+            - "ASAP"/"urgent" → high priority; "eventually"/"whenever" → low priority
+            - "tonight"/"this evening" = today ~20:00; "next week" = 7 days from now
+            - Greetings alone → unknown with friendly reply
+            - Filtered lists: e.g. "show high priority tasks" → list_tasks + filter_priority:"high"
+            - "show school tasks due this week" → list_tasks + filter_category:"school" + filter_due_range:"this_week"
+            - "move gym to tomorrow" → reschedule_task
+            - "copy the report task to next Monday" → duplicate_task
+            - "remind me about gym every 30 minutes" → set_reminder_interval + target_title:"gym" + reminder_interval_minutes:30
+            - "no reminders after 10pm until 7am" → set_quiet_hours + quiet_start:"22:00" + quiet_end:"07:00"
+            - "add a note to gym: bring water bottle" → add_notes
+            - "save gym as a template called daily workout" → save_template + target_title:"gym" + template_name:"daily workout"
+            - "use my daily workout template for tomorrow" → use_template + template_name:"daily workout" + due_date
+            - "undo" / "undo that" → undo
             """;
 
     private final String apiKey;
@@ -80,19 +131,15 @@ public class ClaudeService {
     }
 
     public ParsedTask parse(String userMessage) {
-        String now = LocalDateTime.now(zoneId)
-                .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
-
-        String userContent = "Today is " + now + " (" + zoneId + ").\n\nUser message: " + userMessage;
+        String now = LocalDateTime.now(zoneId).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
+        String userContent = "Today is " + now + " (" + zoneId + ").\n\nUser: " + userMessage;
 
         try {
             String requestBody = objectMapper.writeValueAsString(new java.util.LinkedHashMap<>() {{
                 put("model", MODEL);
-                put("max_tokens", 300);
+                put("max_tokens", 400);
                 put("system", SYSTEM_PROMPT);
-                put("messages", java.util.List.of(
-                        java.util.Map.of("role", "user", "content", userContent)
-                ));
+                put("messages", java.util.List.of(java.util.Map.of("role", "user", "content", userContent)));
             }});
 
             HttpRequest request = HttpRequest.newBuilder()
@@ -107,52 +154,66 @@ public class ClaudeService {
 
             if (response.statusCode() != 200) {
                 System.err.println("Claude API error " + response.statusCode() + ": " + response.body());
-                return unknown("Sorry, I couldn't reach the AI right now. Use /help for manual commands.");
+                return unknown("AI parser unavailable. Use /help for commands.");
             }
 
             JsonNode root   = objectMapper.readTree(response.body());
             String rawJson  = root.path("content").get(0).path("text").asText().trim();
             rawJson = rawJson.replaceAll("(?s)^```[a-zA-Z]*\\s*", "").replaceAll("(?s)```\\s*$", "").trim();
-            JsonNode parsed = objectMapper.readTree(rawJson);
+            JsonNode p = objectMapper.readTree(rawJson);
 
-            String type          = parsed.path("type").asText("unknown");
-            String title         = parsed.path("title").asText(null);
-            String dueDateStr    = parsed.path("due_date").asText(null);
-            String priorityStr   = parsed.path("priority").asText("medium");
-            String categoryStr   = parsed.path("category").asText("none");
-            String recurrenceStr = parsed.path("recurrence").asText("none");
-            String targetTitle   = parsed.path("target_title").asText(null);
-            int snoozeHours      = parsed.path("snooze_hours").asInt(24);
-            String clarification = parsed.path("clarification").asText(null);
-
+            String type = p.path("type").asText("unknown");
             if ("unknown".equals(type)) {
-                String msg = (clarification != null && !clarification.isBlank())
-                        ? clarification
-                        : "Not sure what you'd like to do. Use /help for all commands.";
-                return unknown(msg);
+                String msg = p.path("clarification").asText(null);
+                return unknown(msg != null && !msg.isBlank() ? msg : "Not sure what you'd like to do. Use /help.");
             }
 
-            LocalDateTime dueAt = null;
-            if (dueDateStr != null && !dueDateStr.isBlank() && !dueDateStr.equals("null")) {
-                try {
-                    dueAt = LocalDateTime.parse(dueDateStr, DateTimeFormatter.ISO_LOCAL_DATE_TIME);
-                } catch (Exception ignored) {}
-            }
+            LocalDateTime dueAt   = parseIsoDateTime(p.path("due_date").asText(null));
+            LocalDateTime newDue  = parseIsoDateTime(p.path("due_date").asText(null)); // reused for reschedule/duplicate
 
-            Task.Priority priority     = Task.Priority.fromText(priorityStr);
-            Task.Recurrence recurrence = Task.Recurrence.fromText(recurrenceStr);
-            String category            = (categoryStr == null || categoryStr.isBlank()) ? "none" : categoryStr;
-            String cleanTarget         = (targetTitle != null && !targetTitle.isBlank()) ? targetTitle.trim() : null;
-
-            return new ParsedTask(type, title, dueAt, priority, category, recurrence, cleanTarget, snoozeHours, null);
+            return new ParsedTask(
+                    type,
+                    nullIfBlank(p.path("title").asText(null)),
+                    dueAt,
+                    Task.Priority.fromText(p.path("priority").asText("medium")),
+                    nullIfBlank(p.path("category").asText("none")),
+                    Task.Recurrence.fromText(p.path("recurrence").asText("none")),
+                    nullIfBlank(p.path("notes").asText(null)),
+                    nullIfBlank(p.path("target_title").asText(null)),
+                    nullIfBlank(p.path("filter_priority").asText(null)),
+                    nullIfBlank(p.path("filter_category").asText(null)),
+                    nullIfBlank(p.path("filter_due_range").asText(null)),
+                    p.path("snooze_hours").asInt(24),
+                    newDue,
+                    nullIfBlank(p.path("search_query").asText(null)),
+                    nullIfBlank(p.path("bulk_target").asText(null)),
+                    nullIfBlank(p.path("bulk_op").asText(null)),
+                    nullIfBlank(p.path("quiet_start").asText(null)),
+                    nullIfBlank(p.path("quiet_end").asText(null)),
+                    p.path("reminder_interval_minutes").asInt(0),
+                    nullIfBlank(p.path("template_name").asText(null)),
+                    nullIfBlank(p.path("clarification").asText(null))
+            );
 
         } catch (Exception e) {
             System.err.println("ClaudeService.parse error: " + e.getMessage());
-            return unknown("Something went wrong. Use /help for manual commands.");
+            return unknown("Something went wrong. Use /help for commands.");
         }
     }
 
+    private LocalDateTime parseIsoDateTime(String s) {
+        if (s == null || s.isBlank() || s.equals("null")) return null;
+        try { return LocalDateTime.parse(s, DateTimeFormatter.ISO_LOCAL_DATE_TIME); } catch (Exception ignored) {}
+        return null;
+    }
+
+    private static String nullIfBlank(String s) {
+        return (s == null || s.isBlank() || s.equals("null")) ? null : s.trim();
+    }
+
     private static ParsedTask unknown(String clarification) {
-        return new ParsedTask("unknown", null, null, null, null, null, null, 0, clarification);
+        return new ParsedTask("unknown", null, null, null, null, null, null,
+                null, null, null, null, 0, null, null, null, null,
+                null, null, 0, null, clarification);
     }
 }

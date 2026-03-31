@@ -4,38 +4,28 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.time.Duration;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.LocalTime;
-import java.time.ZoneId;
+import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Locale;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 import java.util.stream.Collectors;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
 
 public class TaskService {
-    public record AddTaskRequest(String title,
-                                 Task.Priority priority,
-                                 String category,
-                                 LocalDateTime dueAt,
-                                 Task.Recurrence recurrence) {}
 
-    public record ReminderDue(Task task, int stage, String label) {}
+    public record AddTaskRequest(String title, Task.Priority priority, String category,
+                                 LocalDateTime dueAt, Task.Recurrence recurrence, String notes) {
+        public AddTaskRequest(String title, Task.Priority priority, String category,
+                              LocalDateTime dueAt, Task.Recurrence recurrence) {
+            this(title, priority, category, dueAt, recurrence, null);
+        }
+    }
 
+    public record ReminderDue(Task task, String label) {}
     public record UserChat(long userId, long chatId) {}
 
-    private static final DateTimeFormatter STORE_FORMATTER   = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
-    private static final DateTimeFormatter DISPLAY_FORMATTER = DateTimeFormatter.ofPattern("d MMM, HH:mm");
-    private static final DateTimeFormatter TIME_FORMATTER    = DateTimeFormatter.ofPattern("HH:mm");
+    private static final DateTimeFormatter STORE_FMT   = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+    private static final DateTimeFormatter DISPLAY_FMT = DateTimeFormatter.ofPattern("d MMM, HH:mm");
+    private static final DateTimeFormatter TIME_FMT    = DateTimeFormatter.ofPattern("HH:mm");
     private static final String DEFAULT_CATEGORY = "none";
 
     private final Database database;
@@ -52,171 +42,183 @@ public class TaskService {
 
     public AddTaskRequest parseAddCommand(String rawInput) {
         String input = rawInput == null ? "" : rawInput.trim();
-        if (input.isBlank()) {
-            throw new IllegalArgumentException("Use /add followed by a task title. Send /add for examples.");
-        }
-        return input.contains("|") ? parseLegacyAddCommand(input) : parseNaturalAddCommand(input);
+        if (input.isBlank()) throw new IllegalArgumentException("Use /add followed by a task title.");
+        return input.contains("|") ? parseLegacy(input) : parseNatural(input);
     }
 
-    private AddTaskRequest parseLegacyAddCommand(String input) {
-        String[] parts = input.split("\\|");
-        String title = parts.length > 0 ? parts[0].trim() : "";
+    private AddTaskRequest parseLegacy(String input) {
+        String[] p = input.split("\\|");
+        String title = p.length > 0 ? p[0].trim() : "";
         if (title.isBlank()) throw new IllegalArgumentException("Task title cannot be empty.");
-
-        Task.Priority priority   = parts.length > 1 && !parts[1].trim().isBlank() ? Task.Priority.fromText(parts[1]) : Task.Priority.MEDIUM;
-        String category          = parts.length > 2 && !parts[2].trim().isBlank() ? normalizeCategory(parts[2].trim()) : DEFAULT_CATEGORY;
-        LocalDateTime dueAt      = parts.length > 3 && !parts[3].trim().isBlank() ? parseDateTime(parts[3].trim()) : null;
-        Task.Recurrence recurrence = parts.length > 4 && !parts[4].trim().isBlank() ? Task.Recurrence.fromText(parts[4]) : Task.Recurrence.NONE;
-
-        return new AddTaskRequest(title, priority, category, dueAt, recurrence);
+        Task.Priority priority = p.length > 1 && !p[1].isBlank() ? Task.Priority.fromText(p[1]) : Task.Priority.MEDIUM;
+        String category        = p.length > 2 && !p[2].isBlank() ? normalizeCategory(p[2]) : DEFAULT_CATEGORY;
+        LocalDateTime dueAt    = p.length > 3 && !p[3].isBlank() ? parseDateTime(p[3].trim()) : null;
+        Task.Recurrence rec    = p.length > 4 && !p[4].isBlank() ? Task.Recurrence.fromText(p[4]) : Task.Recurrence.NONE;
+        return new AddTaskRequest(title, priority, category, dueAt, rec);
     }
 
-    private AddTaskRequest parseNaturalAddCommand(String input) {
+    private AddTaskRequest parseNatural(String input) {
         List<String> tokens = new ArrayList<>(Arrays.asList(input.split("\\s+")));
-        if (tokens.isEmpty()) throw new IllegalArgumentException("Task title cannot be empty.");
-
-        Task.Priority priority     = Task.Priority.MEDIUM;
-        String category            = DEFAULT_CATEGORY;
+        Task.Priority priority = Task.Priority.MEDIUM;
+        String category = DEFAULT_CATEGORY;
         Task.Recurrence recurrence = Task.Recurrence.NONE;
-        List<String> titleTokens   = new ArrayList<>();
-        List<String> dateTokens    = new ArrayList<>();
+        List<String> titleTokens = new ArrayList<>(), dateTokens = new ArrayList<>();
 
-        Set<String> weekdayTokens = new HashSet<>(Arrays.asList(
-                "mon", "monday", "tue", "tues", "tuesday", "wed", "wednesday",
-                "thu", "thur", "thurs", "thursday", "fri", "friday",
-                "sat", "saturday", "sun", "sunday"));
+        Set<String> weekdays = Set.of("mon","monday","tue","tues","tuesday","wed","wednesday",
+                "thu","thur","thurs","thursday","fri","friday","sat","saturday","sun","sunday");
 
         for (int i = 0; i < tokens.size(); i++) {
-            String token = tokens.get(i);
-            String lower = token.toLowerCase(Locale.ROOT);
-
+            String token = tokens.get(i), lower = token.toLowerCase(Locale.ROOT);
             if (lower.startsWith("#") && lower.length() > 1) { category = normalizeCategory(lower.substring(1)); continue; }
             if (lower.equals("!high") || lower.equals("!medium") || lower.equals("!low")) { priority = Task.Priority.fromText(lower.substring(1)); continue; }
-
             if (lower.equals("every") && i + 1 < tokens.size()) {
                 String next = tokens.get(i + 1).toLowerCase(Locale.ROOT);
                 recurrence = switch (next) {
-                    case "day", "daily"       -> Task.Recurrence.DAILY;
-                    case "week", "weekly"     -> Task.Recurrence.WEEKLY;
-                    case "month", "monthly"   -> Task.Recurrence.MONTHLY;
+                    case "day","daily" -> Task.Recurrence.DAILY;
+                    case "week","weekly" -> Task.Recurrence.WEEKLY;
+                    case "month","monthly" -> Task.Recurrence.MONTHLY;
                     default -> recurrence;
                 };
-                boolean consumed = List.of("day","daily","week","weekly","month","monthly").contains(next);
-                if (!consumed) titleTokens.add(token); else i++;
+                if (List.of("day","daily","week","weekly","month","monthly").contains(next)) i++;
+                else titleTokens.add(token);
                 continue;
             }
-
             if (lower.equals("today") || lower.equals("tomorrow")) {
                 dateTokens.add(token);
-                if (i + 1 < tokens.size() && looksLikeTimeToken(tokens.get(i + 1))) { dateTokens.add(tokens.get(++i)); }
+                if (i + 1 < tokens.size() && looksLikeTime(tokens.get(i + 1))) dateTokens.add(tokens.get(++i));
                 continue;
             }
-            if (weekdayTokens.contains(lower)) {
+            if (weekdays.contains(lower)) {
                 dateTokens.add(token);
-                if (i + 1 < tokens.size() && looksLikeTimeToken(tokens.get(i + 1))) { dateTokens.add(tokens.get(++i)); }
+                if (i + 1 < tokens.size() && looksLikeTime(tokens.get(i + 1))) dateTokens.add(tokens.get(++i));
                 continue;
             }
-            if (looksLikeDateToken(token)) {
+            if (looksLikeDate(token)) {
                 dateTokens.add(token);
-                if (i + 1 < tokens.size() && looksLikeTimeToken(tokens.get(i + 1))) { dateTokens.add(tokens.get(++i)); }
+                if (i + 1 < tokens.size() && looksLikeTime(tokens.get(i + 1))) dateTokens.add(tokens.get(++i));
                 continue;
             }
             titleTokens.add(token);
         }
-
         String title = String.join(" ", titleTokens).trim();
         if (title.isBlank()) throw new IllegalArgumentException("Task title cannot be empty.");
-
         LocalDateTime dueAt = dateTokens.isEmpty() ? null : parseDateTime(String.join(" ", dateTokens));
         return new AddTaskRequest(title, priority, category, dueAt, recurrence);
     }
 
-    private boolean looksLikeDateToken(String token) { return token.toLowerCase(Locale.ROOT).matches("\\d{4}-\\d{2}-\\d{2}"); }
-    private boolean looksLikeTimeToken(String token) {
-        String v = token.toLowerCase(Locale.ROOT);
+    private boolean looksLikeDate(String t) { return t.toLowerCase(Locale.ROOT).matches("\\d{4}-\\d{2}-\\d{2}"); }
+    private boolean looksLikeTime(String t) {
+        String v = t.toLowerCase(Locale.ROOT);
         return v.matches("\\d{1,2}:\\d{2}") || v.matches("\\d{1,2}(am|pm)") || v.matches("\\d{1,2}:\\d{2}(am|pm)");
     }
 
     // ── Task CRUD ────────────────────────────────────────────────────────────
 
-    public Task createTask(long userId, long chatId, AddTaskRequest request) {
-        String category = normalizeCategory(request.category());
+    public Task createTask(long userId, long chatId, AddTaskRequest req) {
+        String category = normalizeCategory(req.category());
         ensureCategoryExists(userId, category);
         LocalDateTime now = LocalDateTime.now(zoneId);
 
         Task task = new Task();
         task.setId(UUID.randomUUID().toString().replace("-", ""));
-        task.setUserId(userId);
-        task.setChatId(chatId);
-        task.setTitle(request.title().trim());
-        task.setPriority(request.priority());
-        task.setCategory(category);
-        task.setDueAt(request.dueAt());
-        task.setStatus(Task.Status.ACTIVE);
-        task.setRecurrence(request.recurrence());
-        task.setStaleAfterDays(defaultStaleDays);
-        task.setCreatedAt(now);
-        task.setUpdatedAt(now);
-        task.setReminderStage(0);
+        task.setUserId(userId); task.setChatId(chatId);
+        task.setTitle(req.title().trim()); task.setNotes(req.notes());
+        task.setPriority(req.priority()); task.setCategory(category);
+        task.setDueAt(req.dueAt()); task.setStatus(Task.Status.ACTIVE);
+        task.setRecurrence(req.recurrence()); task.setStaleAfterDays(defaultStaleDays);
+        task.setCreatedAt(now); task.setUpdatedAt(now); task.setReminderStage(0);
 
-        try (Connection connection = database.getConnection();
-             PreparedStatement statement = connection.prepareStatement("""
-                     INSERT INTO tasks (
-                         id, user_id, chat_id, title, priority, category, due_at, status, recurrence,
-                         stale_after_days, created_at, updated_at, reminder_stage, last_reminder_at, stale_notified_at
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("""
+                     INSERT INTO tasks (id,user_id,chat_id,title,priority,category,due_at,status,recurrence,
+                         stale_after_days,created_at,updated_at,reminder_stage,last_reminder_at,stale_notified_at,
+                         notes,reminder_interval_minutes,repeat_reminder)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                      """)) {
-            bindTask(statement, task);
-            statement.executeUpdate();
-        } catch (SQLException e) {
-            throw new RuntimeException("Failed to create task", e);
-        }
+            bindTask(s, task); s.executeUpdate();
+        } catch (SQLException e) { throw new RuntimeException("Failed to create task", e); }
         return task;
     }
 
+    public Task duplicateTask(long userId, long chatId, String hint, LocalDateTime newDueAt) {
+        Optional<Task> original = findTaskByTitleHint(userId, hint);
+        if (original.isEmpty()) return null;
+        Task orig = original.get();
+        AddTaskRequest req = new AddTaskRequest(
+                orig.getTitle(), orig.getPriority(), orig.getCategory(),
+                newDueAt != null ? newDueAt : orig.getDueAt(),
+                orig.getRecurrence(), orig.getNotes());
+        return createTask(userId, chatId, req);
+    }
+
     public List<Task> getActiveTasks(long userId) {
-        return queryTasks("SELECT * FROM tasks WHERE user_id = ? AND status = 'ACTIVE' ORDER BY CASE priority WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END, due_at IS NULL, due_at, created_at", userId);
+        return queryTasks("SELECT * FROM tasks WHERE user_id=? AND status='ACTIVE' ORDER BY CASE priority WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END, due_at IS NULL, due_at, created_at", userId);
+    }
+
+    public List<Task> getFilteredTasks(long userId, String priorityFilter, String categoryFilter, String dueRangeFilter) {
+        List<Task> tasks = getActiveTasks(userId);
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        LocalDate today = now.toLocalDate();
+
+        if (priorityFilter != null && !priorityFilter.isBlank()) {
+            Task.Priority p = Task.Priority.fromText(priorityFilter);
+            tasks = tasks.stream().filter(t -> t.getPriority() == p).collect(Collectors.toList());
+        }
+        if (categoryFilter != null && !categoryFilter.isBlank()) {
+            String cat = normalizeCategory(categoryFilter);
+            tasks = tasks.stream().filter(t -> cat.equals(t.getCategory())).collect(Collectors.toList());
+        }
+        if (dueRangeFilter != null) {
+            tasks = switch (dueRangeFilter.toLowerCase(Locale.ROOT)) {
+                case "today" -> tasks.stream().filter(t -> t.getDueAt() != null && t.getDueAt().toLocalDate().isEqual(today)).collect(Collectors.toList());
+                case "this_week" -> tasks.stream().filter(t -> t.getDueAt() != null && !t.getDueAt().toLocalDate().isBefore(today) && t.getDueAt().toLocalDate().isBefore(today.plusDays(7))).collect(Collectors.toList());
+                case "overdue" -> tasks.stream().filter(t -> t.getDueAt() != null && t.getDueAt().isBefore(now)).collect(Collectors.toList());
+                default -> tasks;
+            };
+        }
+        return tasks;
     }
 
     public List<Task> getTodayTasks(long userId) {
         LocalDate today = LocalDate.now(zoneId);
-        return getActiveTasks(userId).stream()
-                .filter(t -> t.getDueAt() != null && t.getDueAt().toLocalDate().isEqual(today))
-                .collect(Collectors.toList());
+        return getActiveTasks(userId).stream().filter(t -> t.getDueAt() != null && t.getDueAt().toLocalDate().isEqual(today)).collect(Collectors.toList());
     }
 
     public List<Task> getOverdueTasks(long userId) {
         LocalDateTime now = LocalDateTime.now(zoneId);
-        return getActiveTasks(userId).stream()
-                .filter(t -> t.getDueAt() != null && t.getDueAt().isBefore(now))
-                .sorted(Comparator.comparing(Task::getDueAt))
-                .collect(Collectors.toList());
+        return getActiveTasks(userId).stream().filter(t -> t.getDueAt() != null && t.getDueAt().isBefore(now)).sorted(Comparator.comparing(Task::getDueAt)).collect(Collectors.toList());
     }
 
     public List<Task> getStaleTasks(long userId) {
         LocalDateTime now = LocalDateTime.now(zoneId);
-        return getActiveTasks(userId).stream()
-                .filter(t -> isTaskStale(t, now))
-                .collect(Collectors.toList());
+        return getActiveTasks(userId).stream().filter(t -> isTaskStale(t, now)).collect(Collectors.toList());
     }
 
     public List<Task> getDoneTasks(long userId) {
-        return queryTasks("SELECT * FROM tasks WHERE user_id = ? AND status = 'DONE' ORDER BY updated_at DESC", userId);
+        return queryTasks("SELECT * FROM tasks WHERE user_id=? AND status='DONE' ORDER BY updated_at DESC", userId);
+    }
+
+    public List<Task> searchTasks(long userId, String query) {
+        if (query == null || query.isBlank()) return List.of();
+        String lower = query.toLowerCase(Locale.ROOT);
+        return queryTasks("SELECT * FROM tasks WHERE user_id=? AND status='ACTIVE'", userId).stream()
+                .filter(t -> t.getTitle().toLowerCase(Locale.ROOT).contains(lower)
+                        || (t.getNotes() != null && t.getNotes().toLowerCase(Locale.ROOT).contains(lower))
+                        || t.getCategory().toLowerCase(Locale.ROOT).contains(lower))
+                .collect(Collectors.toList());
     }
 
     public Optional<Task> findTaskByShortId(long userId, String shortId) {
         if (shortId == null || shortId.isBlank()) return Optional.empty();
-        return queryTasks("SELECT * FROM tasks WHERE user_id = ?", userId).stream()
-                .filter(t -> t.getId().startsWith(shortId.trim()))
-                .findFirst();
+        return queryTasks("SELECT * FROM tasks WHERE user_id=?", userId).stream()
+                .filter(t -> t.getId().startsWith(shortId.trim())).findFirst();
     }
 
     public Optional<Task> findTaskByTitleHint(long userId, String hint) {
         if (hint == null || hint.isBlank()) return Optional.empty();
         String lower = hint.toLowerCase(Locale.ROOT);
         return getActiveTasks(userId).stream()
-                .filter(t -> t.getTitle().toLowerCase(Locale.ROOT).contains(lower))
-                .findFirst();
+                .filter(t -> t.getTitle().toLowerCase(Locale.ROOT).contains(lower)).findFirst();
     }
 
     public boolean markDone(long userId, String shortId) {
@@ -225,29 +227,18 @@ public class TaskService {
         Task task = opt.get();
         LocalDateTime now = LocalDateTime.now(zoneId);
         updateTaskStatus(task.getId(), Task.Status.DONE, now);
-        if (task.getRecurrence() != Task.Recurrence.NONE) createNextRecurringTask(task, now);
+        if (task.getRecurrence() != Task.Recurrence.NONE) createNextRecurring(task, now);
         return true;
     }
 
     public int markAllDone(long userId) {
         List<Task> active = getActiveTasks(userId);
         LocalDateTime now = LocalDateTime.now(zoneId);
-        int count = 0;
-        for (Task task : active) {
-            updateTaskStatus(task.getId(), Task.Status.DONE, now);
-            if (task.getRecurrence() != Task.Recurrence.NONE) createNextRecurringTask(task, now);
-            count++;
+        for (Task t : active) {
+            updateTaskStatus(t.getId(), Task.Status.DONE, now);
+            if (t.getRecurrence() != Task.Recurrence.NONE) createNextRecurring(t, now);
         }
-        return count;
-    }
-
-    public int deleteAllDone(long userId) {
-        List<Task> done = getDoneTasks(userId);
-        LocalDateTime now = LocalDateTime.now(zoneId);
-        for (Task task : done) {
-            updateTaskStatus(task.getId(), Task.Status.DELETED, now);
-        }
-        return done.size();
+        return active.size();
     }
 
     public boolean deleteTask(long userId, String shortId) {
@@ -255,6 +246,13 @@ public class TaskService {
         if (opt.isEmpty()) return false;
         updateTaskStatus(opt.get().getId(), Task.Status.DELETED, LocalDateTime.now(zoneId));
         return true;
+    }
+
+    public int deleteAllDone(long userId) {
+        List<Task> done = getDoneTasks(userId);
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        done.forEach(t -> updateTaskStatus(t.getId(), Task.Status.DELETED, now));
+        return done.size();
     }
 
     public boolean snoozeTask(long userId, String shortId, Duration duration) {
@@ -265,30 +263,67 @@ public class TaskService {
         task.setDueAt(base.plus(duration));
         task.setUpdatedAt(LocalDateTime.now(zoneId));
         task.setReminderStage(0);
+        task.setLastReminderAt(null);
         updateTask(task);
         return true;
     }
 
+    /** Bulk snooze overdue tasks */
+    public int bulkSnoozeOverdue(long userId, int hours) {
+        List<Task> overdue = getOverdueTasks(userId);
+        Duration d = Duration.ofHours(hours);
+        for (Task t : overdue) snoozeTask(userId, t.shortId(), d);
+        return overdue.size();
+    }
+
+    /** Bulk delete stale tasks */
+    public int bulkDeleteStale(long userId) {
+        List<Task> stale = getStaleTasks(userId);
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        stale.forEach(t -> updateTaskStatus(t.getId(), Task.Status.DELETED, now));
+        return stale.size();
+    }
+
+    /** Bulk mark done by category */
+    public int bulkMarkDoneByCategory(long userId, String category) {
+        List<Task> tasks = getActiveTasks(userId).stream()
+                .filter(t -> t.getCategory().equals(normalizeCategory(category)))
+                .collect(Collectors.toList());
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        for (Task t : tasks) {
+            updateTaskStatus(t.getId(), Task.Status.DONE, now);
+            if (t.getRecurrence() != Task.Recurrence.NONE) createNextRecurring(t, now);
+        }
+        return tasks.size();
+    }
+
+    public boolean restoreTask(String taskId, Task.Status prevStatus, LocalDateTime prevDueAt) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("UPDATE tasks SET status=?, due_at=?, updated_at=?, reminder_stage=0 WHERE id=?")) {
+            s.setString(1, prevStatus.name());
+            s.setString(2, formatDateTime(prevDueAt));
+            s.setString(3, LocalDateTime.now(zoneId).toString());
+            s.setString(4, taskId);
+            return s.executeUpdate() > 0;
+        } catch (SQLException e) { throw new RuntimeException("Failed to restore task", e); }
+    }
+
+    // ── Task field updates ───────────────────────────────────────────────────
+
     public boolean updateTaskTitle(long userId, String shortId, String newTitle) {
         Optional<Task> opt = findTaskByShortId(userId, shortId);
         if (opt.isEmpty()) return false;
-        String title = newTitle == null ? "" : newTitle.trim();
-        if (title.isBlank()) throw new IllegalArgumentException("Task title cannot be empty.");
-        Task task = opt.get();
-        task.setTitle(title);
-        task.setUpdatedAt(LocalDateTime.now(zoneId));
-        updateTask(task);
-        return true;
+        String t = newTitle == null ? "" : newTitle.trim();
+        if (t.isBlank()) throw new IllegalArgumentException("Title cannot be empty.");
+        Task task = opt.get(); task.setTitle(t); task.setUpdatedAt(LocalDateTime.now(zoneId));
+        updateTask(task); return true;
     }
 
     public boolean updateTaskPriority(long userId, String shortId, String newPriority) {
         Optional<Task> opt = findTaskByShortId(userId, shortId);
         if (opt.isEmpty()) return false;
-        Task task = opt.get();
-        task.setPriority(Task.Priority.fromText(newPriority));
-        task.setUpdatedAt(LocalDateTime.now(zoneId));
-        updateTask(task);
-        return true;
+        Task task = opt.get(); task.setPriority(Task.Priority.fromText(newPriority));
+        task.setUpdatedAt(LocalDateTime.now(zoneId)); updateTask(task); return true;
     }
 
     public boolean updateTaskCategory(long userId, String shortId, String newCategory) {
@@ -296,52 +331,63 @@ public class TaskService {
         if (opt.isEmpty()) return false;
         String category = normalizeCategory(newCategory);
         ensureCategoryExists(userId, category);
-        Task task = opt.get();
-        task.setCategory(category);
-        task.setUpdatedAt(LocalDateTime.now(zoneId));
-        updateTask(task);
-        return true;
+        Task task = opt.get(); task.setCategory(category);
+        task.setUpdatedAt(LocalDateTime.now(zoneId)); updateTask(task); return true;
     }
 
     public boolean updateTaskDueAt(long userId, String shortId, String input) {
         Optional<Task> opt = findTaskByShortId(userId, shortId);
         if (opt.isEmpty()) return false;
         Task task = opt.get();
-        if (input == null || input.isBlank() || input.trim().equalsIgnoreCase("none") || input.trim().equalsIgnoreCase("clear")) {
+        if (input == null || input.isBlank() || input.equalsIgnoreCase("none") || input.equalsIgnoreCase("clear"))
             task.setDueAt(null);
-        } else {
-            task.setDueAt(parseDateTime(input.trim()));
-        }
-        task.setUpdatedAt(LocalDateTime.now(zoneId));
-        task.setReminderStage(0);
-        updateTask(task);
-        return true;
+        else task.setDueAt(parseDateTime(input.trim()));
+        task.setUpdatedAt(LocalDateTime.now(zoneId)); task.setReminderStage(0);
+        updateTask(task); return true;
+    }
+
+    public boolean updateTaskDueAtDirectly(long userId, String shortId, LocalDateTime newDueAt) {
+        Optional<Task> opt = findTaskByShortId(userId, shortId);
+        if (opt.isEmpty()) return false;
+        Task task = opt.get(); task.setDueAt(newDueAt);
+        task.setUpdatedAt(LocalDateTime.now(zoneId)); task.setReminderStage(0);
+        task.setLastReminderAt(null); updateTask(task); return true;
     }
 
     public boolean updateTaskRecurrence(long userId, String shortId, String input) {
         Optional<Task> opt = findTaskByShortId(userId, shortId);
         if (opt.isEmpty()) return false;
         Task task = opt.get();
-        String value = input == null ? "" : input.trim();
-        if (value.equalsIgnoreCase("clear")) value = "none";
-        task.setRecurrence(Task.Recurrence.fromText(value));
-        task.setUpdatedAt(LocalDateTime.now(zoneId));
-        updateTask(task);
-        return true;
+        String v = (input == null ? "" : input.trim()).equalsIgnoreCase("clear") ? "none" : (input == null ? "none" : input.trim());
+        task.setRecurrence(Task.Recurrence.fromText(v));
+        task.setUpdatedAt(LocalDateTime.now(zoneId)); updateTask(task); return true;
+    }
+
+    public boolean updateTaskNotes(long userId, String shortId, String notes) {
+        Optional<Task> opt = findTaskByShortId(userId, shortId);
+        if (opt.isEmpty()) return false;
+        Task task = opt.get(); task.setNotes(notes == null || notes.isBlank() ? null : notes.trim());
+        task.setUpdatedAt(LocalDateTime.now(zoneId)); updateTask(task); return true;
+    }
+
+    public boolean setReminderInterval(long userId, String shortId, int minutes) {
+        Optional<Task> opt = findTaskByShortId(userId, shortId);
+        if (opt.isEmpty()) return false;
+        Task task = opt.get();
+        task.setReminderIntervalMinutes(minutes > 0 ? minutes : null);
+        task.setUpdatedAt(LocalDateTime.now(zoneId)); updateTask(task); return true;
     }
 
     // ── Categories ───────────────────────────────────────────────────────────
 
     public List<String> getCategories(long userId) {
-        List<String> categories = new ArrayList<>();
+        List<String> list = new ArrayList<>();
         try (Connection c = database.getConnection();
-             PreparedStatement s = c.prepareStatement("SELECT name FROM categories WHERE user_id = ? ORDER BY name")) {
+             PreparedStatement s = c.prepareStatement("SELECT name FROM categories WHERE user_id=? ORDER BY name")) {
             s.setLong(1, userId);
-            try (ResultSet rs = s.executeQuery()) {
-                while (rs.next()) categories.add(rs.getString("name"));
-            }
+            try (ResultSet rs = s.executeQuery()) { while (rs.next()) list.add(rs.getString("name")); }
         } catch (SQLException e) { throw new RuntimeException("Failed to fetch categories", e); }
-        return categories;
+        return list;
     }
 
     public void addCategory(long userId, String name) { ensureCategoryExists(userId, normalizeCategory(name)); }
@@ -352,60 +398,140 @@ public class TaskService {
         ensureCategoryExists(userId, newCat);
         try (Connection c = database.getConnection()) {
             c.setAutoCommit(false);
-            try (PreparedStatement upd = c.prepareStatement("UPDATE tasks SET category = ?, updated_at = ? WHERE user_id = ? AND category = ?");
-                 PreparedStatement del = c.prepareStatement("DELETE FROM categories WHERE user_id = ? AND name = ?")) {
+            try (PreparedStatement upd = c.prepareStatement("UPDATE tasks SET category=?,updated_at=? WHERE user_id=? AND category=?");
+                 PreparedStatement del = c.prepareStatement("DELETE FROM categories WHERE user_id=? AND name=?")) {
                 upd.setString(1, newCat); upd.setString(2, LocalDateTime.now(zoneId).toString()); upd.setLong(3, userId); upd.setString(4, oldCat);
                 int updated = upd.executeUpdate();
                 del.setLong(1, userId); del.setString(2, oldCat); del.executeUpdate();
-                c.commit();
-                return updated > 0 || categoryExists(userId, newCat);
+                c.commit(); return updated > 0 || categoryExists(userId, newCat);
             } catch (SQLException e) { c.rollback(); throw e; } finally { c.setAutoCommit(true); }
         } catch (SQLException e) { throw new RuntimeException("Failed to rename category", e); }
     }
 
     public boolean deleteCategory(long userId, String categoryName) {
-        String category = normalizeCategory(categoryName);
-        if (DEFAULT_CATEGORY.equals(category)) return false;
+        String cat = normalizeCategory(categoryName);
+        if (DEFAULT_CATEGORY.equals(cat)) return false;
         try (Connection c = database.getConnection()) {
             c.setAutoCommit(false);
-            try (PreparedStatement upd = c.prepareStatement("UPDATE tasks SET category = ?, updated_at = ? WHERE user_id = ? AND category = ?");
-                 PreparedStatement del = c.prepareStatement("DELETE FROM categories WHERE user_id = ? AND name = ?")) {
-                upd.setString(1, DEFAULT_CATEGORY); upd.setString(2, LocalDateTime.now(zoneId).toString()); upd.setLong(3, userId); upd.setString(4, category);
+            try (PreparedStatement upd = c.prepareStatement("UPDATE tasks SET category=?,updated_at=? WHERE user_id=? AND category=?");
+                 PreparedStatement del = c.prepareStatement("DELETE FROM categories WHERE user_id=? AND name=?")) {
+                upd.setString(1, DEFAULT_CATEGORY); upd.setString(2, LocalDateTime.now(zoneId).toString()); upd.setLong(3, userId); upd.setString(4, cat);
                 int changed = upd.executeUpdate();
-                del.setLong(1, userId); del.setString(2, category); int deleted = del.executeUpdate();
-                c.commit();
-                return changed > 0 || deleted > 0;
+                del.setLong(1, userId); del.setString(2, cat); int deleted = del.executeUpdate();
+                c.commit(); return changed > 0 || deleted > 0;
             } catch (SQLException e) { c.rollback(); throw e; } finally { c.setAutoCommit(true); }
         } catch (SQLException e) { throw new RuntimeException("Failed to delete category", e); }
+    }
+
+    // ── User Settings ────────────────────────────────────────────────────────
+
+    public UserSettings getUserSettings(long userId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("SELECT * FROM user_settings WHERE user_id=?")) {
+            s.setLong(1, userId);
+            try (ResultSet rs = s.executeQuery()) {
+                if (rs.next()) return new UserSettings(userId, rs.getString("quiet_start"), rs.getString("quiet_end"), rs.getInt("weekly_digest") == 1);
+            }
+        } catch (SQLException e) { throw new RuntimeException("Failed to fetch user settings", e); }
+        return new UserSettings(userId, null, null, true);
+    }
+
+    public void saveUserSettings(long userId, String quietStart, String quietEnd) {
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("""
+                     INSERT INTO user_settings (user_id, quiet_start, quiet_end, weekly_digest, created_at, updated_at)
+                     VALUES (?, ?, ?, 1, ?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET quiet_start=excluded.quiet_start, quiet_end=excluded.quiet_end, updated_at=excluded.updated_at
+                     """)) {
+            s.setLong(1, userId); s.setString(2, quietStart); s.setString(3, quietEnd);
+            s.setString(4, now.toString()); s.setString(5, now.toString());
+            s.executeUpdate();
+        } catch (SQLException e) { throw new RuntimeException("Failed to save user settings", e); }
+    }
+
+    // ── Templates ────────────────────────────────────────────────────────────
+
+    public List<Template> getTemplates(long userId) {
+        List<Template> list = new ArrayList<>();
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("SELECT * FROM templates WHERE user_id=? ORDER BY name")) {
+            s.setLong(1, userId);
+            try (ResultSet rs = s.executeQuery()) {
+                while (rs.next()) list.add(new Template(
+                        rs.getInt("id"), userId, rs.getString("name"), rs.getString("title"),
+                        Task.Priority.fromText(rs.getString("priority")), rs.getString("category"),
+                        Task.Recurrence.fromText(rs.getString("recurrence")), rs.getString("notes")));
+            }
+        } catch (SQLException e) { throw new RuntimeException("Failed to fetch templates", e); }
+        return list;
+    }
+
+    public Optional<Template> findTemplate(long userId, String name) {
+        return getTemplates(userId).stream()
+                .filter(t -> t.getName().equalsIgnoreCase(name.trim())).findFirst();
+    }
+
+    public boolean saveTemplate(long userId, String hint, String templateName) {
+        Optional<Task> opt = findTaskByTitleHint(userId, hint);
+        if (opt.isEmpty()) return false;
+        Task task = opt.get();
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("""
+                     INSERT INTO templates (user_id, name, title, priority, category, recurrence, notes, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(user_id, name) DO UPDATE SET title=excluded.title, priority=excluded.priority,
+                         category=excluded.category, recurrence=excluded.recurrence, notes=excluded.notes
+                     """)) {
+            s.setLong(1, userId); s.setString(2, templateName.trim().toLowerCase());
+            s.setString(3, task.getTitle()); s.setString(4, task.getPriority().name());
+            s.setString(5, task.getCategory()); s.setString(6, task.getRecurrence().name());
+            s.setString(7, task.getNotes()); s.setString(8, now.toString());
+            s.executeUpdate();
+        } catch (SQLException e) { throw new RuntimeException("Failed to save template", e); }
+        return true;
+    }
+
+    public Task useTemplate(long userId, long chatId, String templateName, LocalDateTime dueAt) {
+        Optional<Template> opt = findTemplate(userId, templateName);
+        if (opt.isEmpty()) return null;
+        Template tmpl = opt.get();
+        AddTaskRequest req = new AddTaskRequest(tmpl.getTitle(), tmpl.getPriority(), tmpl.getCategory(), dueAt, tmpl.getRecurrence(), tmpl.getNotes());
+        return createTask(userId, chatId, req);
+    }
+
+    public boolean deleteTemplate(long userId, String name) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("DELETE FROM templates WHERE user_id=? AND name=?")) {
+            s.setLong(1, userId); s.setString(2, name.trim().toLowerCase());
+            return s.executeUpdate() > 0;
+        } catch (SQLException e) { throw new RuntimeException("Failed to delete template", e); }
     }
 
     // ── Formatting ───────────────────────────────────────────────────────────
 
     public String formatTask(Task task) {
-        String priorityEmoji = switch (task.getPriority()) {
-            case HIGH   -> "🔴";
-            case MEDIUM -> "🟡";
-            case LOW    -> "🟢";
-        };
-        String recur = task.getRecurrence() == Task.Recurrence.NONE ? "" : "  🔁 " + capitalize(task.getRecurrence().name());
-        String cat   = DEFAULT_CATEGORY.equals(task.getCategory()) ? "" : "  📁 " + task.getCategory();
-        String due   = task.getDueAt() == null ? "" : "  📅 " + formatDue(task.getDueAt());
-
-        return priorityEmoji + " " + task.getTitle()
-                + "\n" + cat + due + recur
+        String dot  = switch (task.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; };
+        String cat  = DEFAULT_CATEGORY.equals(task.getCategory()) ? "" : "  📁 " + task.getCategory();
+        String due  = task.getDueAt() == null ? "" : "  📅 " + friendlyDate(task.getDueAt());
+        String rec  = task.getRecurrence() == Task.Recurrence.NONE ? "" : "  🔁 " + capitalize(task.getRecurrence().name());
+        String notes = task.getNotes() != null ? "\n📝 " + task.getNotes() : "";
+        String interval = task.getReminderIntervalMinutes() != null
+                ? "  ⏱ every " + task.getReminderIntervalMinutes() + "min" : "";
+        return dot + " " + task.getTitle()
+                + "\n" + cat + due + rec + interval
+                + notes
                 + "\nID: " + task.shortId();
     }
 
-    public String formatDue(LocalDateTime dueAt) {
-        if (dueAt == null) return "—";
-        LocalDate today    = LocalDate.now(zoneId);
-        LocalDate tomorrow = today.plusDays(1);
-        LocalDate dueDate  = dueAt.toLocalDate();
-        String time        = dueAt.format(TIME_FORMATTER);
-
-        if (dueDate.isEqual(today))    return "Today, " + time;
-        if (dueDate.isEqual(tomorrow)) return "Tomorrow, " + time;
-        return dueAt.format(DISPLAY_FORMATTER);
+    public String friendlyDate(LocalDateTime dt) {
+        if (dt == null) return "—";
+        LocalDate today = LocalDate.now(zoneId), tomorrow = today.plusDays(1), date = dt.toLocalDate();
+        String time = dt.format(TIME_FMT);
+        if (date.isEqual(today))    return "Today, " + time;
+        if (date.isEqual(tomorrow)) return "Tomorrow, " + time;
+        return dt.format(DISPLAY_FMT);
     }
 
     public String getReviewSummary(long userId) {
@@ -415,84 +541,108 @@ public class TaskService {
         List<Task> stale   = getStaleTasks(userId);
         List<Task> done    = getDoneTasks(userId);
 
-        long high   = active.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
-        long medium = active.stream().filter(t -> t.getPriority() == Task.Priority.MEDIUM).count();
-        long low    = active.stream().filter(t -> t.getPriority() == Task.Priority.LOW).count();
+        long high = active.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
+        long med  = active.stream().filter(t -> t.getPriority() == Task.Priority.MEDIUM).count();
+        long low  = active.stream().filter(t -> t.getPriority() == Task.Priority.LOW).count();
 
-        return "📊 Your Review\n"
+        // Productivity score: done this week / (done + active this week)
+        LocalDateTime weekAgo = LocalDateTime.now(zoneId).minusDays(7);
+        long doneThisWeek    = done.stream().filter(t -> t.getUpdatedAt() != null && t.getUpdatedAt().isAfter(weekAgo)).count();
+        long createdThisWeek = active.stream().filter(t -> t.getCreatedAt() != null && t.getCreatedAt().isAfter(weekAgo)).count();
+        long total = doneThisWeek + createdThisWeek;
+        String score = total > 0 ? Math.round((doneThisWeek * 100.0) / total) + "%" : "N/A";
+
+        // Category breakdown
+        Map<String, Long> byCategory = active.stream()
+                .collect(Collectors.groupingBy(t -> t.getCategory() == null ? "none" : t.getCategory(), Collectors.counting()));
+        StringBuilder catBreakdown = new StringBuilder();
+        byCategory.entrySet().stream().sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                .forEach(e -> catBreakdown.append("  📁 ").append(e.getKey()).append(": ").append(e.getValue()).append("\n"));
+
+        return "📊 Review\n"
                 + "─────────────────\n"
-                + "Active:      " + active.size() + " task(s)\n"
-                + "  🔴 High    " + high + "\n"
-                + "  🟡 Medium  " + medium + "\n"
-                + "  🟢 Low     " + low + "\n"
+                + "Active:     " + active.size() + " task(s)\n"
+                + "  🔴 High   " + high + "\n"
+                + "  🟡 Medium " + med + "\n"
+                + "  🟢 Low    " + low + "\n"
                 + "─────────────────\n"
                 + "📅 Due today:  " + today.size() + "\n"
                 + "⚠️ Overdue:   " + overdue.size() + "\n"
                 + "🧊 Stale:     " + stale.size() + "\n"
-                + "✅ Done:      " + done.size();
+                + "✅ Done:      " + done.size() + "\n"
+                + "─────────────────\n"
+                + "📈 This week: " + score + " completion rate\n"
+                + (catBreakdown.length() > 0 ? "─────────────────\nBy category:\n" + catBreakdown : "");
     }
 
     public String buildMorningSummary(long userId) {
         List<Task> today   = getTodayTasks(userId);
         List<Task> overdue = getOverdueTasks(userId);
         List<Task> stale   = getStaleTasks(userId);
-
         StringBuilder sb = new StringBuilder();
-        sb.append("☀️ Good morning! Here's your day:\n")
-          .append("─────────────────\n")
+        sb.append("☀️ Good morning! Here's your day:\n─────────────────\n")
           .append("📅 Due today: ").append(today.size()).append("\n")
           .append("⚠️ Overdue:  ").append(overdue.size()).append("\n")
           .append("🧊 Stale:    ").append(stale.size()).append("\n");
-
         if (!today.isEmpty()) {
             sb.append("\nDue today:\n");
-            today.forEach(t -> sb.append("  ").append(priorityDot(t)).append(" ").append(t.getTitle())
-                    .append(t.getDueAt() != null ? " @ " + t.getDueAt().format(TIME_FORMATTER) : "").append("\n"));
+            today.forEach(t -> sb.append("  ").append(dot(t)).append(" ").append(t.getTitle())
+                    .append(t.getDueAt() != null ? " @ " + t.getDueAt().format(TIME_FMT) : "").append("\n"));
         }
         if (!overdue.isEmpty()) {
             sb.append("\nOverdue:\n");
-            overdue.forEach(t -> sb.append("  ").append(priorityDot(t)).append(" ").append(t.getTitle()).append("\n"));
+            overdue.forEach(t -> sb.append("  ").append(dot(t)).append(" ").append(t.getTitle()).append("\n"));
         }
         return sb.toString().trim();
     }
 
-    private String priorityDot(Task t) {
-        return switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; };
+    public String buildWeeklyDigest(long userId) {
+        LocalDateTime weekAgo = LocalDateTime.now(zoneId).minusDays(7);
+        List<Task> done   = getDoneTasks(userId).stream().filter(t -> t.getUpdatedAt() != null && t.getUpdatedAt().isAfter(weekAgo)).collect(Collectors.toList());
+        List<Task> active = getActiveTasks(userId);
+        List<Task> overdue = getOverdueTasks(userId);
+
+        long total = done.size() + active.size();
+        String score = total > 0 ? Math.round((done.size() * 100.0) / total) + "%" : "N/A";
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("📆 Weekly Digest\n─────────────────\n")
+          .append("✅ Completed this week: ").append(done.size()).append("\n")
+          .append("📋 Still active:        ").append(active.size()).append("\n")
+          .append("⚠️ Overdue:             ").append(overdue.size()).append("\n")
+          .append("📈 Completion rate:     ").append(score).append("\n");
+
+        if (!done.isEmpty()) {
+            sb.append("\nCompleted:\n");
+            done.stream().limit(10).forEach(t -> sb.append("  ✅ ").append(t.getTitle()).append("\n"));
+            if (done.size() > 10) sb.append("  ... and ").append(done.size() - 10).append(" more\n");
+        }
+        return sb.toString().trim();
     }
 
-    private static String capitalize(String s) {
-        if (s == null || s.isBlank()) return s;
-        return s.substring(0, 1).toUpperCase() + s.substring(1).toLowerCase();
-    }
+    private String dot(Task t) { return switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; }; }
 
     public static String usageText() {
         return """
                 Available commands:
-                /start — intro
-                /help — command list
-                /add — add a task (see examples)
-                /tasks — active tasks
-                /today — due today
-                /overdue — overdue tasks
-                /stale — stale tasks
-                /done <id> — mark done
-                /delete <id> — delete task
-                /snooze <id> <hours> — snooze task
-                /doneitems — completed tasks
-                /review — summary overview
-                /categories — manage categories
-                /addcategory <name> — add category
-                /cancel — cancel active edit
+                /start · /help · /add · /tasks · /today
+                /overdue · /stale · /doneitems · /cleardone
+                /review · /categories · /addcategory <n>
+                /done <id> · /delete <id> · /snooze <id> <h>
+                /search <query> · /templates · /cancel
 
-                💡 Or just type naturally — no commands needed!
-                e.g. "remind me to submit the report tomorrow 3pm"
-                     "show me my tasks"
-                     "mark the gym task as done"
-                     "clear everything"
+                💡 Or just talk naturally:
+                "show my high priority school tasks"
+                "move gym to tomorrow 9am"
+                "remind me about report every 30 minutes"
+                "no reminders after 10pm"
+                "save gym as a template called workout"
+                "search for school tasks"
+                "undo"
                 """;
     }
 
-    // ── Reminders / Scheduler ────────────────────────────────────────────────
+    // ── Scheduler support ────────────────────────────────────────────────────
 
     public List<UserChat> getKnownUserChats() {
         List<UserChat> pairs = new ArrayList<>();
@@ -507,15 +657,26 @@ public class TaskService {
 
     public List<ReminderDue> findDueReminders() {
         LocalDateTime now = LocalDateTime.now(zoneId);
-        List<Task> active = queryTasks("SELECT * FROM tasks WHERE status = 'ACTIVE' AND due_at IS NOT NULL", null);
+        List<Task> active = queryTasks("SELECT * FROM tasks WHERE status='ACTIVE' AND due_at IS NOT NULL", null);
         List<ReminderDue> due = new ArrayList<>();
+
         for (Task task : active) {
-            long mins = Duration.between(now, task.getDueAt()).toMinutes();
-            int stage = task.getReminderStage() == null ? 0 : task.getReminderStage();
-            if (stage < 1 && mins <= 1440 && mins > 120) due.add(new ReminderDue(task, 1, "Due within 24 hours"));
-            else if (stage < 2 && mins <= 120 && mins > 30) due.add(new ReminderDue(task, 2, "Due within 2 hours"));
-            else if (task.getPriority() == Task.Priority.HIGH && stage < 3 && mins <= 30 && mins >= -10)
-                due.add(new ReminderDue(task, 3, "High priority task due very soon"));
+            long minsUntilDue = Duration.between(now, task.getDueAt()).toMinutes();
+            // Only remind within 48h window, and not more than 1h after due (unless repeat)
+            if (minsUntilDue > 2880) continue;
+            if (minsUntilDue < -60 && !task.isRepeatReminder()) continue;
+
+            int intervalMins = task.effectiveReminderIntervalMinutes();
+            LocalDateTime lastReminded = task.getLastReminderAt() != null ? task.getLastReminderAt() : task.getCreatedAt();
+            long minsSinceLastReminder = Duration.between(lastReminded, now).toMinutes();
+
+            if (minsSinceLastReminder >= intervalMins) {
+                String label = minsUntilDue < 0 ? "Overdue"
+                        : minsUntilDue <= 30 ? "Due very soon (" + minsUntilDue + " min)"
+                        : minsUntilDue <= 120 ? "Due within 2 hours"
+                        : "Due within 24 hours";
+                due.add(new ReminderDue(task, label));
+            }
         }
         return due;
     }
@@ -523,57 +684,50 @@ public class TaskService {
     public void markReminderSent(String taskId, int stage) {
         LocalDateTime now = LocalDateTime.now(zoneId);
         try (Connection c = database.getConnection();
-             PreparedStatement s = c.prepareStatement("UPDATE tasks SET reminder_stage = ?, last_reminder_at = ? WHERE id = ?")) {
+             PreparedStatement s = c.prepareStatement("UPDATE tasks SET reminder_stage=?, last_reminder_at=? WHERE id=?")) {
             s.setInt(1, stage); s.setString(2, now.toString()); s.setString(3, taskId); s.executeUpdate();
         } catch (SQLException e) { throw new RuntimeException("Failed to mark reminder sent", e); }
     }
 
+    public void updateLastReminderAt(String taskId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("UPDATE tasks SET last_reminder_at=? WHERE id=?")) {
+            s.setString(1, LocalDateTime.now(zoneId).toString()); s.setString(2, taskId); s.executeUpdate();
+        } catch (SQLException e) { throw new RuntimeException("Failed to update last_reminder_at", e); }
+    }
+
     public List<Task> findStaleTasksNeedingPing() {
         LocalDateTime now = LocalDateTime.now(zoneId);
-        return queryTasks("SELECT * FROM tasks WHERE status = 'ACTIVE'", null).stream()
+        return queryTasks("SELECT * FROM tasks WHERE status='ACTIVE'", null).stream()
                 .filter(t -> isTaskStale(t, now))
                 .filter(t -> t.getStaleNotifiedAt() == null || t.getStaleNotifiedAt().toLocalDate().isBefore(now.toLocalDate()))
                 .collect(Collectors.toList());
     }
 
     public void markStalePinged(String taskId) {
-        LocalDateTime now = LocalDateTime.now(zoneId);
         try (Connection c = database.getConnection();
-             PreparedStatement s = c.prepareStatement("UPDATE tasks SET stale_notified_at = ? WHERE id = ?")) {
-            s.setString(1, now.toString()); s.setString(2, taskId); s.executeUpdate();
-        } catch (SQLException e) { throw new RuntimeException("Failed to mark stale ping", e); }
+             PreparedStatement s = c.prepareStatement("UPDATE tasks SET stale_notified_at=? WHERE id=?")) {
+            s.setString(1, LocalDateTime.now(zoneId).toString()); s.setString(2, taskId); s.executeUpdate();
+        } catch (SQLException e) { throw new RuntimeException("Failed to mark stale pinged", e); }
     }
 
     // ── Internals ────────────────────────────────────────────────────────────
 
-    private void createNextRecurringTask(Task completedTask, LocalDateTime now) {
-        if (completedTask.getDueAt() == null) return;
-        LocalDateTime nextDue = switch (completedTask.getRecurrence()) {
-            case DAILY   -> completedTask.getDueAt().plusDays(1);
-            case WEEKLY  -> completedTask.getDueAt().plusWeeks(1);
-            case MONTHLY -> completedTask.getDueAt().plusMonths(1);
+    private void createNextRecurring(Task completed, LocalDateTime now) {
+        if (completed.getDueAt() == null) return;
+        LocalDateTime nextDue = switch (completed.getRecurrence()) {
+            case DAILY   -> completed.getDueAt().plusDays(1);
+            case WEEKLY  -> completed.getDueAt().plusWeeks(1);
+            case MONTHLY -> completed.getDueAt().plusMonths(1);
             case NONE    -> null;
         };
         if (nextDue == null) return;
-
-        Task next = new Task();
-        next.setId(UUID.randomUUID().toString().replace("-", ""));
-        next.setUserId(completedTask.getUserId()); next.setChatId(completedTask.getChatId());
-        next.setTitle(completedTask.getTitle()); next.setPriority(completedTask.getPriority());
-        next.setCategory(completedTask.getCategory()); next.setDueAt(nextDue);
-        next.setStatus(Task.Status.ACTIVE); next.setRecurrence(completedTask.getRecurrence());
-        next.setStaleAfterDays(completedTask.getStaleAfterDays());
-        next.setCreatedAt(now); next.setUpdatedAt(now); next.setReminderStage(0);
-
-        try (Connection c = database.getConnection();
-             PreparedStatement s = c.prepareStatement("""
-                     INSERT INTO tasks (
-                         id, user_id, chat_id, title, priority, category, due_at, status, recurrence,
-                         stale_after_days, created_at, updated_at, reminder_stage, last_reminder_at, stale_notified_at
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                     """)) {
-            bindTask(s, next); s.executeUpdate();
-        } catch (SQLException e) { throw new RuntimeException("Failed to create recurring task", e); }
+        AddTaskRequest req = new AddTaskRequest(completed.getTitle(), completed.getPriority(),
+                completed.getCategory(), nextDue, completed.getRecurrence(), completed.getNotes());
+        Task next = createTask(completed.getUserId(), completed.getChatId(), req);
+        next.setReminderIntervalMinutes(completed.getReminderIntervalMinutes());
+        next.setRepeatReminder(completed.isRepeatReminder());
+        updateTask(next);
     }
 
     private boolean isTaskStale(Task task, LocalDateTime now) {
@@ -583,28 +737,28 @@ public class TaskService {
     }
 
     private void ensureCategoryExists(long userId, String category) {
-        String normalized = normalizeCategory(category);
-        if (normalized.isBlank() || DEFAULT_CATEGORY.equals(normalized)) return;
+        String norm = normalizeCategory(category);
+        if (norm.isBlank() || DEFAULT_CATEGORY.equals(norm)) return;
         try (Connection c = database.getConnection();
-             PreparedStatement s = c.prepareStatement("INSERT OR IGNORE INTO categories (user_id, name, created_at) VALUES (?, ?, ?)")) {
-            s.setLong(1, userId); s.setString(2, normalized); s.setString(3, LocalDateTime.now(zoneId).toString());
+             PreparedStatement s = c.prepareStatement("INSERT OR IGNORE INTO categories (user_id,name,created_at) VALUES (?,?,?)")) {
+            s.setLong(1, userId); s.setString(2, norm); s.setString(3, LocalDateTime.now(zoneId).toString());
             s.executeUpdate();
-        } catch (SQLException e) { throw new RuntimeException("Failed to ensure category exists", e); }
+        } catch (SQLException e) { throw new RuntimeException("Failed to ensure category", e); }
     }
 
     private boolean categoryExists(long userId, String category) {
         if (DEFAULT_CATEGORY.equals(category)) return true;
         try (Connection c = database.getConnection();
-             PreparedStatement s = c.prepareStatement("SELECT 1 FROM categories WHERE user_id = ? AND name = ? LIMIT 1")) {
+             PreparedStatement s = c.prepareStatement("SELECT 1 FROM categories WHERE user_id=? AND name=? LIMIT 1")) {
             s.setLong(1, userId); s.setString(2, category);
             try (ResultSet rs = s.executeQuery()) { return rs.next(); }
         } catch (SQLException e) { throw new RuntimeException("Failed to check category", e); }
     }
 
-    private List<Task> queryTasks(String sql, Long userIdOrNull) {
+    private List<Task> queryTasks(String sql, Long userId) {
         List<Task> tasks = new ArrayList<>();
         try (Connection c = database.getConnection(); PreparedStatement s = c.prepareStatement(sql)) {
-            if (userIdOrNull != null && sql.contains("user_id = ?")) s.setLong(1, userIdOrNull);
+            if (userId != null && sql.contains("user_id=?")) s.setLong(1, userId);
             try (ResultSet rs = s.executeQuery()) { while (rs.next()) tasks.add(mapTask(rs)); }
         } catch (SQLException e) { throw new RuntimeException("Failed to query tasks", e); }
         return tasks;
@@ -612,26 +766,33 @@ public class TaskService {
 
     private void updateTaskStatus(String taskId, Task.Status status, LocalDateTime updatedAt) {
         try (Connection c = database.getConnection();
-             PreparedStatement s = c.prepareStatement("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?")) {
-            s.setString(1, status.name()); s.setString(2, updatedAt.toString()); s.setString(3, taskId); s.executeUpdate();
+             PreparedStatement s = c.prepareStatement("UPDATE tasks SET status=?,updated_at=? WHERE id=?")) {
+            s.setString(1, status.name()); s.setString(2, updatedAt.toString()); s.setString(3, taskId);
+            s.executeUpdate();
         } catch (SQLException e) { throw new RuntimeException("Failed to update task status", e); }
     }
 
     private void updateTask(Task task) {
         try (Connection c = database.getConnection();
              PreparedStatement s = c.prepareStatement("""
-                     UPDATE tasks SET
-                         title = ?, priority = ?, category = ?, due_at = ?, status = ?, recurrence = ?,
-                         stale_after_days = ?, updated_at = ?, reminder_stage = ?, last_reminder_at = ?, stale_notified_at = ?
-                     WHERE id = ?
+                     UPDATE tasks SET title=?,priority=?,category=?,due_at=?,status=?,recurrence=?,
+                         stale_after_days=?,updated_at=?,reminder_stage=?,last_reminder_at=?,stale_notified_at=?,
+                         notes=?,reminder_interval_minutes=?,repeat_reminder=?
+                     WHERE id=?
                      """)) {
             s.setString(1, task.getTitle()); s.setString(2, task.getPriority().name());
             s.setString(3, task.getCategory()); s.setString(4, formatDateTime(task.getDueAt()));
             s.setString(5, task.getStatus().name()); s.setString(6, task.getRecurrence().name());
             s.setInt(7, task.getStaleAfterDays()); s.setString(8, task.getUpdatedAt().toString());
             s.setInt(9, task.getReminderStage() == null ? 0 : task.getReminderStage());
-            s.setString(10, formatDateTime(task.getLastReminderAt())); s.setString(11, formatDateTime(task.getStaleNotifiedAt()));
-            s.setString(12, task.getId()); s.executeUpdate();
+            s.setString(10, formatDateTime(task.getLastReminderAt()));
+            s.setString(11, formatDateTime(task.getStaleNotifiedAt()));
+            s.setString(12, task.getNotes());
+            if (task.getReminderIntervalMinutes() != null) s.setInt(13, task.getReminderIntervalMinutes());
+            else s.setNull(13, java.sql.Types.INTEGER);
+            s.setInt(14, task.isRepeatReminder() ? 1 : 0);
+            s.setString(15, task.getId());
+            s.executeUpdate();
         } catch (SQLException e) { throw new RuntimeException("Failed to update task", e); }
     }
 
@@ -641,36 +802,51 @@ public class TaskService {
         s.setString(6, task.getCategory()); s.setString(7, formatDateTime(task.getDueAt()));
         s.setString(8, task.getStatus().name()); s.setString(9, task.getRecurrence().name());
         s.setInt(10, task.getStaleAfterDays()); s.setString(11, task.getCreatedAt().toString());
-        s.setString(12, task.getUpdatedAt().toString()); s.setInt(13, task.getReminderStage() == null ? 0 : task.getReminderStage());
-        s.setString(14, formatDateTime(task.getLastReminderAt())); s.setString(15, formatDateTime(task.getStaleNotifiedAt()));
+        s.setString(12, task.getUpdatedAt().toString());
+        s.setInt(13, task.getReminderStage() == null ? 0 : task.getReminderStage());
+        s.setString(14, formatDateTime(task.getLastReminderAt()));
+        s.setString(15, formatDateTime(task.getStaleNotifiedAt()));
+        s.setString(16, task.getNotes());
+        if (task.getReminderIntervalMinutes() != null) s.setInt(17, task.getReminderIntervalMinutes());
+        else s.setNull(17, java.sql.Types.INTEGER);
+        s.setInt(18, task.isRepeatReminder() ? 1 : 0);
     }
 
     private Task mapTask(ResultSet rs) throws SQLException {
         Task task = new Task();
         task.setId(rs.getString("id")); task.setUserId(rs.getLong("user_id")); task.setChatId(rs.getLong("chat_id"));
         task.setTitle(rs.getString("title")); task.setPriority(Task.Priority.fromText(rs.getString("priority")));
-        task.setCategory(rs.getString("category")); task.setDueAt(parseStoredDateTime(rs.getString("due_at")));
+        task.setCategory(rs.getString("category")); task.setDueAt(parseDt(rs.getString("due_at")));
         task.setStatus(Task.Status.fromText(rs.getString("status"))); task.setRecurrence(Task.Recurrence.fromText(rs.getString("recurrence")));
-        task.setStaleAfterDays(rs.getInt("stale_after_days")); task.setCreatedAt(parseStoredDateTime(rs.getString("created_at")));
-        task.setUpdatedAt(parseStoredDateTime(rs.getString("updated_at"))); task.setReminderStage(rs.getInt("reminder_stage"));
-        task.setLastReminderAt(parseStoredDateTime(rs.getString("last_reminder_at")));
-        task.setStaleNotifiedAt(parseStoredDateTime(rs.getString("stale_notified_at")));
+        task.setStaleAfterDays(rs.getInt("stale_after_days")); task.setCreatedAt(parseDt(rs.getString("created_at")));
+        task.setUpdatedAt(parseDt(rs.getString("updated_at"))); task.setReminderStage(rs.getInt("reminder_stage"));
+        task.setLastReminderAt(parseDt(rs.getString("last_reminder_at")));
+        task.setStaleNotifiedAt(parseDt(rs.getString("stale_notified_at")));
+        try { task.setNotes(rs.getString("notes")); } catch (SQLException ignored) {}
+        try {
+            int rim = rs.getInt("reminder_interval_minutes");
+            task.setReminderIntervalMinutes(rs.wasNull() ? null : rim);
+        } catch (SQLException ignored) {}
+        try { task.setRepeatReminder(rs.getInt("repeat_reminder") == 1); } catch (SQLException ignored) {}
         return task;
     }
 
     private static String formatDateTime(LocalDateTime v) { return v == null ? null : v.toString(); }
-    private static LocalDateTime parseStoredDateTime(String v) { return (v == null || v.isBlank()) ? null : LocalDateTime.parse(v); }
-    private static String normalizeCategory(String category) {
-        if (category == null || category.isBlank()) return DEFAULT_CATEGORY;
-        String v = category.trim().toLowerCase(Locale.ROOT);
+    private static LocalDateTime parseDt(String v) { return (v == null || v.isBlank()) ? null : LocalDateTime.parse(v); }
+    private static String normalizeCategory(String c) {
+        if (c == null || c.isBlank()) return DEFAULT_CATEGORY;
+        String v = c.trim().toLowerCase(Locale.ROOT);
         return v.isBlank() ? DEFAULT_CATEGORY : v;
     }
-    private static String safe(String value) { return value == null || value.isBlank() ? DEFAULT_CATEGORY : value; }
+    private static String capitalize(String s) {
+        if (s == null || s.isBlank()) return s;
+        return s.substring(0, 1).toUpperCase() + s.substring(1).toLowerCase();
+    }
 
-    private LocalDateTime parseDateTime(String input) {
+    public LocalDateTime parseDateTime(String input) {
         String value = input.trim(), lower = value.toLowerCase(Locale.ROOT);
         LocalDate today = LocalDate.now(zoneId);
-        try { return LocalDateTime.parse(value, STORE_FORMATTER); } catch (DateTimeParseException ignored) {}
+        try { return LocalDateTime.parse(value, STORE_FMT); } catch (DateTimeParseException ignored) {}
         try { return LocalDateTime.of(LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE), LocalTime.of(9, 0)); } catch (DateTimeParseException ignored) {}
         if (lower.startsWith("today")) {
             String rem = value.length() > 5 ? value.substring(5).trim() : "";
@@ -691,13 +867,9 @@ public class TaskService {
     private LocalDate tryParseWeekday(String input, LocalDate today) {
         String day = input.split("\\s+", 2)[0];
         int target = switch (day) {
-            case "mon", "monday"                -> 1;
-            case "tue", "tues", "tuesday"       -> 2;
-            case "wed", "wednesday"             -> 3;
-            case "thu", "thur", "thurs", "thursday" -> 4;
-            case "fri", "friday"                -> 5;
-            case "sat", "saturday"              -> 6;
-            case "sun", "sunday"                -> 7;
+            case "mon","monday" -> 1; case "tue","tues","tuesday" -> 2;
+            case "wed","wednesday" -> 3; case "thu","thur","thurs","thursday" -> 4;
+            case "fri","friday" -> 5; case "sat","saturday" -> 6; case "sun","sunday" -> 7;
             default -> -1;
         };
         if (target == -1) return null;
@@ -706,10 +878,10 @@ public class TaskService {
     }
 
     private LocalTime parseTime(String raw) {
-        String value = raw.trim();
-        try { return LocalTime.parse(value); } catch (DateTimeParseException ignored) {}
-        try { return LocalTime.parse(value.toUpperCase(Locale.ROOT), DateTimeFormatter.ofPattern("h:mma")); } catch (DateTimeParseException ignored) {}
-        try { return LocalTime.parse(value.toUpperCase(Locale.ROOT), DateTimeFormatter.ofPattern("ha")); } catch (DateTimeParseException ignored) {}
+        String v = raw.trim();
+        try { return LocalTime.parse(v); } catch (DateTimeParseException ignored) {}
+        try { return LocalTime.parse(v.toUpperCase(Locale.ROOT), DateTimeFormatter.ofPattern("h:mma")); } catch (DateTimeParseException ignored) {}
+        try { return LocalTime.parse(v.toUpperCase(Locale.ROOT), DateTimeFormatter.ofPattern("ha")); } catch (DateTimeParseException ignored) {}
         throw new IllegalArgumentException("Invalid time format.");
     }
 }
