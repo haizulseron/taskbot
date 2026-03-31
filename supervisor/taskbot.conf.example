@@ -1,0 +1,10 @@
+[program:taskbot]
+directory=/home/user/projects/taskbot
+command=/usr/bin/java -jar /home/user/projects/taskbot/target/taskbot-1.0.0.jar
+autostart=true
+autorestart=true
+startsecs=5
+startretries=10
+stderr_logfile=/home/user/projects/taskbot/logs/taskbot.err.log
+stdout_logfile=/home/user/projects/taskbot/logs/taskbot.out.log
+environment=BOT_USERNAME="yourbotuser",BOT_TOKEN="your_tele_token",CLAUDE_API_KEY="your_claude_key",APP_TIMEZONE="timezone",APP_MORNING_SUMMARY_TIME="08:00",APP_SCHEDULER_INTERVAL_SECONDS="60",APP_DB_PATH="/home/user/projects/taskbot/data/taskbot.db",APP_DEFAULT_STALE_DAYS="3"
