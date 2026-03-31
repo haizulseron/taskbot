@@ -90,8 +90,10 @@ public class ClaudeService {
             }
 
             JsonNode root    = objectMapper.readTree(response.body());
-            String rawJson   = root.path("content").get(0).path("text").asText().trim();
-            JsonNode parsed  = objectMapper.readTree(rawJson);
+            String rawJson = root.path("content").get(0).path("text").asText().trim();
+            // Strip markdown code fences if Claude wraps the JSON in them
+            rawJson = rawJson.replaceAll("(?s)^```[a-zA-Z]*\\s*", "").replaceAll("(?s)```\\s*$", "").trim();
+            JsonNode parsed = objectMapper.readTree(rawJson);
 
             String type          = parsed.path("type").asText("unknown");
             String title         = parsed.path("title").asText("").trim();
