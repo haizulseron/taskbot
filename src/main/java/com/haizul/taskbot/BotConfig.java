@@ -12,6 +12,7 @@ import java.util.Properties;
 public class BotConfig {
     private final String botUsername;
     private final String botToken;
+    private final String claudeApiKey;
     private final ZoneId zoneId;
     private final LocalTime morningSummaryTime;
     private final int schedulerCheckIntervalSeconds;
@@ -20,6 +21,7 @@ public class BotConfig {
 
     private BotConfig(String botUsername,
                       String botToken,
+                      String claudeApiKey,
                       ZoneId zoneId,
                       LocalTime morningSummaryTime,
                       int schedulerCheckIntervalSeconds,
@@ -27,6 +29,7 @@ public class BotConfig {
                       int defaultStaleDays) {
         this.botUsername = botUsername;
         this.botToken = botToken;
+        this.claudeApiKey = claudeApiKey;
         this.zoneId = zoneId;
         this.morningSummaryTime = morningSummaryTime;
         this.schedulerCheckIntervalSeconds = schedulerCheckIntervalSeconds;
@@ -51,6 +54,10 @@ public class BotConfig {
         String botToken = firstNonBlank(
                 System.getenv("BOT_TOKEN"),
                 properties.getProperty("bot.token")
+        );
+        String claudeApiKey = firstNonBlank(
+                System.getenv("CLAUDE_API_KEY"),
+                properties.getProperty("claude.api.key")
         );
         String timezone = firstNonBlank(
                 System.getenv("APP_TIMEZONE"),
@@ -93,6 +100,7 @@ public class BotConfig {
         return new BotConfig(
                 botUsername.trim(),
                 botToken.trim(),
+                claudeApiKey != null ? claudeApiKey.trim() : null,
                 ZoneId.of(timezone.trim()),
                 LocalTime.parse(morningTime.trim()),
                 Integer.parseInt(checkInterval.trim()),
@@ -109,31 +117,12 @@ public class BotConfig {
         return value == null || value.trim().isEmpty();
     }
 
-    public String getBotUsername() {
-        return botUsername;
-    }
-
-    public String getBotToken() {
-        return botToken;
-    }
-
-    public ZoneId getZoneId() {
-        return zoneId;
-    }
-
-    public LocalTime getMorningSummaryTime() {
-        return morningSummaryTime;
-    }
-
-    public int getSchedulerCheckIntervalSeconds() {
-        return schedulerCheckIntervalSeconds;
-    }
-
-    public String getDbPath() {
-        return dbPath;
-    }
-
-    public int getDefaultStaleDays() {
-        return defaultStaleDays;
-    }
+    public String getBotUsername() { return botUsername; }
+    public String getBotToken()    { return botToken; }
+    public String getClaudeApiKey(){ return claudeApiKey; }
+    public ZoneId getZoneId()      { return zoneId; }
+    public LocalTime getMorningSummaryTime() { return morningSummaryTime; }
+    public int getSchedulerCheckIntervalSeconds() { return schedulerCheckIntervalSeconds; }
+    public String getDbPath()      { return dbPath; }
+    public int getDefaultStaleDays(){ return defaultStaleDays; }
 }

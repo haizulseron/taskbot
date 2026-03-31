@@ -38,13 +38,19 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
     private final TelegramClient telegramClient;
     private final TaskService taskService;
+    private final ClaudeService claudeService;
     private final String botUsername;
     private final Map<Long, PendingInput> pendingInputs = new ConcurrentHashMap<>();
 
     public TaskBot(BotConfig config, TaskService taskService) {
         this.telegramClient = new OkHttpTelegramClient(config.getBotToken());
-        this.taskService = taskService;
-        this.botUsername = config.getBotUsername();
+        this.taskService    = taskService;
+        this.botUsername    = config.getBotUsername();
+
+        String apiKey = config.getClaudeApiKey();
+        this.claudeService = (apiKey != null && !apiKey.isBlank() && !apiKey.equals("YOUR_CLAUDE_API_KEY"))
+                ? new ClaudeService(apiKey, config.getZoneId())
+                : null;
     }
 
     @Override
@@ -63,13 +69,8 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         }
     }
 
-    public TelegramClient getTelegramClient() {
-        return telegramClient;
-    }
-
-    public String getBotUsername() {
-        return botUsername;
-    }
+    public TelegramClient getTelegramClient() { return telegramClient; }
+    public String getBotUsername()            { return botUsername; }
 
     private void handleMessage(Update update) {
         long chatId = update.getMessage().getChatId();
@@ -122,17 +123,18 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
                     Legacy format still works:
                     /add Title | high | school | 2026-03-25 20:00 | weekly
+
+                    💡 Or just type naturally — no command needed!
+                    e.g. "remind me to submit the report tomorrow at 3pm"
                     """);
             return;
         }
         if (text.startsWith("/add ")) {
             String raw = text.substring(5).trim();
-
             if (raw.isEmpty()) {
                 sendText(chatId, "Please enter a task after /add");
                 return;
             }
-
             try {
                 TaskService.AddTaskRequest request = taskService.parseAddCommand(raw);
                 Task task = taskService.createTask(userId, chatId, request);
@@ -205,14 +207,50 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             return;
         }
 
-        sendText(chatId, "Unknown command. Use /help");
+        // Unknown slash command
+        if (text.startsWith("/")) {
+            sendText(chatId, "Unknown command. Use /help");
+            return;
+        }
+
+        // ── Plain text: route to Claude if available ──────────────────────────
+        if (claudeService != null) {
+            handleNaturalLanguage(chatId, userId, text);
+        } else {
+            sendText(chatId, "I didn't understand that. Use /help to see available commands.\n\n"
+                    + "💡 Tip: Set claude.api.key in application.properties to enable natural language input!");
+        }
+    }
+
+    private void handleNaturalLanguage(long chatId, long userId, String text) {
+        ClaudeService.ParsedTask parsed = claudeService.parse(text);
+
+        if (!"task".equals(parsed.type())) {
+            String reply = parsed.clarification() != null
+                    ? parsed.clarification()
+                    : "I'm not sure what you'd like to do. Use /help for available commands.";
+            sendText(chatId, reply);
+            return;
+        }
+
+        try {
+            TaskService.AddTaskRequest request = new TaskService.AddTaskRequest(
+                    parsed.title(),
+                    parsed.priority(),
+                    parsed.category(),
+                    parsed.dueAt(),
+                    parsed.recurrence()
+            );
+            Task task = taskService.createTask(userId, chatId, request);
+            sendTaskAdded(chatId, task);
+        } catch (Exception e) {
+            sendText(chatId, "I understood your task but couldn't save it. Try /add instead.");
+        }
     }
 
     private void handlePendingInput(long chatId, long userId, String text) {
         PendingInput pending = pendingInputs.get(userId);
-        if (pending == null) {
-            return;
-        }
+        if (pending == null) return;
 
         boolean ok;
         switch (pending.kind()) {
@@ -258,7 +296,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             editMessage(chatId, messageId, ok ? "✅ Task completed: " + taskId : "Task not found", null);
             return;
         }
-
         if (data.startsWith("delete:")) {
             String taskId = data.substring(7);
             boolean ok = taskService.deleteTask(userId, taskId);
@@ -266,7 +303,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             editMessage(chatId, messageId, ok ? "🗑 Task deleted: " + taskId : "Task not found", null);
             return;
         }
-
         if (data.startsWith("snooze24:")) {
             String taskId = data.substring(9);
             boolean ok = taskService.snoozeTask(userId, taskId, Duration.ofHours(24));
@@ -279,7 +315,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             }
             return;
         }
-
         if (data.startsWith("editmenu:")) {
             String taskId = data.substring(9);
             Optional<Task> task = taskService.findTaskByShortId(userId, taskId);
@@ -289,7 +324,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             }
             return;
         }
-
         if (data.startsWith("editback:")) {
             String taskId = data.substring(9);
             Optional<Task> task = taskService.findTaskByShortId(userId, taskId);
@@ -299,7 +333,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             }
             return;
         }
-
         if (data.startsWith("edittitle:")) {
             String taskId = data.substring(10);
             pendingInputs.put(userId, new PendingInput(PendingKind.TASK_TITLE, taskId));
@@ -307,7 +340,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             sendText(chatId, "Send the new task title. Use /cancel to stop.");
             return;
         }
-
         if (data.startsWith("editprio:")) {
             String taskId = data.substring(9);
             pendingInputs.put(userId, new PendingInput(PendingKind.TASK_PRIORITY, taskId));
@@ -315,7 +347,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             sendText(chatId, "Send the new priority: high, medium, or low. Use /cancel to stop.");
             return;
         }
-
         if (data.startsWith("editcat:")) {
             String taskId = data.substring(8);
             pendingInputs.put(userId, new PendingInput(PendingKind.TASK_CATEGORY, taskId));
@@ -323,7 +354,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             sendText(chatId, "Send the new category name. Use none to clear it. Use /cancel to stop.");
             return;
         }
-
         if (data.startsWith("editdue:")) {
             String taskId = data.substring(8);
             pendingInputs.put(userId, new PendingInput(PendingKind.TASK_DUE, taskId));
@@ -331,7 +361,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             sendText(chatId, "Send the new due date like 2026-03-25 20:00, today 8pm, tomorrow 8pm, or none. Use /cancel to stop.");
             return;
         }
-
         if (data.startsWith("editrecur:")) {
             String taskId = data.substring(10);
             pendingInputs.put(userId, new PendingInput(PendingKind.TASK_RECURRENCE, taskId));
@@ -339,7 +368,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             sendText(chatId, "Send the recurrence: none, daily, weekly, or monthly. Use /cancel to stop.");
             return;
         }
-
         if (data.startsWith("catedit:")) {
             String category = decodeValue(data.substring(8));
             pendingInputs.put(userId, new PendingInput(PendingKind.CATEGORY_RENAME, category));
@@ -347,7 +375,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             sendText(chatId, "Send the new name for category '" + category + "'. Use /cancel to stop.");
             return;
         }
-
         if (data.startsWith("catdelete:")) {
             String category = decodeValue(data.substring(10));
             boolean ok = taskService.deleteCategory(userId, category);
@@ -373,7 +400,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             sendText(chatId, title + "\n\nNo tasks found.");
             return;
         }
-
         for (int i = 0; i < tasks.size(); i++) {
             Task task = tasks.get(i);
             String text = (i == 0 ? title + "\n\n" : "") + taskService.formatTask(task);
@@ -392,7 +418,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             sendText(chatId, "No categories yet. Use /addcategory <name>");
             return;
         }
-
         sendText(chatId, "Categories");
         for (String category : categories) {
             SendMessage message = SendMessage.builder()
@@ -456,9 +481,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 .chatId(chatId)
                 .messageId(messageId)
                 .text(text);
-        if (keyboard != null) {
-            builder.replyMarkup(keyboard);
-        }
+        if (keyboard != null) builder.replyMarkup(keyboard);
         telegramClient.execute(builder.build());
     }
 

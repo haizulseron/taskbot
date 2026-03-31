@@ -14,9 +14,10 @@ Thumbs.db
 *.log
 logs/
 
-# Secrets / local overrides
+# Secrets / local overrides — NEVER commit these
 .env
 application-local.properties
+src/main/resources/application.properties
 src/main/resources/application-local.properties
 supervisor/taskbot.local.conf
 
