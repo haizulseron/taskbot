@@ -225,7 +225,23 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
             case "set_reminder_interval" -> {
                 if (p.targetTitle() == null) { sendText(chatId, "Which task?"); return; }
-                if (p.reminderIntervalMinutes() <= 0) { sendText(chatId, "How often (in minutes) should I remind you?"); return; }
+                if (p.reminderIntervalMinutes() <= 0) { sendText(chatId, "How often (in minutes)?"); return; }
+
+                // Handle group targets
+                List<Task> targets = switch (p.targetTitle().toUpperCase()) {
+                    case "ALL_OVERDUE" -> taskService.getOverdueTasks(userId);
+                    case "ALL_STALE"   -> taskService.getStaleTasks(userId);
+                    case "ALL_ACTIVE"  -> taskService.getActiveTasks(userId);
+                    default -> null;
+                };
+
+                if (targets != null) {
+                    targets.forEach(t -> taskService.setReminderInterval(userId, t.shortId(), p.reminderIntervalMinutes()));
+                    sendText(chatId, "⏱ Set reminder every " + p.reminderIntervalMinutes() + " min on " + targets.size() + " task(s).");
+                    return;
+                }
+
+                // Fall back to single task by title
                 taskService.findTaskByTitleHint(userId, p.targetTitle()).ifPresentOrElse(t -> {
                     taskService.setReminderInterval(userId, t.shortId(), p.reminderIntervalMinutes());
                     sendText(chatId, "⏱ Set reminder for \"" + t.getTitle() + "\" every " + p.reminderIntervalMinutes() + " min.");

@@ -116,6 +116,7 @@ public class ClaudeService {
             - "save gym as a template called daily workout" → save_template + target_title:"gym" + template_name:"daily workout"
             - "use my daily workout template for tomorrow" → use_template + template_name:"daily workout" + due_date
             - "undo" / "undo that" → undo
+            - "set reminder for all overdue/stale/active tasks" → set_reminder_interval, set target_title to "ALL_OVERDUE", "ALL_STALE", or "ALL_ACTIVE" respectively
             """;
 
     private final String apiKey;
