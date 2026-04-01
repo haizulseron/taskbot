@@ -192,9 +192,25 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             case "snooze_task" -> {
                 if (p.targetTitle() == null) { sendText(chatId, "Which task would you like to snooze?"); return; }
                 int hours = p.snoozeHours() > 0 ? p.snoozeHours() : 24;
+
+                // Group targets
+                List<Task> targets = switch (p.targetTitle().toUpperCase()) {
+                    case "ALL_OVERDUE" -> taskService.getOverdueTasks(userId);
+                    case "ALL_STALE"   -> taskService.getStaleTasks(userId);
+                    case "ALL_ACTIVE"  -> taskService.getActiveTasks(userId);
+                    default -> null;
+                };
+
+                if (targets != null) {
+                    targets.forEach(t -> taskService.snoozeTask(userId, t.shortId(), Duration.ofHours(hours)));
+                    sendText(chatId, "⏰ Snoozed " + targets.size() + " task(s) by " + hours + "h.");
+                    return;
+                }
+
+                // Single task by title
                 taskService.findTaskByTitleHint(userId, p.targetTitle()).ifPresentOrElse(
-                        t -> doSnooze(chatId, userId, t.shortId(), hours),
-                        () -> sendText(chatId, "Couldn't find \"" + p.targetTitle() + "\"."));
+                    t -> doSnooze(chatId, userId, t.shortId(), hours),
+                    () -> sendText(chatId, "Couldn't find \"" + p.targetTitle() + "\". Use /tasks to see your tasks."));
             }
 
             case "reschedule_task" -> {
