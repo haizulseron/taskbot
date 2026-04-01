@@ -18,7 +18,6 @@ public class Database {
 
     public void initialize() {
         try (Connection c = getConnection(); Statement s = c.createStatement()) {
-
             s.executeUpdate("""
                     CREATE TABLE IF NOT EXISTS tasks (
                         id TEXT PRIMARY KEY,
@@ -38,7 +37,6 @@ public class Database {
                         stale_notified_at TEXT
                     )
                     """);
-
             s.executeUpdate("""
                     CREATE TABLE IF NOT EXISTS categories (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,7 +46,6 @@ public class Database {
                         UNIQUE(user_id, name)
                     )
                     """);
-
             s.executeUpdate("""
                     CREATE TABLE IF NOT EXISTS user_settings (
                         user_id INTEGER PRIMARY KEY,
@@ -59,7 +56,6 @@ public class Database {
                         updated_at TEXT NOT NULL
                     )
                     """);
-
             s.executeUpdate("""
                     CREATE TABLE IF NOT EXISTS templates (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,22 +70,45 @@ public class Database {
                         UNIQUE(user_id, name)
                     )
                     """);
-
+            s.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS habit_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id TEXT NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        completed_at TEXT NOT NULL
+                    )
+                    """);
+            s.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS focus_sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        chat_id INTEGER NOT NULL,
+                        task_title TEXT NOT NULL,
+                        duration_minutes INTEGER NOT NULL,
+                        started_at TEXT NOT NULL,
+                        ends_at TEXT NOT NULL,
+                        completed INTEGER DEFAULT 0,
+                        notified INTEGER DEFAULT 0
+                    )
+                    """);
         } catch (SQLException e) {
             throw new RuntimeException("Failed to initialize database", e);
         }
 
-        // Safe column migrations — SQLite silently fails if column exists
+        // Safe migrations
         migrate("ALTER TABLE tasks ADD COLUMN notes TEXT");
         migrate("ALTER TABLE tasks ADD COLUMN reminder_interval_minutes INTEGER");
         migrate("ALTER TABLE tasks ADD COLUMN repeat_reminder INTEGER DEFAULT 0");
+        migrate("ALTER TABLE tasks ADD COLUMN is_habit INTEGER DEFAULT 0");
+        migrate("ALTER TABLE tasks ADD COLUMN reminder_ignored_count INTEGER DEFAULT 0");
+        migrate("ALTER TABLE tasks ADD COLUMN reminder_lat REAL");
+        migrate("ALTER TABLE tasks ADD COLUMN reminder_lng REAL");
+        migrate("ALTER TABLE tasks ADD COLUMN reminder_radius_meters INTEGER DEFAULT 200");
     }
 
     private void migrate(String sql) {
         try (Connection c = getConnection(); Statement s = c.createStatement()) {
             s.executeUpdate(sql);
-        } catch (SQLException ignored) {
-            // Column already exists — safe to ignore
-        }
+        } catch (SQLException ignored) {}
     }
 }

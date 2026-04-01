@@ -10,17 +10,19 @@ import java.util.concurrent.TimeUnit;
 public class SchedulerService {
     private final TaskService taskService;
     private final TaskBot taskBot;
+    private final ClaudeService claudeService;
     private final ZoneId zoneId;
     private final LocalTime morningSummaryTime;
     private final int intervalSeconds;
     private final ScheduledExecutorService executor;
-    private final Set<String> sentMorningKeys   = ConcurrentHashMap.newKeySet();
-    private final Set<String> sentWeeklyKeys    = ConcurrentHashMap.newKeySet();
+    private final Set<String> sentMorningKeys = ConcurrentHashMap.newKeySet();
+    private final Set<String> sentWeeklyKeys  = ConcurrentHashMap.newKeySet();
 
-    public SchedulerService(TaskService taskService, TaskBot taskBot, ZoneId zoneId,
-                            LocalTime morningSummaryTime, int intervalSeconds) {
+    public SchedulerService(TaskService taskService, TaskBot taskBot, ClaudeService claudeService,
+                            ZoneId zoneId, LocalTime morningSummaryTime, int intervalSeconds) {
         this.taskService        = taskService;
         this.taskBot            = taskBot;
+        this.claudeService      = claudeService;
         this.zoneId             = zoneId;
         this.morningSummaryTime = morningSummaryTime;
         this.intervalSeconds    = intervalSeconds;
@@ -40,24 +42,71 @@ public class SchedulerService {
     private void runCycle() {
         sendReminders();
         sendStaleTaskPings();
+        checkFocusSessions();
         sendMorningSummaries();
         sendWeeklyDigests();
         cleanupKeys();
     }
 
+    // ── Reminders ────────────────────────────────────────────────────────────
+
     private void sendReminders() {
         LocalTime now = LocalTime.now(zoneId);
         for (TaskService.ReminderDue reminder : taskService.findDueReminders()) {
             Task task = reminder.task();
-            // Respect quiet hours
             UserSettings settings = taskService.getUserSettings(task.getUserId());
-            if (settings.isQuietHour(now)) continue;
+            if (settings.isQuietHour(now)) {
+                // Still count as ignored so we don't increment the count unfairly
+                continue;
+            }
 
-            String text = "⏰ Reminder: " + reminder.label() + "\n\n" + taskService.formatTask(task);
-            taskBot.sendText(task.getChatId(), text);
+            int ignoredCount = task.getReminderIgnoredCount();
+
+            // Build reminder message — contextual if Claude available, escalating if ignored enough
+            String messageText = buildReminderText(task, reminder.label(), ignoredCount);
+            taskBot.sendText(task.getChatId(), messageText);
             taskService.updateLastReminderAt(task.getId());
+            taskService.incrementReminderIgnoredCount(task.getId());
         }
     }
+
+    private String buildReminderText(Task task, String label, int ignoredCount) {
+        String prefix;
+        if (ignoredCount >= 5) {
+            prefix = "🚨 URGENT — You've missed " + ignoredCount + " reminders for this task!";
+        } else if (ignoredCount >= 3) {
+            prefix = "⚠️ You've had " + ignoredCount + " reminders for this and haven't acted yet.";
+        } else {
+            prefix = "⏰ Reminder: " + label;
+        }
+
+        // Try to get a contextual motivating message from Claude
+        String contextualMsg = null;
+        if (claudeService != null) {
+            try {
+                contextualMsg = claudeService.generateReminderMessage(
+                        task.getTitle(), task.getPriority(), label, ignoredCount);
+            } catch (Exception ignored) {}
+        }
+
+        String baseText = prefix + "\n\n" + taskService.formatTask(task);
+        return contextualMsg != null ? baseText + "\n\n💬 " + contextualMsg : baseText;
+    }
+
+    // ── Focus sessions ───────────────────────────────────────────────────────
+
+    private void checkFocusSessions() {
+        for (FocusSession session : taskService.findUnnotifiedCompletedSessions()) {
+            String msg = "🎯 Focus session complete!\n\n"
+                    + "You focused on: " + session.getTaskTitle() + "\n"
+                    + "Duration: " + session.getDurationMinutes() + " minutes\n\n"
+                    + "Great work! Take a short break. 🌿";
+            taskBot.sendText(session.getChatId(), msg);
+            taskService.markFocusSessionNotified(session.getId());
+        }
+    }
+
+    // ── Stale tasks ──────────────────────────────────────────────────────────
 
     private void sendStaleTaskPings() {
         LocalTime now = LocalTime.now(zoneId);
@@ -71,9 +120,12 @@ public class SchedulerService {
         }
     }
 
+    // ── Morning summaries ────────────────────────────────────────────────────
+
     private void sendMorningSummaries() {
         LocalDateTime now = LocalDateTime.now(zoneId);
-        if (now.toLocalTime().isBefore(morningSummaryTime) || now.toLocalTime().isAfter(morningSummaryTime.plusMinutes(5))) return;
+        if (now.toLocalTime().isBefore(morningSummaryTime) ||
+                now.toLocalTime().isAfter(morningSummaryTime.plusMinutes(5))) return;
         for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
             String key = uc.userId() + ":morning:" + LocalDate.now(zoneId);
             if (sentMorningKeys.contains(key)) continue;
@@ -82,11 +134,13 @@ public class SchedulerService {
         }
     }
 
+    // ── Weekly digest ────────────────────────────────────────────────────────
+
     private void sendWeeklyDigests() {
         LocalDateTime now = LocalDateTime.now(zoneId);
-        // Send on Sunday at morning summary time
         if (now.getDayOfWeek() != DayOfWeek.SUNDAY) return;
-        if (now.toLocalTime().isBefore(morningSummaryTime) || now.toLocalTime().isAfter(morningSummaryTime.plusMinutes(5))) return;
+        if (now.toLocalTime().isBefore(morningSummaryTime) ||
+                now.toLocalTime().isAfter(morningSummaryTime.plusMinutes(5))) return;
         for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
             UserSettings settings = taskService.getUserSettings(uc.userId());
             if (!settings.isWeeklyDigest()) continue;

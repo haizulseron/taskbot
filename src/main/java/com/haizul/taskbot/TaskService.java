@@ -132,8 +132,9 @@ public class TaskService {
              PreparedStatement s = c.prepareStatement("""
                      INSERT INTO tasks (id,user_id,chat_id,title,priority,category,due_at,status,recurrence,
                          stale_after_days,created_at,updated_at,reminder_stage,last_reminder_at,stale_notified_at,
-                         notes,reminder_interval_minutes,repeat_reminder)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         notes,reminder_interval_minutes,repeat_reminder,is_habit,reminder_ignored_count,
+                         reminder_lat,reminder_lng,reminder_radius_meters)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                      """)) {
             bindTask(s, task); s.executeUpdate();
         } catch (SQLException e) { throw new RuntimeException("Failed to create task", e); }
@@ -227,6 +228,7 @@ public class TaskService {
         Task task = opt.get();
         LocalDateTime now = LocalDateTime.now(zoneId);
         updateTaskStatus(task.getId(), Task.Status.DONE, now);
+        if (task.isHabit()) logHabitCompletion(task.getId(), userId);
         if (task.getRecurrence() != Task.Recurrence.NONE) createNextRecurring(task, now);
         return true;
     }
@@ -513,14 +515,15 @@ public class TaskService {
 
     public String formatTask(Task task) {
         String dot  = switch (task.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; };
-        String cat  = DEFAULT_CATEGORY.equals(task.getCategory()) ? "" : "  📁 " + task.getCategory();
+        String cat  = "none".equals(task.getCategory()) ? "" : "  📁 " + task.getCategory();
         String due  = task.getDueAt() == null ? "" : "  📅 " + friendlyDate(task.getDueAt());
         String rec  = task.getRecurrence() == Task.Recurrence.NONE ? "" : "  🔁 " + capitalize(task.getRecurrence().name());
         String notes = task.getNotes() != null ? "\n📝 " + task.getNotes() : "";
-        String interval = task.getReminderIntervalMinutes() != null
-                ? "  ⏱ every " + task.getReminderIntervalMinutes() + "min" : "";
+        String interval = task.getReminderIntervalMinutes() != null ? "  ⏱ every " + task.getReminderIntervalMinutes() + "min" : "";
+        String habit = task.isHabit() ? "  🔄 Habit" : "";
+        String location = task.hasLocationReminder() ? "  📍 Location reminder" : "";
         return dot + " " + task.getTitle()
-                + "\n" + cat + due + rec + interval
+                + "\n" + cat + due + rec + interval + habit + location
                 + notes
                 + "\nID: " + task.shortId();
     }
@@ -559,6 +562,17 @@ public class TaskService {
         byCategory.entrySet().stream().sorted(Map.Entry.<String, Long>comparingByValue().reversed())
                 .forEach(e -> catBreakdown.append("  📁 ").append(e.getKey()).append(": ").append(e.getValue()).append("\n"));
 
+        // Habit streaks
+        List<Task> habits = getHabits(userId);
+        StringBuilder habitSection = new StringBuilder();
+        if (!habits.isEmpty()) {
+            habitSection.append("─────────────────\n🔄 Habits:\n");
+            habits.forEach(h -> {
+                int streak = getHabitStreak(h.getId());
+                habitSection.append("  ").append(h.getTitle()).append(": ").append(streak).append(" day streak\n");
+            });
+        }
+
         return "📊 Review\n"
                 + "─────────────────\n"
                 + "Active:     " + active.size() + " task(s)\n"
@@ -572,7 +586,8 @@ public class TaskService {
                 + "✅ Done:      " + done.size() + "\n"
                 + "─────────────────\n"
                 + "📈 This week: " + score + " completion rate\n"
-                + (catBreakdown.length() > 0 ? "─────────────────\nBy category:\n" + catBreakdown : "");
+                + (catBreakdown.length() > 0 ? "─────────────────\nBy category:\n" + catBreakdown : "")
+                + habitSection;
     }
 
     public String buildMorningSummary(long userId) {
@@ -627,7 +642,7 @@ public class TaskService {
                 Available commands:
                 /start · /help · /add · /tasks · /today
                 /overdue · /stale · /doneitems · /cleardone
-                /review · /categories · /addcategory <n>
+                /review · /habits · /categories · /addcategory <n>
                 /done <id> · /delete <id> · /snooze <id> <h>
                 /search <query> · /templates · /cancel
 
@@ -636,8 +651,11 @@ public class TaskService {
                 "move gym to tomorrow 9am"
                 "remind me about report every 30 minutes"
                 "no reminders after 10pm"
+                "mark gym as a habit"
+                "start a 25 min focus session for CEE report"
+                "change gym task to high priority"
+                "send me my location for the lab task reminder"
                 "save gym as a template called workout"
-                "search for school tasks"
                 "undo"
                 """;
     }
@@ -711,6 +729,180 @@ public class TaskService {
         } catch (SQLException e) { throw new RuntimeException("Failed to mark stale pinged", e); }
     }
 
+    // ── Habit tracking ───────────────────────────────────────────────────────
+
+    public boolean toggleHabit(long userId, String shortId, boolean enable) {
+        Optional<Task> opt = findTaskByShortId(userId, shortId);
+        if (opt.isEmpty()) return false;
+        Task task = opt.get();
+        task.setHabit(enable);
+        task.setUpdatedAt(LocalDateTime.now(zoneId));
+        updateTask(task);
+        return true;
+    }
+
+    public List<Task> getHabits(long userId) {
+        return getActiveTasks(userId).stream().filter(Task::isHabit).collect(Collectors.toList());
+    }
+
+    public void logHabitCompletion(String taskId, long userId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement(
+                     "INSERT INTO habit_logs (task_id, user_id, completed_at) VALUES (?, ?, ?)")) {
+            s.setString(1, taskId); s.setLong(2, userId);
+            s.setString(3, LocalDateTime.now(zoneId).toString());
+            s.executeUpdate();
+        } catch (SQLException e) { throw new RuntimeException("Failed to log habit", e); }
+    }
+
+    /** Returns the current consecutive-day streak for a habit task. */
+    public int getHabitStreak(String taskId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement(
+                     "SELECT completed_at FROM habit_logs WHERE task_id=? ORDER BY completed_at DESC")) {
+            s.setString(1, taskId);
+            try (ResultSet rs = s.executeQuery()) {
+                int streak = 0;
+                LocalDate expected = LocalDate.now(zoneId);
+                while (rs.next()) {
+                    LocalDate date = LocalDateTime.parse(rs.getString("completed_at")).toLocalDate();
+                    if (date.isEqual(expected) || date.isEqual(expected.minusDays(1))) {
+                        streak++; expected = date.minusDays(1);
+                    } else break;
+                }
+                return streak;
+            }
+        } catch (SQLException e) { return 0; }
+    }
+
+    // ── Focus sessions ───────────────────────────────────────────────────────
+
+    public FocusSession startFocusSession(long userId, long chatId, String taskTitle, int durationMinutes) {
+        // Cancel any existing session first
+        stopFocusSession(userId);
+        LocalDateTime now    = LocalDateTime.now(zoneId);
+        LocalDateTime endsAt = now.plusMinutes(durationMinutes);
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement(
+                     "INSERT INTO focus_sessions (user_id,chat_id,task_title,duration_minutes,started_at,ends_at,completed,notified) VALUES (?,?,?,?,?,?,0,0)")) {
+            s.setLong(1, userId); s.setLong(2, chatId);
+            s.setString(3, taskTitle); s.setInt(4, durationMinutes);
+            s.setString(5, now.toString()); s.setString(6, endsAt.toString());
+            s.executeUpdate();
+        } catch (SQLException e) { throw new RuntimeException("Failed to start focus session", e); }
+        return getActiveFocusSession(userId);
+    }
+
+    public boolean stopFocusSession(long userId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement(
+                     "UPDATE focus_sessions SET completed=1, notified=1 WHERE user_id=? AND completed=0")) {
+            s.setLong(1, userId);
+            return s.executeUpdate() > 0;
+        } catch (SQLException e) { throw new RuntimeException("Failed to stop focus session", e); }
+    }
+
+    public FocusSession getActiveFocusSession(long userId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement(
+                     "SELECT * FROM focus_sessions WHERE user_id=? AND completed=0 ORDER BY started_at DESC LIMIT 1")) {
+            s.setLong(1, userId);
+            try (ResultSet rs = s.executeQuery()) {
+                if (rs.next()) return mapFocusSession(rs);
+            }
+        } catch (SQLException e) { throw new RuntimeException("Failed to get focus session", e); }
+        return null;
+    }
+
+    public List<FocusSession> findUnnotifiedCompletedSessions() {
+        List<FocusSession> list = new ArrayList<>();
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement(
+                     "SELECT * FROM focus_sessions WHERE completed=0 AND notified=0 AND ends_at <= ?")) {
+            s.setString(1, now.toString());
+            try (ResultSet rs = s.executeQuery()) { while (rs.next()) list.add(mapFocusSession(rs)); }
+        } catch (SQLException e) { throw new RuntimeException("Failed to find completed sessions", e); }
+        return list;
+    }
+
+    public void markFocusSessionNotified(int sessionId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement(
+                     "UPDATE focus_sessions SET completed=1, notified=1 WHERE id=?")) {
+            s.setInt(1, sessionId); s.executeUpdate();
+        } catch (SQLException e) { throw new RuntimeException("Failed to mark session notified", e); }
+    }
+
+    private FocusSession mapFocusSession(ResultSet rs) throws SQLException {
+        return new FocusSession(
+                rs.getInt("id"), rs.getLong("user_id"), rs.getLong("chat_id"),
+                rs.getString("task_title"), rs.getInt("duration_minutes"),
+                LocalDateTime.parse(rs.getString("started_at")),
+                LocalDateTime.parse(rs.getString("ends_at")),
+                rs.getInt("completed") == 1, rs.getInt("notified") == 1);
+    }
+
+    // ── Location reminders ───────────────────────────────────────────────────
+
+    public boolean setLocationReminder(long userId, String shortId, double lat, double lng, int radiusMeters) {
+        Optional<Task> opt = findTaskByShortId(userId, shortId);
+        if (opt.isEmpty()) return false;
+        Task task = opt.get();
+        task.setReminderLat(lat); task.setReminderLng(lng);
+        task.setReminderRadiusMeters(radiusMeters);
+        task.setUpdatedAt(LocalDateTime.now(zoneId));
+        updateTask(task);
+        return true;
+    }
+
+    /** Returns tasks whose location reminder is triggered by the given coordinates. */
+    public List<Task> checkLocationTriggers(long userId, double lat, double lng) {
+        return getActiveTasks(userId).stream()
+                .filter(Task::hasLocationReminder)
+                .filter(t -> {
+                    int radius = t.getReminderRadiusMeters() != null ? t.getReminderRadiusMeters() : 200;
+                    return t.distanceMetersTo(lat, lng) <= radius;
+                })
+                .collect(Collectors.toList());
+    }
+
+    // ── Natural language field edit dispatch ─────────────────────────────────
+
+    /** Dispatches a field edit by name, used by the edit_task intent. Returns false if task not found or field unknown. */
+    public boolean editTaskField(long userId, String hint, String field, String value) {
+        Optional<Task> opt = findTaskByTitleHint(userId, hint);
+        if (opt.isEmpty()) return false;
+        String shortId = opt.get().shortId();
+        return switch (field.toLowerCase(Locale.ROOT)) {
+            case "title"      -> updateTaskTitle(userId, shortId, value);
+            case "priority"   -> updateTaskPriority(userId, shortId, value);
+            case "category"   -> updateTaskCategory(userId, shortId, value);
+            case "due", "due_date" -> updateTaskDueAt(userId, shortId, value);
+            case "recurrence" -> updateTaskRecurrence(userId, shortId, value);
+            case "notes"      -> updateTaskNotes(userId, shortId, value);
+            default -> false;
+        };
+    }
+
+    // ── Escalating reminders ─────────────────────────────────────────────────
+
+    public void incrementReminderIgnoredCount(String taskId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement(
+                     "UPDATE tasks SET reminder_ignored_count = reminder_ignored_count + 1 WHERE id=?")) {
+            s.setString(1, taskId); s.executeUpdate();
+        } catch (SQLException e) { throw new RuntimeException("Failed to increment ignored count", e); }
+    }
+
+    public void resetReminderIgnoredCount(String taskId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement(
+                     "UPDATE tasks SET reminder_ignored_count = 0 WHERE id=?")) {
+            s.setString(1, taskId); s.executeUpdate();
+        } catch (SQLException e) { throw new RuntimeException("Failed to reset ignored count", e); }
+    }
+
     // ── Internals ────────────────────────────────────────────────────────────
 
     private void createNextRecurring(Task completed, LocalDateTime now) {
@@ -777,7 +969,8 @@ public class TaskService {
              PreparedStatement s = c.prepareStatement("""
                      UPDATE tasks SET title=?,priority=?,category=?,due_at=?,status=?,recurrence=?,
                          stale_after_days=?,updated_at=?,reminder_stage=?,last_reminder_at=?,stale_notified_at=?,
-                         notes=?,reminder_interval_minutes=?,repeat_reminder=?
+                         notes=?,reminder_interval_minutes=?,repeat_reminder=?,is_habit=?,reminder_ignored_count=?,
+                         reminder_lat=?,reminder_lng=?,reminder_radius_meters=?
                      WHERE id=?
                      """)) {
             s.setString(1, task.getTitle()); s.setString(2, task.getPriority().name());
@@ -791,7 +984,15 @@ public class TaskService {
             if (task.getReminderIntervalMinutes() != null) s.setInt(13, task.getReminderIntervalMinutes());
             else s.setNull(13, java.sql.Types.INTEGER);
             s.setInt(14, task.isRepeatReminder() ? 1 : 0);
-            s.setString(15, task.getId());
+            s.setInt(15, task.isHabit() ? 1 : 0);
+            s.setInt(16, task.getReminderIgnoredCount());
+            if (task.getReminderLat() != null) s.setDouble(17, task.getReminderLat());
+            else s.setNull(17, java.sql.Types.REAL);
+            if (task.getReminderLng() != null) s.setDouble(18, task.getReminderLng());
+            else s.setNull(18, java.sql.Types.REAL);
+            if (task.getReminderRadiusMeters() != null) s.setInt(19, task.getReminderRadiusMeters());
+            else s.setNull(19, java.sql.Types.INTEGER);
+            s.setString(20, task.getId());
             s.executeUpdate();
         } catch (SQLException e) { throw new RuntimeException("Failed to update task", e); }
     }
@@ -810,6 +1011,14 @@ public class TaskService {
         if (task.getReminderIntervalMinutes() != null) s.setInt(17, task.getReminderIntervalMinutes());
         else s.setNull(17, java.sql.Types.INTEGER);
         s.setInt(18, task.isRepeatReminder() ? 1 : 0);
+        s.setInt(19, task.isHabit() ? 1 : 0);
+        s.setInt(20, task.getReminderIgnoredCount());
+        if (task.getReminderLat() != null) s.setDouble(21, task.getReminderLat());
+        else s.setNull(21, java.sql.Types.REAL);
+        if (task.getReminderLng() != null) s.setDouble(22, task.getReminderLng());
+        else s.setNull(22, java.sql.Types.REAL);
+        if (task.getReminderRadiusMeters() != null) s.setInt(23, task.getReminderRadiusMeters());
+        else s.setNull(23, java.sql.Types.INTEGER);
     }
 
     private Task mapTask(ResultSet rs) throws SQLException {
@@ -823,11 +1032,13 @@ public class TaskService {
         task.setLastReminderAt(parseDt(rs.getString("last_reminder_at")));
         task.setStaleNotifiedAt(parseDt(rs.getString("stale_notified_at")));
         try { task.setNotes(rs.getString("notes")); } catch (SQLException ignored) {}
-        try {
-            int rim = rs.getInt("reminder_interval_minutes");
-            task.setReminderIntervalMinutes(rs.wasNull() ? null : rim);
-        } catch (SQLException ignored) {}
+        try { int rim = rs.getInt("reminder_interval_minutes"); task.setReminderIntervalMinutes(rs.wasNull() ? null : rim); } catch (SQLException ignored) {}
         try { task.setRepeatReminder(rs.getInt("repeat_reminder") == 1); } catch (SQLException ignored) {}
+        try { task.setHabit(rs.getInt("is_habit") == 1); } catch (SQLException ignored) {}
+        try { task.setReminderIgnoredCount(rs.getInt("reminder_ignored_count")); } catch (SQLException ignored) {}
+        try { double lat = rs.getDouble("reminder_lat"); if (!rs.wasNull()) task.setReminderLat(lat); } catch (SQLException ignored) {}
+        try { double lng = rs.getDouble("reminder_lng"); if (!rs.wasNull()) task.setReminderLng(lng); } catch (SQLException ignored) {}
+        try { int rad = rs.getInt("reminder_radius_meters"); if (!rs.wasNull()) task.setReminderRadiusMeters(rad); } catch (SQLException ignored) {}
         return task;
     }
 

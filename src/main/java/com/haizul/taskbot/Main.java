@@ -10,12 +10,20 @@ public class Main {
         database.initialize();
 
         TaskService taskService = new TaskService(database, config.getZoneId(), config.getDefaultStaleDays());
-        TaskBot taskBot = new TaskBot(config, taskService);
+
+        String claudeKey = config.getClaudeApiKey();
+        ClaudeService claudeService = (claudeKey != null && !claudeKey.isBlank() && !claudeKey.equals("YOUR_CLAUDE_API_KEY"))
+                ? new ClaudeService(claudeKey, config.getZoneId()) : null;
+
+        String whisperKey = config.getWhisperApiKey();
+        WhisperService whisperService = (whisperKey != null && !whisperKey.isBlank() && !whisperKey.equals("YOUR_WHISPER_API_KEY"))
+                ? new WhisperService(whisperKey, config.getBotToken()) : null;
+
+        TaskBot taskBot = new TaskBot(config, taskService, claudeService, whisperService);
+
         SchedulerService schedulerService = new SchedulerService(
-                taskService,
-                taskBot,
-                config.getZoneId(),
-                config.getMorningSummaryTime(),
+                taskService, taskBot, claudeService,
+                config.getZoneId(), config.getMorningSummaryTime(),
                 config.getSchedulerCheckIntervalSeconds()
         );
 

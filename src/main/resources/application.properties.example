@@ -1,12 +1,16 @@
-# Copy this file to application.properties and fill in your values.
+# Copy this to application.properties and fill in your values.
 # application.properties is gitignored — never commit it.
 
 # Telegram bot settings
 bot.username=YOUR_BOT_USERNAME
 bot.token=YOUR_BOT_TOKEN
 
-# Anthropic Claude API key (get from https://console.anthropic.com)
+# Anthropic Claude API key (https://console.anthropic.com)
 claude.api.key=YOUR_CLAUDE_API_KEY
+
+# OpenAI Whisper API key for voice-to-task (https://platform.openai.com)
+# Leave blank to disable voice input
+whisper.api.key=YOUR_OPENAI_API_KEY
 
 # App settings
 app.timezone=Asia/Singapore
