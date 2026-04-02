@@ -172,6 +172,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             case "/habits"    -> sendHabitList(chatId, userId);
             case "/categories"-> sendCategoryList(chatId, userId);
             case "/templates" -> sendTemplateList(chatId, userId);
+            case "/edittasks" -> sendEditableTaskList(chatId, "📋 Active Tasks", taskService.getActiveTasks(userId));
             case "/add"       -> sendText(chatId, addHelpText());
             default           -> handleTextCommand(chatId, userId, text);
         }
@@ -233,6 +234,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             case "list_categories" -> sendCategoryList(chatId, userId);
             case "list_templates"  -> sendTemplateList(chatId, userId);
             case "review"          -> sendText(chatId, taskService.getReviewSummary(userId));
+            case "edit_tasks_menu" -> sendEditableTaskList(chatId, "📋 Active Tasks", taskService.getActiveTasks(userId));
 
             case "search_tasks" -> {
                 if (p.searchQuery() == null) { sendText(chatId, "What would you like to search for?"); return; }
@@ -545,6 +547,13 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             answer(update, ok ? "Deleted" : "Not found");
             editMessage(chatId, messageId, ok ? "🗑 Deleted category: " + cat : "Category not found.", null); return;
         }
+        if (data.equals("showedit")) {
+            // User tapped "Edit Tasks" from the list view — resend as editable cards
+            // We need userId context — infer from active tasks
+            answer(update, "Here are your tasks");
+            sendEditableTaskList(chatId, "📋 Active Tasks", taskService.getActiveTasks(userId));
+            return;
+        }
         if (data.equals("cleardone")) {
             int n = taskService.deleteAllDone(userId);
             answer(update, n > 0 ? "Cleared " + n : "Nothing to clear");
@@ -564,26 +573,51 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         execute(SendMessage.builder().chatId(chatId).text("Task added!\n\n" + taskService.formatTask(task)).replyMarkup(buildTaskKeyboard(task)).build());
     }
 
-    private void sendTaskList(long chatId, String title, List<Task> tasks, boolean withButtons) {
+    private void sendTaskList(long chatId, String title, List<Task> tasks, boolean isDone) {
         if (tasks.isEmpty()) { sendText(chatId, title + "\n\nNo tasks found."); return; }
+
         long high = tasks.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
         long med  = tasks.stream().filter(t -> t.getPriority() == Task.Priority.MEDIUM).count();
         long low  = tasks.stream().filter(t -> t.getPriority() == Task.Priority.LOW).count();
-        String header = title + "  (" + tasks.size() + ")\n"
-                + (high > 0 ? "🔴 " + high + " high   " : "")
-                + (med  > 0 ? "🟡 " + med  + " medium   " : "")
-                + (low  > 0 ? "🟢 " + low  + " low" : "");
-        if (!withButtons) {
-            execute(SendMessage.builder().chatId(chatId).text(header.trim())
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(title).append("  (").append(tasks.size()).append(")\n");
+        if (high > 0) sb.append("🔴 ").append(high).append(" high   ");
+        if (med  > 0) sb.append("🟡 ").append(med).append(" medium   ");
+        if (low  > 0) sb.append("🟢 ").append(low).append(" low");
+        sb.append("\n─────────────────\n");
+
+        for (int i = 0; i < tasks.size(); i++) {
+            Task task = tasks.get(i);
+            String dot = switch (task.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; };
+            String due = task.getDueAt() != null ? "  📅 " + taskService.friendlyDate(task.getDueAt()) : "";
+            String cat = "none".equals(task.getCategory()) ? "" : "  📁 " + task.getCategory();
+            String habit = task.isHabit() ? "  🔄" : "";
+            String loc   = task.hasLocationReminder() ? "  📍" : "";
+            sb.append(dot).append(" ").append(task.getTitle()).append("\n");
+            sb.append("   ").append(cat).append(due).append(habit).append(loc).append("\n");
+            if (i < tasks.size() - 1) sb.append("\n");
+        }
+
+        if (isDone) {
+            execute(SendMessage.builder().chatId(chatId).text(sb.toString().trim())
                     .replyMarkup(InlineKeyboardMarkup.builder().keyboard(List.of(new InlineKeyboardRow(
                             InlineKeyboardButton.builder().text("🗑 Clear All Completed").callbackData("cleardone").build()
                     ))).build()).build());
         } else {
-            sendText(chatId, header.trim());
+            execute(SendMessage.builder().chatId(chatId).text(sb.toString().trim())
+                    .replyMarkup(InlineKeyboardMarkup.builder().keyboard(List.of(new InlineKeyboardRow(
+                            InlineKeyboardButton.builder().text("✏️ Edit Tasks").callbackData("showedit").build()
+                    ))).build()).build());
         }
+    }
+
+    private void sendEditableTaskList(long chatId, String title, List<Task> tasks) {
+        if (tasks.isEmpty()) { sendText(chatId, title + "\n\nNo tasks found."); return; }
+        sendText(chatId, "✏️ " + title + " — tap a button to act:");
         for (Task task : tasks) {
             execute(SendMessage.builder().chatId(chatId).text(taskService.formatTask(task))
-                    .replyMarkup(withButtons && task.getStatus() == Task.Status.ACTIVE ? buildTaskKeyboard(task) : null).build());
+                    .replyMarkup(buildTaskKeyboard(task)).build());
         }
     }
 

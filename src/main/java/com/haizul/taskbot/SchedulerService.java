@@ -84,8 +84,8 @@ public class SchedulerService {
         String contextualMsg = null;
         if (claudeService != null) {
             try {
-                contextualMsg = claudeService.generateReminderMessage(
-                        task.getTitle(), task.getPriority(), label, ignoredCount);
+                int habitStreak = task.isHabit() ? taskService.getHabitStreak(task.getId()) : 0;
+                contextualMsg = claudeService.generateReminderMessage(task, label, ignoredCount, habitStreak);
             } catch (Exception ignored) {}
         }
 

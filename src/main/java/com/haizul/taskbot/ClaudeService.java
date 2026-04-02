@@ -50,6 +50,7 @@ public class ClaudeService {
             list_done             — completed tasks
             list_categories       — show categories
             list_templates        — show saved templates
+            edit_tasks_menu       — user wants to see tasks WITH edit/action buttons ("edit my tasks", "manage my tasks", "let me edit tasks")
             review                — summary + productivity + habits
             search_tasks          — search tasks by keyword
             mark_done             — mark a specific task done
@@ -113,6 +114,7 @@ public class ClaudeService {
             - "set reminder for all overdue tasks" → set_reminder_interval + target_title:"ALL_OVERDUE"
             - "snooze all overdue tasks" → snooze_task + target_title:"ALL_OVERDUE"
             - "undo" / "undo that" → undo
+            - "edit my tasks" / "manage tasks" / "let me edit" → edit_tasks_menu
             """;
 
     private final String apiKey;
@@ -134,16 +136,30 @@ public class ClaudeService {
     }
 
     /** Generates a short contextual motivating reminder message using Haiku */
-    public String generateReminderMessage(String taskTitle, Task.Priority priority, String label, int ignoredCount) {
-        String urgency = switch (priority) { case HIGH -> "HIGH PRIORITY"; case MEDIUM -> "medium priority"; case LOW -> "low priority"; };
-        String escalation = ignoredCount >= 3 ? " This is the " + (ignoredCount + 1) + "th reminder — it's overdue for attention!" : "";
-        String prompt = "Generate a short (1 sentence max), motivating reminder message for a task bot. Task: \"" + taskTitle
-                + "\". Priority: " + urgency + ". Status: " + label + "." + escalation
-                + " Be encouraging but direct. No emojis. No quotes around the output.";
+    public String generateReminderMessage(Task task, String label, int ignoredCount, int habitStreak) {
+        String urgency = switch (task.getPriority()) {
+            case HIGH   -> "high priority";
+            case MEDIUM -> "medium priority";
+            case LOW    -> "low priority";
+        };
+        String cat   = (task.getCategory() != null && !task.getCategory().equals("none")) ? task.getCategory() : null;
+        String notes = task.getNotes();
 
-        String sys = "You generate short task reminder messages. Return ONLY the message text — no JSON, no quotes, no punctuation at end unless natural.";
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("Write a short, natural, conversational reminder message (1-2 sentences max) for a personal task bot.\n\n");
+        prompt.append("Task: \"").append(task.getTitle()).append("\"\n");
+        prompt.append("Priority: ").append(urgency).append("\n");
+        prompt.append("Status: ").append(label).append("\n");
+        if (cat != null)   prompt.append("Category: ").append(cat).append("\n");
+        if (notes != null) prompt.append("Notes: ").append(notes).append("\n");
+        if (habitStreak > 1) prompt.append("Habit streak: ").append(habitStreak).append(" days — mention keeping the streak going\n");
+        if (ignoredCount >= 5) prompt.append("This reminder has been ignored ").append(ignoredCount).append(" times — be more urgent and direct\n");
+        else if (ignoredCount >= 3) prompt.append("This has been reminded ").append(ignoredCount).append(" times — nudge them firmly but still kindly\n");
+        prompt.append("\nTone: friendly, casual, like a helpful mate. No emojis. No quotes. Just the message text.");
+
+        String sys = "You write short reminder messages for a personal task bot. Return ONLY the message — no JSON, no quotes, no labels.";
         try {
-            return callApi(prompt, 80, sys, node -> {
+            return callApi(prompt.toString(), 100, sys, node -> {
                 String text = node.path("content").get(0).path("text").asText("").trim();
                 return text.isBlank() ? null : text;
             });
