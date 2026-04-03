@@ -40,16 +40,21 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private final TaskService taskService;
     private final ClaudeService claudeService;
     private final WhisperService whisperService;
+    private final NotionService notionService;
+    private final NoteService noteService;
     private final String botUsername;
     private final Map<Long, PendingInput> pendingInputs = new ConcurrentHashMap<>();
     private final Map<Long, UndoAction>   undoStack     = new ConcurrentHashMap<>();
 
     public TaskBot(BotConfig config, TaskService taskService,
-                   ClaudeService claudeService, WhisperService whisperService) {
+                   ClaudeService claudeService, WhisperService whisperService,
+                   NotionService notionService, NoteService noteService) {
         this.telegramClient = new OkHttpTelegramClient(config.getBotToken());
         this.taskService    = taskService;
         this.claudeService  = claudeService;
         this.whisperService = whisperService;
+        this.notionService  = notionService;
+        this.noteService    = noteService;
         this.botUsername    = config.getBotUsername();
     }
 
@@ -94,13 +99,15 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
         if (claudeService != null) {
             handleNaturalLanguage(chatId, userId, transcription);
+        } else if (notionService != null && noteService != null) {
+            // No Claude for routing — save as note directly
+            handleSaveNote(chatId, userId, transcription, "voice");
         } else {
-            // Try to add as task directly
             try {
                 Task task = taskService.createTask(userId, chatId, taskService.parseAddCommand(transcription));
                 sendTaskAdded(chatId, task);
             } catch (Exception e) {
-                sendText(chatId, "Couldn't parse that as a task. Try typing it instead.");
+                sendText(chatId, "Couldn't parse that. Try typing it instead.");
             }
         }
     }
@@ -172,7 +179,9 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             case "/habits"    -> sendHabitList(chatId, userId);
             case "/categories"-> sendCategoryList(chatId, userId);
             case "/templates" -> sendTemplateList(chatId, userId);
-            case "/edittasks" -> sendEditableTaskList(chatId, "📋 Active Tasks", taskService.getActiveTasks(userId));
+            case "/edittasks"    -> sendEditableTaskList(chatId, "📋 Active Tasks", taskService.getActiveTasks(userId));
+            case "/recentnotes"  -> handleRecentNotes(chatId, userId);
+            case "/setupnotes"   -> handleSetupNotes(chatId);
             case "/add"       -> sendText(chatId, addHelpText());
             default           -> handleTextCommand(chatId, userId, text);
         }
@@ -384,6 +393,20 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 else sendText(chatId, "Template \"" + p.templateName() + "\" not found. Use /templates to see yours.");
             }
 
+            case "save_note" -> {
+                if (notionService == null || noteService == null) {
+                    sendText(chatId, "Notes are not enabled. Set NOTION_API_KEY and NOTION_DATABASE_ID to use this feature."); return;
+                }
+                handleSaveNote(chatId, userId, text, "text");
+            }
+
+            case "search_notes" -> {
+                if (notionService == null || noteService == null) {
+                    sendText(chatId, "Notes are not enabled. Set NOTION_API_KEY and NOTION_DATABASE_ID to use this feature."); return;
+                }
+                handleSearchNotes(chatId, text);
+            }
+
             case "undo" -> handleUndo(chatId, userId);
 
             default -> {
@@ -420,6 +443,112 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             taskService.resetReminderIgnoredCount(task.getId());
             sendText(chatId, "⏰ Snoozed \"" + task.getTitle() + "\" by " + hours + "h.\n\nSay \"undo\" to reverse.");
         }, () -> sendText(chatId, "Task not found: " + shortId));
+    }
+
+
+    // ── Notes ────────────────────────────────────────────────────────────────
+
+    private void handleSaveNote(long chatId, long userId, String rawText, String source) {
+        sendText(chatId, "📝 Saving your note...");
+        try {
+            NoteService.StructuredNote structured = noteService.structure(rawText);
+            NotionService.SavedNote saved = notionService.saveNote(
+                    structured.title(),
+                    structured.category(),
+                    structured.tags(),
+                    rawText,
+                    structured.summary(),
+                    source
+            );
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("✅ Note saved to Notion!\n\n");
+            sb.append("📌 ").append(saved.title()).append("\n");
+            sb.append("📁 ").append(saved.category());
+            if (!saved.tags().isEmpty()) {
+                sb.append("  🏷 ").append(String.join(", ", saved.tags()));
+            }
+            sb.append("\n\n💬 ").append(structured.summary());
+
+            sendText(chatId, sb.toString());
+        } catch (Exception e) {
+            System.err.println("handleSaveNote error: " + e.getMessage());
+            sendText(chatId, "Sorry, couldn't save that note. Check your Notion connection.");
+        }
+    }
+
+    private void handleSearchNotes(long chatId, String query) {
+        sendText(chatId, "🔍 Searching your notes...");
+        try {
+            NoteService.NoteSearchParams params = noteService.parseSearchQuery(query);
+            java.util.List<NotionService.NoteResult> results;
+
+            if (params.isRecent()) {
+                results = notionService.getRecentNotes(params.limit());
+            } else {
+                results = notionService.searchNotes(params.query(), params.categoryFilter(), params.limit());
+            }
+
+            if (results.isEmpty()) {
+                sendText(chatId, "No notes found matching that. Try /recentnotes to see what you've saved.");
+                return;
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("📝 Found ").append(results.size()).append(" note(s):\n─────────────────\n\n");
+            for (NotionService.NoteResult note : results) {
+                sb.append("📌 **").append(note.title()).append("**\n");
+                sb.append("📁 ").append(note.category());
+                if (!note.tags().isEmpty()) sb.append("  🏷 ").append(String.join(", ", note.tags()));
+                sb.append("  📅 ").append(note.created()).append("\n");
+                if (!note.summary().isBlank()) sb.append(note.summary()).append("\n");
+                sb.append("\n");
+            }
+            sendText(chatId, sb.toString().trim());
+        } catch (Exception e) {
+            System.err.println("handleSearchNotes error: " + e.getMessage());
+            sendText(chatId, "Couldn't search notes right now.");
+        }
+    }
+
+
+    private void handleSetupNotes(long chatId) {
+        if (notionService == null) {
+            sendText(chatId, "Notes not enabled. Add NOTION_API_KEY and NOTION_DATABASE_ID to your supervisor conf."); return;
+        }
+        sendText(chatId, "⚙️ Setting up your Quick Notes database...");
+        try {
+            notionService.setupDatabase();
+            sendText(chatId, "✅ Quick Notes is ready!\n\n"
+                    + "Try it:\n"
+                    + "• \"remember that Jacob's birthday is 15 May at Orchard\"\n"
+                    + "• \"note: CEE report needs Gantt chart exported as PDF\"\n"
+                    + "• Or send a voice note!\n\n"
+                    + "To recall: \"when is Jacob's birthday?\"");
+        } catch (Exception e) {
+            sendText(chatId, "Setup failed: " + e.getMessage() + "\n\nCheck your NOTION_API_KEY and NOTION_DATABASE_ID.");
+        }
+    }
+
+    private void handleRecentNotes(long chatId, long userId) {
+        if (notionService == null) {
+            sendText(chatId, "Notes not enabled. Set NOTION_API_KEY and NOTION_DATABASE_ID."); return;
+        }
+        sendText(chatId, "📝 Fetching recent notes...");
+        try {
+            java.util.List<NotionService.NoteResult> results = notionService.getRecentNotes(5);
+            if (results.isEmpty()) { sendText(chatId, "No notes saved yet. Just type or voice anything to save it!"); return; }
+            StringBuilder sb = new StringBuilder("📝 Recent Notes\n─────────────────\n\n");
+            for (NotionService.NoteResult note : results) {
+                sb.append("📌 ").append(note.title()).append("\n");
+                sb.append("   📁 ").append(note.category());
+                if (!note.tags().isEmpty()) sb.append("  🏷 ").append(String.join(", ", note.tags()));
+                sb.append("  📅 ").append(note.created()).append("\n\n");
+            }
+            sendText(chatId, sb.toString().trim());
+        } catch (Exception e) {
+            sendText(chatId, "Couldn't fetch recent notes right now.");
+        }
     }
 
     private void handleUndo(long chatId, long userId) {

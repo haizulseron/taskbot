@@ -14,6 +14,8 @@ public class BotConfig {
     private final String botToken;
     private final String claudeApiKey;
     private final String whisperApiKey;   // OpenAI key for voice transcription
+    private final String notionApiKey;
+    private final String notionDatabaseId;
     private final ZoneId zoneId;
     private final LocalTime morningSummaryTime;
     private final int schedulerCheckIntervalSeconds;
@@ -21,12 +23,15 @@ public class BotConfig {
     private final int defaultStaleDays;
 
     private BotConfig(String botUsername, String botToken, String claudeApiKey, String whisperApiKey,
+                      String notionApiKey, String notionDatabaseId,
                       ZoneId zoneId, LocalTime morningSummaryTime,
                       int schedulerCheckIntervalSeconds, String dbPath, int defaultStaleDays) {
         this.botUsername = botUsername;
         this.botToken = botToken;
         this.claudeApiKey = claudeApiKey;
         this.whisperApiKey = whisperApiKey;
+        this.notionApiKey = notionApiKey;
+        this.notionDatabaseId = notionDatabaseId;
         this.zoneId = zoneId;
         this.morningSummaryTime = morningSummaryTime;
         this.schedulerCheckIntervalSeconds = schedulerCheckIntervalSeconds;
@@ -44,6 +49,8 @@ public class BotConfig {
         String botToken     = firstNonBlank(System.getenv("BOT_TOKEN"),         properties.getProperty("bot.token"));
         String claudeApiKey = firstNonBlank(System.getenv("CLAUDE_API_KEY"),    properties.getProperty("claude.api.key"));
         String whisperKey   = firstNonBlank(System.getenv("WHISPER_API_KEY"),   properties.getProperty("whisper.api.key"));
+        String notionKey    = firstNonBlank(System.getenv("NOTION_API_KEY"),    properties.getProperty("notion.api.key"));
+        String notionDbId   = firstNonBlank(System.getenv("NOTION_DATABASE_ID"), properties.getProperty("notion.database.id"));
         String timezone     = firstNonBlank(System.getenv("APP_TIMEZONE"),      properties.getProperty("app.timezone", "Asia/Singapore"));
         String morningTime  = firstNonBlank(System.getenv("APP_MORNING_SUMMARY_TIME"), properties.getProperty("app.morning.summary.time", "08:00"));
         String interval     = firstNonBlank(System.getenv("APP_SCHEDULER_INTERVAL_SECONDS"), properties.getProperty("app.scheduler.check.interval.seconds", "60"));
@@ -62,6 +69,8 @@ public class BotConfig {
         return new BotConfig(botUsername.trim(), botToken.trim(),
                 claudeApiKey != null ? claudeApiKey.trim() : null,
                 whisperKey   != null ? whisperKey.trim()   : null,
+                notionKey    != null ? notionKey.trim()    : null,
+                notionDbId   != null ? notionDbId.trim()   : null,
                 ZoneId.of(timezone.trim()), LocalTime.parse(morningTime.trim()),
                 Integer.parseInt(interval.trim()), dbPath.trim(), Integer.parseInt(staleDays.trim()));
     }
@@ -73,6 +82,8 @@ public class BotConfig {
     public String getBotToken()                  { return botToken; }
     public String getClaudeApiKey()              { return claudeApiKey; }
     public String getWhisperApiKey()             { return whisperApiKey; }
+    public String getNotionApiKey()              { return notionApiKey; }
+    public String getNotionDatabaseId()          { return notionDatabaseId; }
     public ZoneId getZoneId()                    { return zoneId; }
     public LocalTime getMorningSummaryTime()      { return morningSummaryTime; }
     public int getSchedulerCheckIntervalSeconds() { return schedulerCheckIntervalSeconds; }

@@ -51,6 +51,8 @@ public class ClaudeService {
             list_categories       — show categories
             list_templates        — show saved templates
             edit_tasks_menu       — user wants to see tasks WITH edit/action buttons ("edit my tasks", "manage my tasks", "let me edit tasks")
+            save_note             — user wants to save a note/reminder to remember ("remember that...", "note down...", "save this...")
+            search_notes          — user is asking about something they saved ("when is X", "what did I note about Y", "find my notes on Z", "show recent notes")
             review                — summary + productivity + habits
             search_tasks          — search tasks by keyword
             mark_done             — mark a specific task done
@@ -114,6 +116,9 @@ public class ClaudeService {
             - "set reminder for all overdue tasks" → set_reminder_interval + target_title:"ALL_OVERDUE"
             - "snooze all overdue tasks" → snooze_task + target_title:"ALL_OVERDUE"
             - "undo" / "undo that" → undo
+            - "remember that X", "note this down", "save this for later" → save_note
+            - "when is X", "what did I save about Y", "find my notes on Z" → search_notes
+            - If unsure whether user wants to save a task or a note: tasks have due dates/actions, notes are things to remember/recall
             - "edit my tasks" / "manage tasks" / "let me edit" → edit_tasks_menu
             """;
 

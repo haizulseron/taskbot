@@ -645,6 +645,7 @@ public class TaskService {
                 /review · /habits · /categories · /addcategory <n>
                 /done <id> · /delete <id> · /snooze <id> <h>
                 /search <query> · /templates · /cancel
+                /recentnotes — see your last 5 saved notes
 
                 💡 Or just talk naturally:
                 "show my high priority school tasks"

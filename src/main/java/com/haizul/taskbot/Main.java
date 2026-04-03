@@ -19,7 +19,15 @@ public class Main {
         WhisperService whisperService = (whisperKey != null && !whisperKey.isBlank() && !whisperKey.equals("YOUR_WHISPER_API_KEY"))
                 ? new WhisperService(whisperKey, config.getBotToken()) : null;
 
-        TaskBot taskBot = new TaskBot(config, taskService, claudeService, whisperService);
+        String notionKey  = config.getNotionApiKey();
+        String notionDbId = config.getNotionDatabaseId();
+        NotionService notionService = (notionKey != null && !notionKey.isBlank() && !notionKey.equals("YOUR_NOTION_API_KEY"))
+                ? new NotionService(notionKey, notionDbId) : null;
+
+        NoteService noteService = (claudeKey != null && !claudeKey.isBlank())
+                ? new NoteService(claudeKey) : null;
+
+        TaskBot taskBot = new TaskBot(config, taskService, claudeService, whisperService, notionService, noteService);
 
         SchedulerService schedulerService = new SchedulerService(
                 taskService, taskBot, claudeService,
