@@ -481,6 +481,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         sendText(chatId, "🔍 Searching your notes...");
         try {
             NoteService.NoteSearchParams params = noteService.parseSearchQuery(query);
+            // sendText(chatId, "🔍 query:\"" + params.query() + "\" cat:" + params.categoryFilter() + " recent:" + params.isRecent()); // debug
             java.util.List<NotionService.NoteResult> results;
 
             if (params.isRecent()) {

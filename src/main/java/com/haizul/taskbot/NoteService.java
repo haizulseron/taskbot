@@ -46,16 +46,20 @@ public class NoteService {
             Extract search parameters and return ONLY a JSON object — no markdown, no backticks.
 
             JSON fields:
-            - query          : key search terms to look for in notes (string, or null if searching by category only)
-            - category_filter: one of School/Work/Ideas/Personal/Health/Finance/Reference/Other, or null
+            - query          : 1-3 key nouns/names to search for (string). Extract the core subject — e.g. "when is my MRI" → "MRI", "Jacob's birthday" → "Jacob", "CEE assignment" → "CEE". Keep it short and specific.
+            - category_filter: ONLY set this if the user explicitly mentions a category like "my school notes" or "health stuff". Otherwise leave null.
             - limit          : number of results to fetch (1-5, default 3)
-            - is_recent      : true if user wants recent notes ("what did I save recently", "my last notes")
+            - is_recent      : true only if user says "recent", "last notes", "what did I save"
 
             Examples:
-            "when is jacob's birthday" → query:"jacob birthday", category_filter:"Personal"
-            "what ideas do I have for Cassia" → query:"cassia", category_filter:"Ideas"
-            "show me my recent notes" → is_recent:true
-            "anything about CEE" → query:"CEE", category_filter:"School"
+            "when is jacob's birthday" → query:"jacob", category_filter:null
+            "what is my MRI appointment date" → query:"MRI", category_filter:null
+            "what ideas do I have for Cassia" → query:"cassia", category_filter:null
+            "show me my health notes" → query:null, category_filter:"Health"
+            "show me my recent notes" → is_recent:true, query:null
+            "anything about CEE" → query:"CEE", category_filter:null
+
+            Important: do NOT set category_filter unless the user explicitly asks for a category.
             """;
 
     private final String apiKey;

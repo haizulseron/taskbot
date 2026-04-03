@@ -112,6 +112,7 @@ public class NotionService {
             body.set("properties", props);
 
             String response = post("/databases", body.toString());
+            System.err.println("Notion search response: " + response);
             JsonNode json = mapper.readTree(response);
             return json.path("id").asText(null);
         } catch (Exception e) {
@@ -243,6 +244,7 @@ public class NotionService {
             body.set("children", children);
 
             String response = post("/pages", body.toString());
+            System.err.println("Notion search response: " + response);
             JsonNode json   = mapper.readTree(response);
             String pageId   = json.path("id").asText("");
 
@@ -259,29 +261,39 @@ public class NotionService {
     public List<NoteResult> searchNotes(String query, String categoryFilter, int limit) {
         try {
             ObjectNode body = mapper.createObjectNode();
-            body.put("database_id", databaseId);
             body.put("page_size", Math.min(limit, 10));
 
             // Build filter
             if (query != null || categoryFilter != null) {
                 ObjectNode filter;
-                if (query != null && categoryFilter != null) {
-                    // AND filter: category match + title/summary contains query
+
+                // Always build a broad text search across all text fields
+                ObjectNode textFilter = null;
+                if (query != null) {
+                    ArrayNode orArr = mapper.createArrayNode();
+                    // Search each word individually so "knee MRI" matches even if words are apart
+                    String[] words = query.split("\\s+");
+                    for (String word : words) {
+                        if (word.length() < 2) continue;
+                        orArr.add(buildTextFilter("Title", word));
+                        orArr.add(buildTextFilter("Summary", word));
+                        orArr.add(buildTextFilter("Raw", word));
+                    }
+                    textFilter = mapper.createObjectNode();
+                    textFilter.set("or", orArr);
+                }
+
+                if (categoryFilter != null && textFilter != null) {
+                    // AND: category + broad text search
                     ArrayNode andArr = mapper.createArrayNode();
                     andArr.add(buildCategoryFilter(categoryFilter));
-                    andArr.add(buildTextFilter("Title", query));
+                    andArr.add(textFilter);
                     filter = mapper.createObjectNode();
                     filter.set("and", andArr);
                 } else if (categoryFilter != null) {
                     filter = buildCategoryFilter(categoryFilter);
                 } else {
-                    // Search in Title and Summary
-                    ArrayNode orArr = mapper.createArrayNode();
-                    orArr.add(buildTextFilter("Title", query));
-                    orArr.add(buildTextFilter("Summary", query));
-                    orArr.add(buildTextFilter("Raw", query));
-                    filter = mapper.createObjectNode();
-                    filter.set("or", orArr);
+                    filter = textFilter;
                 }
                 body.set("filter", filter);
             }
@@ -295,6 +307,7 @@ public class NotionService {
             body.set("sorts", sorts);
 
             String response = post("/databases/" + databaseId + "/query", body.toString());
+            System.err.println("Notion search response: " + response);
             JsonNode json   = mapper.readTree(response);
             JsonNode results = json.path("results");
 
