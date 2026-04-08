@@ -231,8 +231,11 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         switch (p.type()) {
             case "task" -> {
                 try {
-                    sendTaskAdded(chatId, taskService.createTask(userId, chatId,
-                            new TaskService.AddTaskRequest(p.title(), p.priority(), p.category(), p.dueAt(), p.recurrence(), p.notes())));
+                    Task created = taskService.createTask(userId, chatId,
+                            new TaskService.AddTaskRequest(p.title(), p.priority(), p.category(), p.dueAt(), p.recurrence(), p.notes()));
+                    sendTaskAdded(chatId, created);
+                    // Record a readable summary so follow-up messages like "actually make it 10am" work
+                    recordAssistantResponse(userId, "Added task: \"" + created.getTitle() + "\" due " + taskService.friendlyDate(created.getDueAt()));
                 } catch (Exception e) { sendText(chatId, "Understood but couldn't save. Try /add instead."); }
             }
 
@@ -574,23 +577,34 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
     // ── Conversation history ─────────────────────────────────────────────────
 
+    /**
+     * Only record user messages that are conversational (not slash commands).
+     * Only record assistant responses that are meaningful summaries.
+     * This keeps history clean so Haiku doesn't get confused by JSON blobs.
+     */
     private void addToHistory(long userId, String role, String content) {
+        if (content == null || content.isBlank()) return;
+        // Don't store raw JSON responses as assistant history
+        if (role.equals("assistant") && content.trim().startsWith("{")) return;
         conversationHistory.computeIfAbsent(userId, k -> new java.util.LinkedList<>())
                 .add(java.util.Map.of("role", role, "content", content));
         java.util.LinkedList<java.util.Map<String, String>> hist = conversationHistory.get(userId);
-        while (hist.size() > MAX_HISTORY * 2) hist.removeFirst(); // keep pairs
+        // Keep max MAX_HISTORY pairs
+        while (hist.size() > MAX_HISTORY * 2) hist.removeFirst();
     }
 
     private java.util.List<java.util.Map<String, String>> getHistory(long userId) {
         java.util.LinkedList<java.util.Map<String, String>> hist = conversationHistory.get(userId);
-        if (hist == null || hist.isEmpty()) return java.util.List.of();
-        // Return all but the last entry (which is the current message we just added)
+        if (hist == null || hist.size() < 2) return java.util.List.of();
+        // Return all but the last user message (which is being sent as the current message)
         java.util.List<java.util.Map<String, String>> list = new java.util.ArrayList<>(hist);
-        return list.size() > 1 ? list.subList(0, list.size() - 1) : java.util.List.of();
+        return list.subList(0, list.size() - 1);
     }
 
-    private void recordAssistantResponse(long userId, String response) {
-        addToHistory(userId, "assistant", response);
+    private void recordAssistantResponse(long userId, String summary) {
+        // Only record meaningful assistant messages, not raw JSON or system confirmations
+        if (summary == null || summary.isBlank() || summary.startsWith("{")) return;
+        addToHistory(userId, "assistant", summary);
     }
 
     // ── Pomodoro ─────────────────────────────────────────────────────────────
@@ -819,10 +833,8 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                             InlineKeyboardButton.builder().text("🗑 Clear All Completed").callbackData("cleardone").build()
                     ))).build()).build());
         } else {
-            execute(SendMessage.builder().chatId(chatId).text(sb.toString().trim())
-                    .replyMarkup(InlineKeyboardMarkup.builder().keyboard(List.of(new InlineKeyboardRow(
-                            InlineKeyboardButton.builder().text("✏️ Edit Tasks").callbackData("showedit").build()
-                    ))).build()).build());
+            // Active task list — just show text, no button clutter
+            sendText(chatId, sb.toString().trim());
         }
     }
 

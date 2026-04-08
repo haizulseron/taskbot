@@ -117,6 +117,10 @@ public class ClaudeService {
             pomodoro_rounds           int      number of rounds (default 4)
 
             RULES:
+            - ALWAYS parse "add X", "remind me to X", "X tomorrow/today/[date]" as type:"task" — never as list_tasks
+            - If the message contains a task title + optional date/time/priority, it is ALWAYS type:"task"
+            - Use conversation history ONLY for follow-up edits like "actually make it 10am" or "change the priority"
+            - "tasks", "show tasks", "my tasks", "list tasks", "open tasks" → list_tasks
             - "ASAP"/"urgent" → high priority; "eventually"/"whenever" → low priority
             - "daily", "everyday", "routine", "habit task" → daily priority
             - "tonight" = today ~20:00; "next week" = 7 days from now
