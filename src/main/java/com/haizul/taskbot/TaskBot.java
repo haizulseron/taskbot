@@ -45,6 +45,9 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private final String botUsername;
     private final Map<Long, PendingInput> pendingInputs = new ConcurrentHashMap<>();
     private final Map<Long, UndoAction>   undoStack     = new ConcurrentHashMap<>();
+    // Conversation history: last 5 exchanges per user for context-aware parsing
+    private final Map<Long, java.util.LinkedList<java.util.Map<String, String>>> conversationHistory = new ConcurrentHashMap<>();
+    private static final int MAX_HISTORY = 5;
 
     public TaskBot(BotConfig config, TaskService taskService,
                    ClaudeService claudeService, WhisperService whisperService,
@@ -98,6 +101,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         sendText(chatId, "🎤 Heard: \"" + transcription + "\"");
 
         if (claudeService != null) {
+            addToHistory(userId, "user", transcription);
             handleNaturalLanguage(chatId, userId, transcription);
         } else if (notionService != null && noteService != null) {
             // No Claude for routing — save as note directly
@@ -213,14 +217,16 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         }
         if (text.startsWith("/")) { sendText(chatId, "Unknown command. Use /help"); return; }
 
-        if (claudeService != null) handleNaturalLanguage(chatId, userId, text);
-        else sendText(chatId, "Unknown command. Use /help\n\n💡 Set CLAUDE_API_KEY to enable natural language.");
+        if (claudeService != null) {
+            addToHistory(userId, "user", text);
+            handleNaturalLanguage(chatId, userId, text);
+        } else sendText(chatId, "Unknown command. Use /help\n\n💡 Set CLAUDE_API_KEY to enable natural language.");
     }
 
     // ── Natural language ─────────────────────────────────────────────────────
 
     private void handleNaturalLanguage(long chatId, long userId, String text) {
-        ClaudeService.ParsedTask p = claudeService.parse(text);
+        ClaudeService.ParsedTask p = claudeService.parse(text, getHistory(userId));
 
         switch (p.type()) {
             case "task" -> {
@@ -257,6 +263,19 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                         () -> sendText(chatId, "Couldn't find \"" + p.targetTitle() + "\". Use /tasks to see IDs."));
             }
             case "mark_all_done" -> { int n = taskService.markAllDone(userId); sendText(chatId, n > 0 ? "✅ Marked " + n + " task(s) done. Fresh start!" : "No active tasks."); }
+
+            case "mark_daily_done" -> {
+                int n = taskService.markAllDoneByPriority(userId, Task.Priority.DAILY);
+                sendText(chatId, n > 0 ? "🔵 Marked " + n + " daily task(s) done. Nice work!" : "No daily tasks to complete.");
+            }
+
+            case "start_pomodoro" -> {
+                int work   = p.pomodoroWork()   > 0 ? p.pomodoroWork()   : 25;
+                int brk    = p.pomodoroBreak()  > 0 ? p.pomodoroBreak()  : 5;
+                int rounds = p.pomodoroRounds() > 0 ? p.pomodoroRounds() : 4;
+                String taskTitle = p.targetTitle() != null ? p.targetTitle() : "your session";
+                handleStartPomodoro(chatId, userId, taskTitle, work, brk, rounds);
+            }
             case "delete_task" -> {
                 if (p.targetTitle() == null) { sendText(chatId, "Which task would you like to delete?"); return; }
                 taskService.findTaskByTitleHint(userId, p.targetTitle()).ifPresentOrElse(
@@ -552,6 +571,49 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         }
     }
 
+
+    // ── Conversation history ─────────────────────────────────────────────────
+
+    private void addToHistory(long userId, String role, String content) {
+        conversationHistory.computeIfAbsent(userId, k -> new java.util.LinkedList<>())
+                .add(java.util.Map.of("role", role, "content", content));
+        java.util.LinkedList<java.util.Map<String, String>> hist = conversationHistory.get(userId);
+        while (hist.size() > MAX_HISTORY * 2) hist.removeFirst(); // keep pairs
+    }
+
+    private java.util.List<java.util.Map<String, String>> getHistory(long userId) {
+        java.util.LinkedList<java.util.Map<String, String>> hist = conversationHistory.get(userId);
+        if (hist == null || hist.isEmpty()) return java.util.List.of();
+        // Return all but the last entry (which is the current message we just added)
+        java.util.List<java.util.Map<String, String>> list = new java.util.ArrayList<>(hist);
+        return list.size() > 1 ? list.subList(0, list.size() - 1) : java.util.List.of();
+    }
+
+    private void recordAssistantResponse(long userId, String response) {
+        addToHistory(userId, "assistant", response);
+    }
+
+    // ── Pomodoro ─────────────────────────────────────────────────────────────
+
+    private void handleStartPomodoro(long chatId, long userId, String taskTitle, int workMins, int breakMins, int rounds) {
+        // Store pomodoro state — reuse focus sessions table for each round
+        taskService.stopFocusSession(userId); // cancel any existing
+        FocusSession session = taskService.startFocusSession(userId, chatId,
+                taskTitle + " [Pomodoro 1/" + rounds + "]", workMins);
+        if (session == null) { sendText(chatId, "Couldn't start Pomodoro session."); return; }
+
+        // Store pomodoro config in a note so scheduler can continue rounds
+        String pomConfig = "POMODORO:" + rounds + ":" + workMins + ":" + breakMins + ":1:work";
+        UserSettings us = taskService.getUserSettings(userId);
+        taskService.saveUserSettings(userId, us.getQuietStart(), us.getQuietEnd(), pomConfig);
+
+        sendText(chatId, "🍅 Pomodoro started!\n\n"
+                + "Task: " + taskTitle + "\n"
+                + "Round 1 of " + rounds + " — " + workMins + " min work\n"
+                + "Break: " + breakMins + " min between rounds\n\n"
+                + "Focus up! I'll ping you when it's break time. 💪");
+    }
+
     private void handleUndo(long chatId, long userId) {
         UndoAction undo = undoStack.remove(userId);
         if (undo == null) { sendText(chatId, "Nothing to undo."); return; }
@@ -660,7 +722,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             }); return;
         }
         if (data.startsWith("edittitle:"))   { promptPending(update, chatId, userId, PendingKind.TASK_TITLE,        data.substring(10), "Send the new task title."); return; }
-        if (data.startsWith("editprio:"))    { promptPending(update, chatId, userId, PendingKind.TASK_PRIORITY,     data.substring(9),  "Send priority: high, medium, or low."); return; }
+        if (data.startsWith("editprio:"))    { promptPending(update, chatId, userId, PendingKind.TASK_PRIORITY,     data.substring(9),  "Send priority: high, medium, low, or daily."); return; }
         if (data.startsWith("editcat:"))     { promptPending(update, chatId, userId, PendingKind.TASK_CATEGORY,     data.substring(8),  "Send category name, or 'none' to clear."); return; }
         if (data.startsWith("editdue:"))     { promptPending(update, chatId, userId, PendingKind.TASK_DUE,          data.substring(8),  "Send new due date (e.g. tomorrow 8pm, none)."); return; }
         if (data.startsWith("editrecur:"))   { promptPending(update, chatId, userId, PendingKind.TASK_RECURRENCE,   data.substring(10), "Send recurrence: none, daily, weekly, or monthly."); return; }
@@ -706,27 +768,49 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private void sendTaskList(long chatId, String title, List<Task> tasks, boolean isDone) {
         if (tasks.isEmpty()) { sendText(chatId, title + "\n\nNo tasks found."); return; }
 
-        long high = tasks.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
-        long med  = tasks.stream().filter(t -> t.getPriority() == Task.Priority.MEDIUM).count();
-        long low  = tasks.stream().filter(t -> t.getPriority() == Task.Priority.LOW).count();
+        java.util.List<Task> mainTasks  = tasks.stream().filter(t -> t.getPriority() != Task.Priority.DAILY).collect(java.util.stream.Collectors.toList());
+        java.util.List<Task> dailyTasks = tasks.stream().filter(t -> t.getPriority() == Task.Priority.DAILY).collect(java.util.stream.Collectors.toList());
+
+        long high = mainTasks.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
+        long med  = mainTasks.stream().filter(t -> t.getPriority() == Task.Priority.MEDIUM).count();
+        long low  = mainTasks.stream().filter(t -> t.getPriority() == Task.Priority.LOW).count();
 
         StringBuilder sb = new StringBuilder();
         sb.append(title).append("  (").append(tasks.size()).append(")\n");
         if (high > 0) sb.append("🔴 ").append(high).append(" high   ");
         if (med  > 0) sb.append("🟡 ").append(med).append(" medium   ");
         if (low  > 0) sb.append("🟢 ").append(low).append(" low");
+        if (!dailyTasks.isEmpty()) sb.append("  🔵 ").append(dailyTasks.size()).append(" daily");
         sb.append("\n─────────────────\n");
 
-        for (int i = 0; i < tasks.size(); i++) {
-            Task task = tasks.get(i);
-            String dot = switch (task.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; };
+        // Main tasks (high/medium/low)
+        for (int i = 0; i < mainTasks.size(); i++) {
+            Task task = mainTasks.get(i);
+            String dot = switch (task.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; };
             String due = task.getDueAt() != null ? "  📅 " + taskService.friendlyDate(task.getDueAt()) : "";
             String cat = "none".equals(task.getCategory()) ? "" : "  📁 " + task.getCategory();
             String habit = task.isHabit() ? "  🔄" : "";
             String loc   = task.hasLocationReminder() ? "  📍" : "";
             sb.append(dot).append(" ").append(task.getTitle()).append("\n");
             sb.append("   ").append(cat).append(due).append(habit).append(loc).append("\n");
-            if (i < tasks.size() - 1) sb.append("\n");
+            if (i < mainTasks.size() - 1) sb.append("\n");
+        }
+
+        // Daily tasks section
+        if (!dailyTasks.isEmpty()) {
+            if (!mainTasks.isEmpty()) sb.append("\n");
+            sb.append("─────────────────\n");
+            sb.append("🔵 Daily\n");
+            sb.append("─────────────────\n");
+            for (int i = 0; i < dailyTasks.size(); i++) {
+                Task task = dailyTasks.get(i);
+                String due = task.getDueAt() != null ? "  📅 " + taskService.friendlyDate(task.getDueAt()) : "";
+                String cat = "none".equals(task.getCategory()) ? "" : "  📁 " + task.getCategory();
+                String habit = task.isHabit() ? "  🔄" : "";
+                sb.append("🔵 ").append(task.getTitle()).append("\n");
+                sb.append("   ").append(cat).append(due).append(habit).append("\n");
+                if (i < dailyTasks.size() - 1) sb.append("\n");
+            }
         }
 
         if (isDone) {
@@ -759,7 +843,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         StringBuilder sb = new StringBuilder("🔄 Habits (" + habits.size() + ")\n─────────────────\n");
         habits.forEach(h -> {
             int streak = taskService.getHabitStreak(h.getId());
-            String dot = switch (h.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; };
+            String dot = switch (h.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; };
             sb.append(dot).append(" ").append(h.getTitle())
               .append("\n  🔥 Streak: ").append(streak).append(" day(s)\n\n");
         });
@@ -780,7 +864,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         if (templates.isEmpty()) { sendText(chatId, "No templates yet.\n\nSay: \"save the gym task as a template called workout\""); return; }
         StringBuilder sb = new StringBuilder("💾 Templates (" + templates.size() + ")\n─────────────────\n");
         templates.forEach(t -> {
-            String dot = switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; };
+            String dot = switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; };
             sb.append(dot).append(" ").append(t.getName()).append("\n  Title: ").append(t.getTitle())
               .append("\n  Category: ").append(t.getCategory()).append("\n\n");
         });
@@ -838,7 +922,10 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         telegramClient.execute(b.build());
     }
 
-    public void sendText(long chatId, String text) { execute(SendMessage.builder().chatId(chatId).text(text).build()); }
+    public void sendText(long chatId, String text) {
+        execute(SendMessage.builder().chatId(chatId).text(text)
+                .parseMode("Markdown").build());
+    }
 
     private void execute(SendMessage msg) {
         try { telegramClient.execute(msg); }

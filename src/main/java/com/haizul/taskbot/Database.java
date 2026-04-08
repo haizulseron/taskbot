@@ -102,6 +102,7 @@ public class Database {
         migrate("ALTER TABLE tasks ADD COLUMN is_habit INTEGER DEFAULT 0");
         migrate("ALTER TABLE tasks ADD COLUMN reminder_ignored_count INTEGER DEFAULT 0");
         migrate("ALTER TABLE tasks ADD COLUMN reminder_lat REAL");
+        migrate("ALTER TABLE user_settings ADD COLUMN pomodoro_state TEXT");
         migrate("ALTER TABLE tasks ADD COLUMN reminder_lng REAL");
         migrate("ALTER TABLE tasks ADD COLUMN reminder_radius_meters INTEGER DEFAULT 200");
     }

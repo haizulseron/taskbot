@@ -4,7 +4,7 @@ import java.time.LocalDateTime;
 
 public class Task {
     public enum Priority {
-        LOW, MEDIUM, HIGH;
+        LOW, MEDIUM, HIGH, DAILY;
         public static Priority fromText(String value) {
             if (value == null || value.isBlank()) return MEDIUM;
             try { return Priority.valueOf(value.trim().toUpperCase()); } catch (Exception e) { return MEDIUM; }
@@ -102,7 +102,7 @@ public class Task {
 
     public int effectiveReminderIntervalMinutes() {
         if (reminderIntervalMinutes != null && reminderIntervalMinutes > 0) return reminderIntervalMinutes;
-        return switch (priority) { case HIGH -> 60; case MEDIUM -> 120; case LOW -> 360; };
+        return switch (priority) { case HIGH -> 60; case MEDIUM -> 120; case LOW -> 360; case DAILY -> 480; };
     }
 
     public boolean hasLocationReminder() {

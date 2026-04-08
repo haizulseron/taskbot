@@ -10,6 +10,11 @@ import java.net.http.HttpResponse;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
 
 public class ClaudeService {
 
@@ -32,7 +37,11 @@ public class ClaudeService {
             // habit
             boolean habitToggle,
             // clarification
-            String clarification
+            String clarification,
+            // pomodoro
+            int pomodoroWork,
+            int pomodoroBreak,
+            int pomodoroRounds
     ) {}
 
     private static final String API_URL = "https://api.anthropic.com/v1/messages";
@@ -70,8 +79,10 @@ public class ClaudeService {
             use_template          — create task from a saved template
             edit_task             — change a specific field on a task
             toggle_habit          — mark/unmark a task as a habit
-            start_focus           — start a focus/Pomodoro session
+            start_focus           — start a focus session
             stop_focus            — cancel active focus session
+            start_pomodoro        — start a Pomodoro cycle ("pomodoro", "pomodoro mode", "work/break cycle")
+            mark_daily_done       — mark ALL daily tasks done only ("done with my dailies", "complete all daily tasks")
             set_location_reminder — set a location-based reminder for a task
             undo                  — undo the last action
             unknown               — unclear or unrelated message
@@ -80,7 +91,7 @@ public class ClaudeService {
             type                      string   required
             title                     string   for "task"
             due_date                  string   ISO-8601 e.g. "2026-04-02T20:00:00"
-            priority                  string   "high"/"medium"/"low" (default "medium")
+            priority                  string   "high"/"medium"/"low"/"daily" (default "medium")
             category                  string   slug e.g. "school", "work", "none"
             recurrence                string   "none"/"daily"/"weekly"/"monthly"
             notes                     string   extra details
@@ -101,9 +112,13 @@ public class ClaudeService {
             focus_duration_minutes    int      default 25
             habit_toggle              boolean  true to enable, false to disable
             clarification             string   only for "unknown"
+            pomodoro_work             int      work duration in minutes (default 25)
+            pomodoro_break            int      break duration in minutes (default 5)
+            pomodoro_rounds           int      number of rounds (default 4)
 
             RULES:
             - "ASAP"/"urgent" → high priority; "eventually"/"whenever" → low priority
+            - "daily", "everyday", "routine", "habit task" → daily priority
             - "tonight" = today ~20:00; "next week" = 7 days from now
             - Greetings alone → unknown with friendly reply
             - "change the gym task to high priority" → edit_task + target_title:"gym" + edit_field:"priority" + edit_value:"high"
@@ -116,6 +131,8 @@ public class ClaudeService {
             - "set reminder for all overdue tasks" → set_reminder_interval + target_title:"ALL_OVERDUE"
             - "snooze all overdue tasks" → snooze_task + target_title:"ALL_OVERDUE"
             - "undo" / "undo that" → undo
+            - "pomodoro", "start pomodoro", "pomodoro mode" → start_pomodoro
+            - "done with my dailies", "complete all daily tasks", "finish all daily" → mark_daily_done
             - "remember that X", "note this down", "save this for later" → save_note
             - "when is X", "what did I save about Y", "find my notes on Z" → search_notes
             - If unsure whether user wants to save a task or a note: tasks have due dates/actions, notes are things to remember/recall
@@ -134,10 +151,19 @@ public class ClaudeService {
         this.mapper  = new ObjectMapper();
     }
 
-    public ParsedTask parse(String userMessage) {
+    public ParsedTask parse(String userMessage, List<Map<String, String>> history) {
         String now = LocalDateTime.now(zoneId).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
-        String content = "Today is " + now + " (" + zoneId + ").\n\nUser: " + userMessage;
-        return callApi(content, 400, SYSTEM_PROMPT, this::mapToParsedTask);
+        String systemWithDate = SYSTEM_PROMPT + "\nToday is " + now + " (" + zoneId + ").";
+
+        // Build messages array: history + current message
+        List<Map<String, String>> messages = new ArrayList<>(history);
+        messages.add(Map.of("role", "user", "content", userMessage));
+
+        return callApiWithHistory(messages, 400, systemWithDate, this::mapToParsedTask);
+    }
+
+    public ParsedTask parse(String userMessage) {
+        return parse(userMessage, List.of());
     }
 
     /** Generates a short contextual motivating reminder message using Haiku */
@@ -146,6 +172,7 @@ public class ClaudeService {
             case HIGH   -> "high priority";
             case MEDIUM -> "medium priority";
             case LOW    -> "low priority";
+            case DAILY  -> "daily routine";
         };
         String cat   = (task.getCategory() != null && !task.getCategory().equals("none")) ? task.getCategory() : null;
         String notes = task.getNotes();
@@ -175,6 +202,30 @@ public class ClaudeService {
 
     @FunctionalInterface
     private interface ResponseMapper<T> { T map(JsonNode root) throws Exception; }
+
+    private <T> T callApiWithHistory(List<Map<String, String>> messages, int maxTokens,
+                                      String systemPrompt, ResponseMapper<T> responseMapper) {
+        try {
+            java.util.LinkedHashMap<String, Object> bodyMap = new java.util.LinkedHashMap<>();
+            bodyMap.put("model", MODEL);
+            bodyMap.put("max_tokens", maxTokens);
+            bodyMap.put("system", systemPrompt);
+            bodyMap.put("messages", messages);
+            String body = this.mapper.writeValueAsString(bodyMap);
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(API_URL))
+                    .header("Content-Type", "application/json")
+                    .header("x-api-key", apiKey)
+                    .header("anthropic-version", "2023-06-01")
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .build();
+
+            HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+            if (res.statusCode() != 200) { System.err.println("Claude API error " + res.statusCode()); return null; }
+            return responseMapper.map(this.mapper.readTree(res.body()));
+        } catch (Exception e) { System.err.println("ClaudeService error: " + e.getMessage()); return null; }
+    }
 
     private <T> T callApi(String userContent, int maxTokens, String systemPrompt, ResponseMapper<T> mapper) {
         try {
@@ -225,7 +276,10 @@ public class ClaudeService {
                 nb(p.path("edit_field")), nb(p.path("edit_value")),
                 p.path("focus_duration_minutes").asInt(25),
                 p.path("habit_toggle").asBoolean(true),
-                nb(p.path("clarification"))
+                nb(p.path("clarification")),
+                p.path("pomodoro_work").asInt(25),
+                p.path("pomodoro_break").asInt(5),
+                p.path("pomodoro_rounds").asInt(4)
         );
     }
 
@@ -244,6 +298,6 @@ public class ClaudeService {
     private static ParsedTask unknown(String clarification) {
         return new ParsedTask("unknown", null, null, null, null, null, null, null,
                 null, null, null, 0, null, null, null, null, null, null,
-                0, null, null, null, 0, false, clarification);
+                0, null, null, null, 0, false, clarification, 25, 5, 4);
     }
 }

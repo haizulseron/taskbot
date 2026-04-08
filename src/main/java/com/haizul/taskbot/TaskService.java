@@ -70,7 +70,7 @@ public class TaskService {
         for (int i = 0; i < tokens.size(); i++) {
             String token = tokens.get(i), lower = token.toLowerCase(Locale.ROOT);
             if (lower.startsWith("#") && lower.length() > 1) { category = normalizeCategory(lower.substring(1)); continue; }
-            if (lower.equals("!high") || lower.equals("!medium") || lower.equals("!low")) { priority = Task.Priority.fromText(lower.substring(1)); continue; }
+            if (lower.equals("!high") || lower.equals("!medium") || lower.equals("!low") || lower.equals("!daily")) { priority = Task.Priority.fromText(lower.substring(1)); continue; }
             if (lower.equals("every") && i + 1 < tokens.size()) {
                 String next = tokens.get(i + 1).toLowerCase(Locale.ROOT);
                 recurrence = switch (next) {
@@ -153,7 +153,7 @@ public class TaskService {
     }
 
     public List<Task> getActiveTasks(long userId) {
-        return queryTasks("SELECT * FROM tasks WHERE user_id=? AND status='ACTIVE' ORDER BY CASE priority WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END, due_at IS NULL, due_at, created_at", userId);
+        return queryTasks("SELECT * FROM tasks WHERE user_id=? AND status='ACTIVE' ORDER BY CASE priority WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END, due_at IS NULL, due_at, created_at", userId);
     }
 
     public List<Task> getFilteredTasks(long userId, String priorityFilter, String categoryFilter, String dueRangeFilter) {
@@ -241,6 +241,19 @@ public class TaskService {
             if (t.getRecurrence() != Task.Recurrence.NONE) createNextRecurring(t, now);
         }
         return active.size();
+    }
+
+    public int markAllDoneByPriority(long userId, Task.Priority priority) {
+        List<Task> targets = getActiveTasks(userId).stream()
+                .filter(t -> t.getPriority() == priority)
+                .collect(Collectors.toList());
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        for (Task t : targets) {
+            updateTaskStatus(t.getId(), Task.Status.DONE, now);
+            if (t.isHabit()) logHabitCompletion(t.getId(), userId);
+            if (t.getRecurrence() != Task.Recurrence.NONE) createNextRecurring(t, now);
+        }
+        return targets.size();
     }
 
     public boolean deleteTask(long userId, String shortId) {
@@ -432,22 +445,32 @@ public class TaskService {
              PreparedStatement s = c.prepareStatement("SELECT * FROM user_settings WHERE user_id=?")) {
             s.setLong(1, userId);
             try (ResultSet rs = s.executeQuery()) {
-                if (rs.next()) return new UserSettings(userId, rs.getString("quiet_start"), rs.getString("quiet_end"), rs.getInt("weekly_digest") == 1);
+                if (rs.next()) {
+                    String pomState = null;
+                    try { pomState = rs.getString("pomodoro_state"); } catch (Exception ignored) {}
+                    return new UserSettings(userId, rs.getString("quiet_start"), rs.getString("quiet_end"), rs.getInt("weekly_digest") == 1, pomState);
+                }
             }
         } catch (SQLException e) { throw new RuntimeException("Failed to fetch user settings", e); }
-        return new UserSettings(userId, null, null, true);
+        return new UserSettings(userId, null, null, true, null);
     }
 
     public void saveUserSettings(long userId, String quietStart, String quietEnd) {
+        saveUserSettings(userId, quietStart, quietEnd, null);
+    }
+
+    public void saveUserSettings(long userId, String quietStart, String quietEnd, String pomodoroState) {
         LocalDateTime now = LocalDateTime.now(zoneId);
         try (Connection c = database.getConnection();
              PreparedStatement s = c.prepareStatement("""
-                     INSERT INTO user_settings (user_id, quiet_start, quiet_end, weekly_digest, created_at, updated_at)
-                     VALUES (?, ?, ?, 1, ?, ?)
-                     ON CONFLICT(user_id) DO UPDATE SET quiet_start=excluded.quiet_start, quiet_end=excluded.quiet_end, updated_at=excluded.updated_at
+                     INSERT INTO user_settings (user_id, quiet_start, quiet_end, weekly_digest, created_at, updated_at, pomodoro_state)
+                     VALUES (?, ?, ?, 1, ?, ?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET quiet_start=excluded.quiet_start, quiet_end=excluded.quiet_end,
+                         pomodoro_state=excluded.pomodoro_state, updated_at=excluded.updated_at
                      """)) {
             s.setLong(1, userId); s.setString(2, quietStart); s.setString(3, quietEnd);
             s.setString(4, now.toString()); s.setString(5, now.toString());
+            s.setString(6, pomodoroState);
             s.executeUpdate();
         } catch (SQLException e) { throw new RuntimeException("Failed to save user settings", e); }
     }
@@ -514,7 +537,7 @@ public class TaskService {
     // ── Formatting ───────────────────────────────────────────────────────────
 
     public String formatTask(Task task) {
-        String dot  = switch (task.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; };
+        String dot  = switch (task.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; };
         String cat  = "none".equals(task.getCategory()) ? "" : "  📁 " + task.getCategory();
         String due  = task.getDueAt() == null ? "" : "  📅 " + friendlyDate(task.getDueAt());
         String rec  = task.getRecurrence() == Task.Recurrence.NONE ? "" : "  🔁 " + capitalize(task.getRecurrence().name());
@@ -544,9 +567,10 @@ public class TaskService {
         List<Task> stale   = getStaleTasks(userId);
         List<Task> done    = getDoneTasks(userId);
 
-        long high = active.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
-        long med  = active.stream().filter(t -> t.getPriority() == Task.Priority.MEDIUM).count();
-        long low  = active.stream().filter(t -> t.getPriority() == Task.Priority.LOW).count();
+        long high  = active.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
+        long med   = active.stream().filter(t -> t.getPriority() == Task.Priority.MEDIUM).count();
+        long low   = active.stream().filter(t -> t.getPriority() == Task.Priority.LOW).count();
+        long daily = active.stream().filter(t -> t.getPriority() == Task.Priority.DAILY).count();
 
         // Productivity score: done this week / (done + active this week)
         LocalDateTime weekAgo = LocalDateTime.now(zoneId).minusDays(7);
@@ -579,6 +603,7 @@ public class TaskService {
                 + "  🔴 High   " + high + "\n"
                 + "  🟡 Medium " + med + "\n"
                 + "  🟢 Low    " + low + "\n"
+                + "  🔵 Daily  " + daily + "\n"
                 + "─────────────────\n"
                 + "📅 Due today:  " + today.size() + "\n"
                 + "⚠️ Overdue:   " + overdue.size() + "\n"
@@ -635,7 +660,7 @@ public class TaskService {
         return sb.toString().trim();
     }
 
-    private String dot(Task t) { return switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; }; }
+    private String dot(Task t) { return switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; }; }
 
     public static String usageText() {
         return """
@@ -681,19 +706,49 @@ public class TaskService {
 
         for (Task task : active) {
             long minsUntilDue = Duration.between(now, task.getDueAt()).toMinutes();
-            // Only remind within 48h window, and not more than 1h after due (unless repeat)
-            if (minsUntilDue > 2880) continue;
+
+            // Only start reminding when within the natural reminder window based on priority:
+            // HIGH: remind from 24h out, MEDIUM/DAILY: 6h out, LOW: 2h out
+            long windowMins = switch (task.getPriority()) {
+                case HIGH   -> 1440; // 24h
+                case MEDIUM -> 360;  // 6h
+                case DAILY  -> 360;  // 6h
+                case LOW    -> 120;  // 2h
+            };
+            // If a custom interval is set, use that as the window too
+            if (task.getReminderIntervalMinutes() != null) {
+                windowMins = Math.max(windowMins, task.getReminderIntervalMinutes() * 3L);
+            }
+            if (minsUntilDue > windowMins) continue;
             if (minsUntilDue < -60 && !task.isRepeatReminder()) continue;
 
-            int intervalMins = task.effectiveReminderIntervalMinutes();
-            LocalDateTime lastReminded = task.getLastReminderAt() != null ? task.getLastReminderAt() : task.getCreatedAt();
-            long minsSinceLastReminder = Duration.between(lastReminded, now).toMinutes();
+            // How often to repeat the reminder once inside the window
+            int intervalMins = task.getReminderIntervalMinutes() != null && task.getReminderIntervalMinutes() > 0
+                    ? task.getReminderIntervalMinutes()
+                    : switch (task.getPriority()) {
+                        case HIGH   -> 60;
+                        case MEDIUM -> 120;
+                        case DAILY  -> 120;
+                        case LOW    -> 60;
+                    };
 
-            if (minsSinceLastReminder >= intervalMins) {
+            LocalDateTime lastReminded = task.getLastReminderAt();
+            // Never reminded yet — send first reminder now that we're in the window
+            if (lastReminded == null) {
                 String label = minsUntilDue < 0 ? "Overdue"
-                        : minsUntilDue <= 30 ? "Due very soon (" + minsUntilDue + " min)"
+                        : minsUntilDue <= 30  ? "Due very soon (" + minsUntilDue + " min)"
                         : minsUntilDue <= 120 ? "Due within 2 hours"
-                        : "Due within 24 hours";
+                        : "Due today";
+                due.add(new ReminderDue(task, label));
+                continue;
+            }
+
+            long minsSinceLast = Duration.between(lastReminded, now).toMinutes();
+            if (minsSinceLast >= intervalMins) {
+                String label = minsUntilDue < 0 ? "Overdue"
+                        : minsUntilDue <= 30  ? "Due very soon (" + minsUntilDue + " min)"
+                        : minsUntilDue <= 120 ? "Due within 2 hours"
+                        : "Due today";
                 due.add(new ReminderDue(task, label));
             }
         }

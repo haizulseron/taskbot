@@ -43,6 +43,7 @@ public class SchedulerService {
         sendReminders();
         sendStaleTaskPings();
         checkFocusSessions();
+        checkPomodoro();
         sendMorningSummaries();
         sendWeeklyDigests();
         cleanupKeys();
@@ -148,6 +149,73 @@ public class SchedulerService {
             if (sentWeeklyKeys.contains(key)) continue;
             taskBot.sendText(uc.chatId(), taskService.buildWeeklyDigest(uc.userId()));
             sentWeeklyKeys.add(key);
+        }
+    }
+
+
+    // ── Pomodoro ─────────────────────────────────────────────────────────────
+
+    private void checkPomodoro() {
+        for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
+            UserSettings settings = taskService.getUserSettings(uc.userId());
+            String state = settings.getPomodoroState();
+            if (state == null || !state.startsWith("POMODORO:")) continue;
+
+            // Format: POMODORO:rounds:workMins:breakMins:currentRound:phase
+            String[] parts = state.split(":");
+            if (parts.length < 6) continue;
+
+            try {
+                int totalRounds    = Integer.parseInt(parts[1]);
+                int workMins       = Integer.parseInt(parts[2]);
+                int breakMins      = Integer.parseInt(parts[3]);
+                int currentRound   = Integer.parseInt(parts[4]);
+                String phase       = parts[5]; // "work" or "break"
+
+                FocusSession session = taskService.getActiveFocusSession(uc.userId());
+
+                // Check if current phase session has ended
+                java.util.List<FocusSession> completed = taskService.findUnnotifiedCompletedSessions();
+                boolean currentDone = completed.stream().anyMatch(s -> s.getUserId() == uc.userId());
+
+                if (!currentDone) continue;
+
+                // Mark current session notified
+                completed.stream().filter(s -> s.getUserId() == uc.userId())
+                        .forEach(s -> taskService.markFocusSessionNotified(s.getId()));
+
+                String taskTitle = session != null ? session.getTaskTitle()
+                        .replaceAll(" \\[Pomodoro .*\\]", "") : "your task";
+
+                if (phase.equals("work")) {
+                    if (currentRound >= totalRounds) {
+                        // All rounds done!
+                        taskBot.sendText(uc.chatId(), "🍅 Pomodoro complete!\n\n"
+                                + "You finished all " + totalRounds + " rounds for: " + taskTitle + "\n\n"
+                                + "Excellent work! Take a proper break. 🎉");
+                        taskService.saveUserSettings(uc.userId(), settings.getQuietStart(), settings.getQuietEnd(), null);
+                    } else {
+                        // Start break
+                        String newState = "POMODORO:" + totalRounds + ":" + workMins + ":" + breakMins + ":" + currentRound + ":break";
+                        taskService.saveUserSettings(uc.userId(), settings.getQuietStart(), settings.getQuietEnd(), newState);
+                        taskService.startFocusSession(uc.userId(), uc.chatId(),
+                                taskTitle + " [Break " + currentRound + "/" + totalRounds + "]", breakMins);
+                        taskBot.sendText(uc.chatId(), "☕ Break time! (" + breakMins + " min)\n\n"
+                                + "Round " + currentRound + "/" + totalRounds + " done. Rest up, next work session starts after your break.");
+                    }
+                } else {
+                    // Break done — start next work round
+                    int nextRound = currentRound + 1;
+                    String newState = "POMODORO:" + totalRounds + ":" + workMins + ":" + breakMins + ":" + nextRound + ":work";
+                    taskService.saveUserSettings(uc.userId(), settings.getQuietStart(), settings.getQuietEnd(), newState);
+                    taskService.startFocusSession(uc.userId(), uc.chatId(),
+                            taskTitle + " [Pomodoro " + nextRound + "/" + totalRounds + "]", workMins);
+                    taskBot.sendText(uc.chatId(), "🍅 Back to work! Round " + nextRound + "/" + totalRounds + "\n\n"
+                            + workMins + " min focus session started. Let's go! 💪");
+                }
+            } catch (Exception e) {
+                System.err.println("Pomodoro check error: " + e.getMessage());
+            }
         }
     }
 
