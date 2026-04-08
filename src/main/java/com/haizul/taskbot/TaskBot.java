@@ -186,6 +186,12 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             case "/edittasks"    -> sendEditableTaskList(chatId, "📋 Active Tasks", taskService.getActiveTasks(userId));
             case "/recentnotes"  -> handleRecentNotes(chatId, userId);
             case "/setupnotes"   -> handleSetupNotes(chatId);
+            case "/stoppomodoro" -> {
+                boolean stopped = taskService.stopFocusSession(userId);
+                UserSettings us = taskService.getUserSettings(userId);
+                taskService.saveUserSettings(userId, us.getQuietStart(), us.getQuietEnd(), null);
+                sendText(chatId, stopped ? "⏹ Pomodoro stopped." : "No active Pomodoro session.");
+            }
             case "/add"       -> sendText(chatId, addHelpText());
             default           -> handleTextCommand(chatId, userId, text);
         }
@@ -211,6 +217,15 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             if (name.isBlank()) { sendText(chatId, "Usage: /addcategory <n>"); return; }
             taskService.addCategory(userId, name); sendText(chatId, "Added category: " + name.trim().toLowerCase()); return;
         }
+        if (text.startsWith("/pomodoro")) {
+            // Usage: /pomodoro [work] [break] [rounds]  e.g. /pomodoro 25 5 4
+            String[] parts = text.trim().split("\\s+");
+            int work   = parts.length > 1 ? parseIntSafe(parts[1], 25) : 25;
+            int brk    = parts.length > 2 ? parseIntSafe(parts[2], 5)  : 5;
+            int rounds = parts.length > 3 ? parseIntSafe(parts[3], 4)  : 4;
+            handleStartPomodoro(chatId, userId, "your session", work, brk, rounds);
+            return;
+        }
         if (text.startsWith("/search ")) {
             String query = text.substring(8).trim();
             sendTaskList(chatId, "🔍 Search: " + query, taskService.searchTasks(userId, query), true); return;
@@ -218,6 +233,29 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         if (text.startsWith("/")) { sendText(chatId, "Unknown command. Use /help"); return; }
 
         if (claudeService != null) {
+            // Pre-process pomodoro/focus keywords in Java before hitting Claude
+            String lower = text.toLowerCase(java.util.Locale.ROOT);
+            if (lower.contains("stop pomodoro") || lower.contains("cancel pomodoro")
+                    || lower.contains("stop focus") || lower.contains("end session")
+                    || lower.contains("cancel session")) {
+                boolean stopped = taskService.stopFocusSession(userId);
+                UserSettings us = taskService.getUserSettings(userId);
+                taskService.saveUserSettings(userId, us.getQuietStart(), us.getQuietEnd(), null);
+                sendText(chatId, stopped ? "⏹ Session stopped." : "No active session.");
+                return;
+            }
+            // Simple pomodoro start: must contain "pomodoro" but NOT other task-related keywords
+            if (lower.contains("pomodoro") && !lower.contains("task") && !lower.contains("what")
+                    && !lower.contains("show") && !lower.contains("list") && !lower.contains("my tasks")) {
+                // Parse optional duration e.g. "pomodoro for 1 hour" → 60 min total ÷ 25 = rounds
+                int work = 25, brk = 5, rounds = 4;
+                java.util.regex.Matcher mWork = java.util.regex.Pattern.compile("(\\d+)\\s*min").matcher(lower);
+                java.util.regex.Matcher mHour = java.util.regex.Pattern.compile("(\\d+)\\s*hour").matcher(lower);
+                if (mWork.find()) work = Integer.parseInt(mWork.group(1));
+                else if (mHour.find()) { int totalMins = Integer.parseInt(mHour.group(1)) * 60; rounds = Math.max(1, totalMins / 25); }
+                handleStartPomodoro(chatId, userId, "your session", work, brk, rounds);
+                return;
+            }
             addToHistory(userId, "user", text);
             handleNaturalLanguage(chatId, userId, text);
         } else sendText(chatId, "Unknown command. Use /help\n\n💡 Set CLAUDE_API_KEY to enable natural language.");
@@ -272,13 +310,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 sendText(chatId, n > 0 ? "🔵 Marked " + n + " daily task(s) done. Nice work!" : "No daily tasks to complete.");
             }
 
-            case "start_pomodoro" -> {
-                int work   = p.pomodoroWork()   > 0 ? p.pomodoroWork()   : 25;
-                int brk    = p.pomodoroBreak()  > 0 ? p.pomodoroBreak()  : 5;
-                int rounds = p.pomodoroRounds() > 0 ? p.pomodoroRounds() : 4;
-                String taskTitle = p.targetTitle() != null ? p.targetTitle() : "your session";
-                handleStartPomodoro(chatId, userId, taskTitle, work, brk, rounds);
-            }
+
             case "delete_task" -> {
                 if (p.targetTitle() == null) { sendText(chatId, "Which task would you like to delete?"); return; }
                 taskService.findTaskByTitleHint(userId, p.targetTitle()).ifPresentOrElse(
@@ -361,12 +393,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 }
             }
 
-            case "stop_focus" -> {
-                FocusSession active = taskService.getActiveFocusSession(userId);
-                if (active == null) { sendText(chatId, "No active focus session."); return; }
-                taskService.stopFocusSession(userId);
-                sendText(chatId, "⏹ Focus session stopped.\n\nTask: " + active.getTaskTitle());
-            }
+
 
             case "set_reminder_interval" -> {
                 if (p.targetTitle() == null) { sendText(chatId, "Which task?"); return; }
@@ -626,6 +653,10 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 + "Round 1 of " + rounds + " — " + workMins + " min work\n"
                 + "Break: " + breakMins + " min between rounds\n\n"
                 + "Focus up! I'll ping you when it's break time. 💪");
+    }
+
+    private static int parseIntSafe(String s, int fallback) {
+        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return fallback; }
     }
 
     private void handleUndo(long chatId, long userId) {

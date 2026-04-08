@@ -79,9 +79,6 @@ public class ClaudeService {
             use_template          — create task from a saved template
             edit_task             — change a specific field on a task
             toggle_habit          — mark/unmark a task as a habit
-            start_focus           — start a focus session
-            stop_focus            — cancel active focus session
-            start_pomodoro        — start a Pomodoro cycle ("pomodoro", "pomodoro mode", "work/break cycle")
             mark_daily_done       — mark ALL daily tasks done only ("done with my dailies", "complete all daily tasks")
             set_location_reminder — set a location-based reminder for a task
             undo                  — undo the last action
@@ -112,9 +109,8 @@ public class ClaudeService {
             focus_duration_minutes    int      default 25
             habit_toggle              boolean  true to enable, false to disable
             clarification             string   only for "unknown"
-            pomodoro_work             int      work duration in minutes (default 25)
-            pomodoro_break            int      break duration in minutes (default 5)
-            pomodoro_rounds           int      number of rounds (default 4)
+
+
 
             RULES:
             - ALWAYS parse "add X", "remind me to X", "X tomorrow/today/[date]" as type:"task" — never as list_tasks
@@ -135,8 +131,8 @@ public class ClaudeService {
             - "set reminder for all overdue tasks" → set_reminder_interval + target_title:"ALL_OVERDUE"
             - "snooze all overdue tasks" → snooze_task + target_title:"ALL_OVERDUE"
             - "undo" / "undo that" → undo
-            - "pomodoro", "start pomodoro", "pomodoro mode" → start_pomodoro
             - "done with my dailies", "complete all daily tasks", "finish all daily" → mark_daily_done
+
             - "remember that X", "note this down", "save this for later" → save_note
             - "when is X", "what did I save about Y", "find my notes on Z" → search_notes
             - If unsure whether user wants to save a task or a note: tasks have due dates/actions, notes are things to remember/recall
