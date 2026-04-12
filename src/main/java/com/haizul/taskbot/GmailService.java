@@ -6,6 +6,7 @@ import com.google.api.services.gmail.model.ListMessagesResponse;
 import com.google.api.services.gmail.model.Message;
 import com.google.api.services.gmail.model.MessagePartHeader;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -124,7 +125,7 @@ Haizul Ali Seron""";
         sb.append("To: ").append(to).append("\r\n");
         if (cc  != null && !cc.isBlank())  sb.append("CC: ").append(cc).append("\r\n");
         if (bcc != null && !bcc.isBlank()) sb.append("BCC: ").append(bcc).append("\r\n");
-        sb.append("Subject: ").append(subject).append("\r\n");
+        sb.append("Subject: ").append(encodeHeader(subject)).append("\r\n");
         if (inReplyTo != null && !inReplyTo.isBlank()) {
             sb.append("In-Reply-To: ").append(inReplyTo).append("\r\n");
             sb.append("References: ").append(inReplyTo).append("\r\n");
@@ -145,7 +146,7 @@ Haizul Ali Seron""";
         sb.append("To: ").append(to).append("\r\n");
         if (cc  != null && !cc.isBlank())  sb.append("CC: ").append(cc).append("\r\n");
         if (bcc != null && !bcc.isBlank()) sb.append("BCC: ").append(bcc).append("\r\n");
-        sb.append("Subject: ").append(subject).append("\r\n");
+        sb.append("Subject: ").append(encodeHeader(subject)).append("\r\n");
         if (inReplyTo != null && !inReplyTo.isBlank()) {
             sb.append("In-Reply-To: ").append(inReplyTo).append("\r\n");
             sb.append("References: ").append(inReplyTo).append("\r\n");
@@ -173,6 +174,24 @@ Haizul Ali Seron""";
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * RFC 2047 encodes a header value (e.g. Subject) so that any non-ASCII
+     * characters — smart quotes, apostrophes, accents, etc. — are transmitted
+     * as Base64-encoded UTF-8 instead of raw bytes.  Without this, email clients
+     * that default to Latin-1 show "â€™" instead of a plain apostrophe.
+     */
+    private static String encodeHeader(String value) {
+        // Only encode if there are non-ASCII characters
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) > 127) {
+                return "=?UTF-8?B?"
+                        + Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8))
+                        + "?=";
+            }
+        }
+        return value;
+    }
 
     private String getHeader(Message msg, String name) {
         if (msg.getPayload() == null || msg.getPayload().getHeaders() == null) return "";
