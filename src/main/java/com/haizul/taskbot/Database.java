@@ -2,8 +2,14 @@ package com.haizul.taskbot;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 public class Database {
     private final String jdbcUrl;
@@ -91,6 +97,17 @@ public class Database {
                         notified INTEGER DEFAULT 0
                     )
                     """);
+            s.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS conversation_history (
+                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id    INTEGER NOT NULL,
+                        role       TEXT    NOT NULL,
+                        content    TEXT    NOT NULL,
+                        created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                    )
+                    """);
+            s.executeUpdate(
+                    "CREATE INDEX IF NOT EXISTS idx_conv_user ON conversation_history(user_id, id)");
         } catch (SQLException e) {
             throw new RuntimeException("Failed to initialize database", e);
         }
@@ -106,6 +123,69 @@ public class Database {
         migrate("ALTER TABLE tasks ADD COLUMN reminder_lng REAL");
         migrate("ALTER TABLE tasks ADD COLUMN reminder_radius_meters INTEGER DEFAULT 200");
     }
+
+    // ── Conversation history ──────────────────────────────────────────────────
+
+    /** Append a message to the persisted conversation history for a user. */
+    public void appendConversation(long userId, String role, String content) {
+        String sql = "INSERT INTO conversation_history (user_id, role, content) VALUES (?, ?, ?)";
+        try (Connection c = getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setString(2, role);
+            ps.setString(3, content);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Failed to save conversation: " + e.getMessage());
+        }
+        // Keep only the last MAX rows per user (trim old history automatically)
+        pruneConversation(userId, 40);
+    }
+
+    /** Load the most recent messages for a user, oldest-first, capped at limit. */
+    public List<Map<String, Object>> loadConversation(long userId, int limit) {
+        String sql = """
+                SELECT role, content FROM conversation_history
+                WHERE user_id = ?
+                ORDER BY id DESC LIMIT ?
+                """;
+        List<Map<String, Object>> rows = new ArrayList<>();
+        try (Connection c = getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setInt(2, limit);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("role",    rs.getString("role"));
+                row.put("content", rs.getString("content"));
+                rows.add(row);
+            }
+        } catch (SQLException e) {
+            System.err.println("Failed to load conversation: " + e.getMessage());
+        }
+        // Reverse so oldest message is first (Claude expects chronological order)
+        java.util.Collections.reverse(rows);
+        return rows;
+    }
+
+    /** Delete all conversation history older than the newest keepCount rows for this user. */
+    private void pruneConversation(long userId, int keepCount) {
+        String sql = """
+                DELETE FROM conversation_history
+                WHERE user_id = ? AND id NOT IN (
+                    SELECT id FROM conversation_history WHERE user_id = ? ORDER BY id DESC LIMIT ?
+                )
+                """;
+        try (Connection c = getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setLong(2, userId);
+            ps.setInt(3, keepCount);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Failed to prune conversation: " + e.getMessage());
+        }
+    }
+
+    // ── Migrations ────────────────────────────────────────────────────────────
 
     private void migrate(String sql) {
         try (Connection c = getConnection(); Statement s = c.createStatement()) {

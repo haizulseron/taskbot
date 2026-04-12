@@ -12,7 +12,10 @@ import java.net.http.HttpResponse;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 public class ClaudeService {
 
@@ -21,48 +24,71 @@ public class ClaudeService {
     private static final int    MAX_TURNS = 8; // max tool call rounds per message
 
     private static final String SYSTEM_PROMPT = """
-            You are Proton, a smart personal productivity assistant managing tasks and notes for the user.
-            You have tools to create/edit/complete tasks, save notes, and search notes.
-            
+            You are Proton, a smart personal productivity assistant managing tasks, notes, email, calendar, and files.
+
             Personality: friendly, casual, like a helpful mate. Keep responses concise.
             Always confirm what you did in plain English after using tools.
-            
+
             CRITICAL RULES:
-            - Only call tools when the user clearly wants to DO something with tasks or notes
-            - Casual conversation, questions about yourself, greetings, or venting → respond naturally with text, NO tool calls
-            - Examples that should NEVER trigger tools: "whats up", "how are you", "you're making no sense", "what can you do", "thanks", "ok", "lol"
-            - Examples that SHOULD trigger tools: "add gym tomorrow", "mark report done", "show my tasks", "remember that X"
+            - Only call tools when the user clearly wants to DO something
+            - Casual conversation, greetings, or venting → respond naturally with text, NO tool calls
+            - Examples that should NEVER trigger tools: "whats up", "how are you", "thanks", "ok", "lol"
+            - Examples that SHOULD trigger tools: "add gym tomorrow", "mark report done", "check my inbox", "what's on my calendar"
             - When in doubt whether to call a tool, DON'T — just respond conversationally
             - For multiple actions in one message, call multiple tools
             - When listing tasks, format them clearly with priority emoji: 🔴 high, 🟡 medium, 🟢 low, 🔵 daily
             - Dates/times: always interpret relative to today's date in the system context
             - If a task isn't found by title, say so and ask the user to be more specific
             - For notes, always save them — don't ask for confirmation
+
+            CALENDAR RULES:
+            - Interpret all date/times relative to the current date/time in the system context
+            - For add_event, if no end time given, default to 1 hour after start
+            - For reschedule_event, use the event title as the hint
+
+            DRIVE RULES:
+            - search_drive ONLY lists files — it does NOT send anything to Telegram
+            - To actually deliver a file, you MUST call send_drive_file with the exact file_id from search_drive results
+            - NEVER say a file was sent without having called send_drive_file first
+            - Always call search_drive first to get the file_id, then immediately call send_drive_file in the same turn
+            - If the user asks for a specific file (e.g. "first one"), call send_drive_file with that file's id right away
+
+            EMAIL RULES:
+            - ALWAYS write emails in a professional, clear, and polished tone — no exceptions
+            - Always open with an appropriate greeting (e.g. "Dear [Name]," or "Hi [Name]," depending on formality)
+            - Do NOT add a sign-off or signature in the body — the system automatically appends "Warm regards, Haizul Ali Seron"
+            - For draft_email: YOU compose the full subject AND body right now. Do not ask for more info.
+            - For reply_email: write a professional reply body, then call the tool with the original message_id
+            - Attached files from Telegram are automatically included when drafting/replying — no need to mention them
             """;
 
     private final String apiKey;
     private final ZoneId zoneId;
     private final HttpClient http;
     private final ObjectMapper mapper;
+    private final Database db;
 
-    // Per-user conversation history (rolling, user messages only for context)
-    private final Map<Long, LinkedList<Map<String, Object>>> history = new HashMap<>();
-    private static final int MAX_HISTORY = 10;
+    // How many individual messages (user + assistant alternating) to keep per user
+    private static final int MAX_HISTORY = 20;
 
-    public ClaudeService(String apiKey, ZoneId zoneId) {
+    public ClaudeService(String apiKey, ZoneId zoneId, Database db) {
         this.apiKey  = apiKey;
         this.zoneId  = zoneId;
         this.http    = HttpClient.newHttpClient();
         this.mapper  = new ObjectMapper();
+        this.db      = db;
     }
 
     // ── Main agent entry point ────────────────────────────────────────────────
 
-    @FunctionalInterface
-    public interface MessageSender { void send(String text); }
+    @FunctionalInterface public interface MessageSender { void send(String text); }
+    @FunctionalInterface public interface FileSender    { void send(String filename, byte[] data); }
 
-    public String chat(long userId, long chatId, String userMessage, TaskService taskService,
-                       NotionService notionService, NoteService noteService, MessageSender sender) {
+    public String chat(long userId, long chatId, String userMessage,
+                       TaskService taskService, NotionService notionService, NoteService noteService,
+                       GmailService gmailService, CalendarService calendarService, DriveService driveService,
+                       List<GmailService.Attachment> pendingAttachments,
+                       MessageSender sender, FileSender fileSender) {
         String now = LocalDateTime.now(zoneId).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
         String systemWithDate = SYSTEM_PROMPT + "\n\nCurrent date/time: " + now + " (" + zoneId + ")";
 
@@ -111,7 +137,8 @@ public class ClaudeService {
                 String toolName  = (String) toolBlock.get("name");
                 String toolUseId = (String) toolBlock.get("id");
                 Map<String, Object> input = (Map<String, Object>) toolBlock.get("input");
-                String result = executeTool(toolName, input, userId, taskService, notionService, noteService, sender);
+                String result = executeTool(toolName, input, userId, taskService, notionService, noteService,
+                        gmailService, calendarService, driveService, pendingAttachments, sender, fileSender);
                 System.out.println("Tool [" + toolName + "] result: " + result.substring(0, Math.min(120, result.length())));
                 toolResults.add(Map.of("type", "tool_result", "tool_use_id", toolUseId, "content", result));
             }
@@ -126,7 +153,9 @@ public class ClaudeService {
 
     private String executeTool(String name, Map<String, Object> input, long userId,
                                 TaskService taskService, NotionService notionService, NoteService noteService,
-                                MessageSender sender) {
+                                GmailService gmailService, CalendarService calendarService, DriveService driveService,
+                                List<GmailService.Attachment> pendingAttachments,
+                                MessageSender sender, FileSender fileSender) {
         try {
             return switch (name) {
                 case "create_task" -> {
@@ -333,6 +362,117 @@ public class ClaudeService {
                     yield (enable ? "Marked as habit: " : "Removed from habits: ") + opt.get().getTitle();
                 }
 
+                // ── Email ──────────────────────────────────────────────────────────
+                case "read_emails" -> {
+                    if (gmailService == null) yield "Gmail not connected. Send /authorize to link your Google account.";
+                    int count = intVal(input, "count", 5);
+                    List<GmailService.EmailSummary> emails = gmailService.getInbox(count);
+                    if (emails.isEmpty()) yield "No emails in inbox.";
+                    StringBuilder sb = new StringBuilder("📧 Inbox (" + emails.size() + ")\n─────────────────\n\n");
+                    for (int i = 0; i < emails.size(); i++) {
+                        GmailService.EmailSummary e = emails.get(i);
+                        sb.append(i + 1).append(". ").append(e.subject()).append("\n");
+                        sb.append("   From: ").append(e.from()).append("\n");
+                        sb.append("   ").append(e.date()).append("\n");
+                        if (e.snippet() != null && !e.snippet().isBlank())
+                            sb.append("   ").append(e.snippet()).append("\n");
+                        sb.append("   ID: ").append(e.id()).append("\n\n");
+                    }
+                    sender.send(sb.toString().trim());
+                    // Return IDs separately so Claude can reference them for replies
+                    StringBuilder ids = new StringBuilder("Emails shown. Message IDs for reply:\n");
+                    emails.forEach(e -> ids.append("• ").append(e.subject()).append(" → ").append(e.id()).append("\n"));
+                    yield ids.toString();
+                }
+
+                case "draft_email" -> {
+                    if (gmailService == null) yield "Gmail not connected. Send /authorize to link your Google account.";
+                    String to      = str(input, "to");
+                    String cc      = str(input, "cc");
+                    String subject = str(input, "subject");
+                    String body    = str(input, "body");
+                    String draftId = gmailService.createDraft(to, cc, subject, body, pendingAttachments);
+                    String attNote = (pendingAttachments != null && !pendingAttachments.isEmpty())
+                            ? " (" + pendingAttachments.size() + " attachment(s) included)" : "";
+                    yield "Draft saved" + attNote + ". Open Gmail to review and send.";
+                }
+
+                case "reply_email" -> {
+                    if (gmailService == null) yield "Gmail not connected. Send /authorize to link your Google account.";
+                    String messageId = str(input, "message_id");
+                    String body      = str(input, "body");
+                    String draftId   = gmailService.replyToDraft(messageId, body, pendingAttachments);
+                    String attNote   = (pendingAttachments != null && !pendingAttachments.isEmpty())
+                            ? " (" + pendingAttachments.size() + " attachment(s) included)" : "";
+                    yield "Reply draft saved" + attNote + ". Open Gmail to review and send.";
+                }
+
+                // ── Calendar ───────────────────────────────────────────────────────
+                case "list_events" -> {
+                    if (calendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    int days = intVal(input, "days", 7);
+                    List<CalendarService.EventSummary> events = calendarService.getUpcomingEvents(days);
+                    if (events.isEmpty()) yield "No events in the next " + days + " days.";
+                    StringBuilder sb = new StringBuilder("📅 Calendar (next " + days + " days)\n─────────────────\n\n");
+                    for (CalendarService.EventSummary e : events) {
+                        sb.append(e.start()).append("\n");
+                        sb.append("  📌 ").append(e.title()).append("\n");
+                        if (e.location() != null && !e.location().isBlank())
+                            sb.append("  📍 ").append(e.location()).append("\n");
+                        sb.append("\n");
+                    }
+                    sender.send(sb.toString().trim());
+                    yield "SENT_DIRECTLY";
+                }
+
+                case "add_event" -> {
+                    if (calendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    String title   = str(input, "title");
+                    String startDt = str(input, "start_datetime");
+                    String endDt   = str(input, "end_datetime");
+                    String desc    = str(input, "description");
+                    CalendarService.EventSummary created = calendarService.addEvent(title, startDt, endDt, desc);
+                    yield "Added to calendar: \"" + created.title() + "\" on " + created.start();
+                }
+
+                case "reschedule_event" -> {
+                    if (calendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    String hint  = str(input, "event_hint");
+                    String newDt = str(input, "new_start_datetime");
+                    yield calendarService.rescheduleEvent(hint, newDt);
+                }
+
+                // ── Google Drive ───────────────────────────────────────────────────
+                case "search_drive" -> {
+                    if (driveService == null) yield "Drive not connected. Send /authorize to link your Google account.";
+                    String query = str(input, "query");
+                    List<DriveService.FileSummary> files = driveService.searchFiles(query);
+                    if (files.isEmpty()) yield "No files found matching: " + query + ". Try a shorter or different keyword.";
+                    StringBuilder sb = new StringBuilder("📁 Drive Results\n─────────────────\n\n");
+                    StringBuilder toolResult = new StringBuilder("Found " + files.size() + " file(s):\n");
+                    for (int i = 0; i < files.size(); i++) {
+                        DriveService.FileSummary f = files.get(i);
+                        sb.append(i + 1).append(". ").append(f.name()).append("\n");
+                        sb.append("   ID: ").append(f.id()).append("\n");
+                        if (f.size() != null) sb.append("   ").append(f.size() / 1024).append(" KB\n");
+                        sb.append("   ").append(f.modifiedTime()).append("\n\n");
+                        toolResult.append(i + 1).append(". \"").append(f.name()).append("\" — id: ").append(f.id()).append("\n");
+                    }
+                    toolResult.append("\nNOW call send_drive_file with the correct file_id to deliver it.");
+                    sender.send(sb.toString().trim());
+                    yield toolResult.toString();
+                }
+
+                case "send_drive_file" -> {
+                    if (driveService == null) yield "Drive not connected. Send /authorize to link your Google account.";
+                    String fileId = str(input, "file_id");
+                    DriveService.DriveFileResult file = driveService.downloadFile(fileId);
+                    if (file.data() == null || file.data().length == 0)
+                        yield "Downloaded file \"" + file.name() + "\" was empty. It may be a Google Workspace file that couldn't be exported, or access was denied.";
+                    fileSender.send(file.name(), file.data());
+                    yield "SENT_DIRECTLY";
+                }
+
                 default -> "Unknown tool: " + name;
             };
         } catch (Exception e) {
@@ -433,26 +573,73 @@ public class ClaudeService {
                     .req("enable", "boolean", "true to enable, false to disable")
         ));
 
+        // ── Email tools ─────────────────────────────────────────────────────────
+        tools.add(tool("read_emails", "Read recent emails from Gmail inbox",
+                props()
+                    .opt("count", "integer", "Number of emails to fetch (default: 5, max: 10)")
+        ));
+
+        tools.add(tool("draft_email", "Create a professional draft email in Gmail. Always use professional tone. YOU compose subject and body.",
+                props()
+                    .req("to",      "string", "Recipient email address")
+                    .opt("cc",      "string", "CC email address(es)")
+                    .req("subject", "string", "Email subject line — write it professionally")
+                    .req("body",    "string", "Full email body — always professional and polished, written by you")
+        ));
+
+        tools.add(tool("reply_email", "Reply to an email as a draft in Gmail. Always use professional tone. YOU compose the reply body.",
+                props()
+                    .req("message_id", "string", "ID of the email to reply to (from read_emails results)")
+                    .req("body",       "string", "Professional reply body — written by you")
+        ));
+
+        // ── Calendar tools ──────────────────────────────────────────────────────
+        tools.add(tool("list_events", "List upcoming Google Calendar events",
+                props()
+                    .opt("days", "integer", "Days ahead to look (default: 7)")
+        ));
+
+        tools.add(tool("add_event", "Add a new event to Google Calendar",
+                props()
+                    .req("title",          "string", "Event title")
+                    .req("start_datetime", "string", "Start datetime ISO-8601 e.g. 2026-04-15T09:00:00")
+                    .opt("end_datetime",   "string", "End datetime ISO-8601 (default: 1 hour after start)")
+                    .opt("description",    "string", "Event description or notes")
+        ));
+
+        tools.add(tool("reschedule_event", "Move a Google Calendar event to a new time",
+                props()
+                    .req("event_hint",        "string", "Keywords from the event title")
+                    .req("new_start_datetime","string", "New start datetime ISO-8601")
+        ));
+
+        // ── Drive tools ─────────────────────────────────────────────────────────
+        tools.add(tool("search_drive", "Search for files in Google Drive",
+                props()
+                    .req("query", "string", "Filename keywords to search for")
+        ));
+
+        tools.add(tool("send_drive_file", "Download a Drive file and send it to Telegram",
+                props()
+                    .req("file_id", "string", "Google Drive file ID (from search_drive results)")
+        ));
+
         return tools;
     }
 
-    // ── Conversation history ──────────────────────────────────────────────────
-    // Stores pairs of (userMessage, assistantResponse) as clean text.
-    // This gives Claude context for follow-ups like "actually make it 10am".
+    // ── Conversation history (persisted to SQLite) ────────────────────────────
+    // Survives bot restarts. Each exchange saves the user message + assistant
+    // response as two rows; the DB prunes to MAX_HISTORY rows automatically.
 
-    /** Call after each completed exchange with the user message and Claude's final text response. */
     private void addToHistory(long userId, String userMessage, String assistantResponse) {
-        LinkedList<Map<String, Object>> hist = history.computeIfAbsent(userId, k -> new LinkedList<>());
-        hist.add(Map.of("role", "user", "content", userMessage));
-        hist.add(Map.of("role", "assistant", "content", assistantResponse));
-        // Keep last MAX_HISTORY messages (pairs)
-        while (hist.size() > MAX_HISTORY) hist.removeFirst();
+        if (db == null) return;
+        db.appendConversation(userId, "user",      userMessage);
+        db.appendConversation(userId, "assistant", assistantResponse);
     }
 
     private List<Map<String, Object>> getHistory(long userId) {
-        LinkedList<Map<String, Object>> hist = history.get(userId);
-        if (hist == null || hist.size() < 2) return List.of();
-        return new ArrayList<>(hist);
+        if (db == null) return List.of();
+        return db.loadConversation(userId, MAX_HISTORY);
     }
 
     // ── Reminder message (used by SchedulerService) ───────────────────────────

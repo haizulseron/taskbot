@@ -3,8 +3,10 @@ package com.haizul.taskbot;
 import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
+import org.telegram.telegrambots.meta.api.methods.send.SendDocument;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
+import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
@@ -12,6 +14,13 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKe
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import org.telegram.telegrambots.meta.generics.TelegramClient;
 
+import java.io.FileOutputStream;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.util.ArrayList;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -21,7 +30,7 @@ import static java.lang.Math.toIntExact;
 
 public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
-    private enum PendingKind { LOCATION_TASK_HINT }
+    private enum PendingKind { LOCATION_TASK_HINT, GOOGLE_OAUTH_CODE }
     private record PendingInput(PendingKind kind, String target) {}
 
     private final TelegramClient telegramClient;
@@ -30,22 +39,43 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private final WhisperService whisperService;
     private final NotionService notionService;
     private final NoteService noteService;
+    private final GoogleAuthService googleAuthService;
     private final String botUsername;
 
+    private GmailService gmailService;
+    private CalendarService calendarService;
+    private DriveService driveService;
+
     private final long allowedUserId;
+    private final String botToken;
+    private final HttpClient httpClient = HttpClient.newHttpClient();
     private final Map<Long, PendingInput> pendingInputs = new ConcurrentHashMap<>();
+    // Files sent by the user via Telegram, queued for email attachment
+    private final Map<Long, List<GmailService.Attachment>> pendingAttachments = new ConcurrentHashMap<>();
 
     public TaskBot(BotConfig config, TaskService taskService,
                    ClaudeService claudeService, WhisperService whisperService,
-                   NotionService notionService, NoteService noteService) {
-        this.telegramClient = new OkHttpTelegramClient(config.getBotToken());
-        this.taskService    = taskService;
-        this.claudeService  = claudeService;
-        this.whisperService = whisperService;
-        this.notionService  = notionService;
-        this.noteService    = noteService;
-        this.botUsername    = config.getBotUsername();
-        this.allowedUserId  = config.getAllowedUserId();
+                   NotionService notionService, NoteService noteService,
+                   GoogleAuthService googleAuthService) {
+        this.telegramClient   = new OkHttpTelegramClient(config.getBotToken());
+        this.botToken         = config.getBotToken();
+        this.taskService      = taskService;
+        this.claudeService    = claudeService;
+        this.whisperService   = whisperService;
+        this.notionService    = notionService;
+        this.noteService      = noteService;
+        this.googleAuthService = googleAuthService;
+        this.botUsername      = config.getBotUsername();
+        this.allowedUserId    = config.getAllowedUserId();
+        initGoogleServices();
+    }
+
+    private void initGoogleServices() {
+        if (googleAuthService == null || !googleAuthService.isAuthorized()) return;
+        try { this.gmailService    = new GmailService(googleAuthService);    } catch (Exception e) { System.err.println("GmailService init failed: "    + e.getMessage()); }
+        try { this.calendarService = new CalendarService(googleAuthService, java.time.ZoneId.systemDefault()); } catch (Exception e) { System.err.println("CalendarService init failed: " + e.getMessage()); }
+        try { this.driveService    = new DriveService(googleAuthService);    } catch (Exception e) { System.err.println("DriveService init failed: "    + e.getMessage()); }
+        System.out.println("Google services initialized (Gmail, Calendar, Drive).");
     }
 
     @Override
@@ -59,9 +89,10 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 userId = update.getCallbackQuery().getFrom().getId();
             if (allowedUserId != 0 && userId != allowedUserId) return;
             if (update.hasMessage()) {
-                if (update.getMessage().hasText())         handleMessage(update);
-                else if (update.getMessage().hasVoice())   handleVoice(update);
-                else if (update.getMessage().hasLocation()) handleLocation(update);
+                if (update.getMessage().hasText())           handleMessage(update);
+                else if (update.getMessage().hasVoice())     handleVoice(update);
+                else if (update.getMessage().hasDocument())  handleDocument(update);
+                else if (update.getMessage().hasLocation())  handleLocation(update);
             } else if (update.hasCallbackQuery()) {
                 handleCallback(update);
             }
@@ -91,6 +122,38 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
         sendText(chatId, "🎤 Heard: \"" + transcription + "\"");
         routeToAgent(chatId, userId, transcription);
+    }
+
+    // ── Incoming document (queued for email attachment) ───────────────────────
+
+    private void handleDocument(Update update) {
+        long chatId   = update.getMessage().getChatId();
+        long userId   = update.getMessage().getFrom().getId();
+        var  doc      = update.getMessage().getDocument();
+        String filename = doc.getFileName() != null ? doc.getFileName() : "attachment";
+
+        try {
+            byte[] data = downloadTelegramFile(doc.getFileId());
+            pendingAttachments.computeIfAbsent(userId, k -> new ArrayList<>())
+                    .add(new GmailService.Attachment(filename, data));
+            int total = pendingAttachments.get(userId).size();
+            sendText(chatId, "📎 Got \"" + filename + "\" (" + data.length / 1024 + " KB). " + total
+                    + " file(s) queued for your next email draft or reply.\n\nSay \"draft email to...\" or \"reply to [email]\" to use it.");
+        } catch (Exception e) {
+            sendText(chatId, "Couldn't save that file: " + e.getMessage());
+        }
+    }
+
+    private byte[] downloadTelegramFile(String fileId) throws Exception {
+        org.telegram.telegrambots.meta.api.methods.GetFile getFileMethod =
+                new org.telegram.telegrambots.meta.api.methods.GetFile(fileId);
+        org.telegram.telegrambots.meta.api.objects.File file = telegramClient.execute(getFileMethod);
+        String url = "https://api.telegram.org/file/bot" + botToken + "/" + file.getFilePath();
+        HttpResponse<byte[]> resp = httpClient.send(
+                HttpRequest.newBuilder().uri(URI.create(url)).build(),
+                HttpResponse.BodyHandlers.ofByteArray());
+        if (resp.statusCode() != 200) throw new RuntimeException("HTTP " + resp.statusCode());
+        return resp.body();
     }
 
     // ── Location ─────────────────────────────────────────────────────────────
@@ -126,10 +189,38 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         long userId = update.getMessage().getFrom().getId();
         String text = update.getMessage().getText().trim();
 
+        // If the user replied to a previous bot message, prepend that message's text
+        // so the agent knows exactly what is being referred to (e.g. replying to a reminder).
+        if (update.getMessage().getReplyToMessage() != null) {
+            var replied = update.getMessage().getReplyToMessage();
+            String repliedText = replied.hasText() ? replied.getText()
+                               : replied.hasCaption() ? replied.getCaption() : null;
+            if (repliedText != null && !repliedText.isBlank()) {
+                // Truncate long messages to avoid flooding the context
+                if (repliedText.length() > 400) repliedText = repliedText.substring(0, 400) + "...";
+                text = "[Replying to: \"" + repliedText + "\"]\n" + text;
+            }
+        }
+
         if (text.equals("/cancel")) {
             sendText(chatId, pendingInputs.remove(userId) != null ? "Cancelled." : "Nothing to cancel."); return;
         }
-        if (pendingInputs.containsKey(userId)) {
+
+        // Handle pending inputs before slash commands
+        PendingInput pending = pendingInputs.get(userId);
+        if (pending != null) {
+            if (pending.kind() == PendingKind.GOOGLE_OAUTH_CODE) {
+                pendingInputs.remove(userId);
+                sendText(chatId, "🔄 Authorizing...");
+                boolean ok = googleAuthService.exchangeCode(text.trim());
+                if (ok) {
+                    initGoogleServices();
+                    sendText(chatId, "✅ Google account linked! Gmail, Calendar, and Drive are now active.");
+                } else {
+                    sendText(chatId, "❌ Authorization failed. Please try /authorize again.");
+                }
+                return;
+            }
             sendText(chatId, "Please send your location or /cancel."); return;
         }
 
@@ -137,6 +228,13 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         switch (text) {
             case "/start"        -> { sendText(chatId, "👋 Hey! I'm Proton, your personal productivity bot.\n\nJust talk to me naturally — add tasks, save notes, check what's due, anything. What do you need?"); return; }
             case "/help"         -> { sendText(chatId, helpText()); return; }
+            case "/authorize"         -> { handleAuthorize(chatId, userId); return; }
+            case "/clearattachments"  -> {
+                List<GmailService.Attachment> removed = pendingAttachments.remove(userId);
+                sendText(chatId, removed != null && !removed.isEmpty()
+                        ? "🗑 Cleared " + removed.size() + " queued attachment(s)." : "No attachments queued.");
+                return;
+            }
             case "/tasks"        -> { sendTaskList(chatId, "📋 Active Tasks", taskService.getActiveTasks(userId)); return; }
             case "/today"        -> { sendTaskList(chatId, "🗓 Due Today", taskService.getTodayTasks(userId)); return; }
             case "/overdue"      -> { sendTaskList(chatId, "⚠️ Overdue", taskService.getOverdueTasks(userId)); return; }
@@ -188,30 +286,54 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         }
 
         // Set location reminder pending
+        final String finalText = text;  // may have been reassigned above (reply context prepend)
         if (lower.contains("location") && lower.contains("remind") || lower.contains("when i get to") || lower.contains("when i arrive")) {
-            taskService.findTaskByTitleHint(userId, text).ifPresentOrElse(task -> {
+            taskService.findTaskByTitleHint(userId, finalText).ifPresentOrElse(task -> {
                 pendingInputs.put(userId, new PendingInput(PendingKind.LOCATION_TASK_HINT, task.getTitle()));
                 sendText(chatId, "📍 Send me your location and I'll set a reminder for \"" + task.getTitle() + "\".");
-            }, () -> routeToAgent(chatId, userId, text));
+            }, () -> routeToAgent(chatId, userId, finalText));
             return;
         }
 
         // Everything else goes to the agent
-        routeToAgent(chatId, userId, text);
+        routeToAgent(chatId, userId, finalText);
     }
 
     // ── Agent routing ─────────────────────────────────────────────────────────
 
     private void routeToAgent(long chatId, long userId, String text) {
         if (claudeService == null) { sendText(chatId, "AI not configured. Set CLAUDE_API_KEY."); return; }
-        String response = claudeService.chat(userId, chatId, text, taskService, notionService, noteService,
-                msg -> sendText(chatId, msg));
-        // Don't send if Claude's response is just acknowledging a direct send
+        List<GmailService.Attachment> attachments = pendingAttachments.getOrDefault(userId, List.of());
+        String response = claudeService.chat(userId, chatId, text,
+                taskService, notionService, noteService,
+                gmailService, calendarService, driveService,
+                attachments,
+                msg -> sendText(chatId, msg),
+                (filename, data) -> sendDocument(chatId, filename, data));
+        // Clear queued attachments after any email draft/reply was created
+        if (response != null && (response.contains("Draft saved") || response.contains("Reply draft saved"))) {
+            pendingAttachments.remove(userId);
+        }
         if (response != null && !response.isBlank()
                 && !response.equals("SENT_DIRECTLY")
                 && !response.contains("SENT_DIRECTLY")) {
             sendText(chatId, response);
         }
+    }
+
+    // ── Google authorization ──────────────────────────────────────────────────
+
+    private void handleAuthorize(long chatId, long userId) {
+        if (googleAuthService == null || !googleAuthService.isInitialized()) {
+            sendText(chatId, "Google integration not configured.\n\nSet GOOGLE_CREDENTIALS_PATH in your config to enable Gmail, Calendar, and Drive."); return;
+        }
+        if (googleAuthService.isAuthorized()) {
+            sendText(chatId, "✅ Google account already linked.\n\nGmail, Calendar, and Drive are active."); return;
+        }
+        String url = googleAuthService.getAuthorizationUrl();
+        pendingInputs.put(userId, new PendingInput(PendingKind.GOOGLE_OAUTH_CODE, null));
+        sendText(chatId, "🔐 Authorize Google access:\n\n" + url
+                + "\n\n1. Open the link above\n2. Sign in and grant access\n3. Copy the code and send it here");
     }
 
     // ── Callbacks ────────────────────────────────────────────────────────────
@@ -401,6 +523,31 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         execute(SendMessage.builder().chatId(chatId).text(text).build());
     }
 
+    public void sendDocument(long chatId, String filename, byte[] data) {
+        java.io.File tmp = null;
+        try {
+            // Write to a temp file so OkHttp knows the content-length for multipart upload.
+            // Sanitize filename: '/' and other special chars break Files.createTempFile on Linux.
+            String safeSuffix = "_" + filename.replaceAll("[/\\\\:*?\"<>|\\s]", "_");
+            tmp = Files.createTempFile("taskbot_", safeSuffix).toFile();
+            try (FileOutputStream fos = new FileOutputStream(tmp)) { fos.write(data); }
+
+            telegramClient.execute(SendDocument.builder()
+                    .chatId(chatId)
+                    .document(new InputFile(tmp, filename))
+                    .build());
+        } catch (Exception e) {
+            System.err.println("sendDocument failed: " + e.getMessage());
+            // Surface the real error to the user
+            try { sendText(chatId, "Couldn't send file \"" + filename + "\": " + e.getMessage()); }
+            catch (Exception ignored) {}
+            // Re-throw so the tool reports failure to Claude instead of saying "sent"
+            throw new RuntimeException("File send failed: " + e.getMessage(), e);
+        } finally {
+            if (tmp != null) tmp.delete();
+        }
+    }
+
     private void execute(SendMessage msg) {
         try { telegramClient.execute(msg); }
         catch (TelegramApiException e) { throw new RuntimeException("Failed to send message", e); }
@@ -436,6 +583,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 /recentnotes /setupnotes /edittasks
                 /pomodoro [work] [break] [rounds]
                 /stoppomodoro /doneitems /cleardone
+                /authorize — link Google (Gmail, Calendar, Drive)
                 """;
     }
 }

@@ -16,6 +16,8 @@ public class BotConfig {
     private final String whisperApiKey;   // OpenAI key for voice transcription
     private final String notionApiKey;
     private final String notionDatabaseId;
+    private final String googleCredentialsPath;
+    private final String googleTokensPath;
     private final long allowedUserId;
     private final ZoneId zoneId;
     private final LocalTime morningSummaryTime;
@@ -25,6 +27,7 @@ public class BotConfig {
 
     private BotConfig(String botUsername, String botToken, String claudeApiKey, String whisperApiKey,
                       String notionApiKey, String notionDatabaseId,
+                      String googleCredentialsPath, String googleTokensPath,
                       long allowedUserId,
                       ZoneId zoneId, LocalTime morningSummaryTime,
                       int schedulerCheckIntervalSeconds, String dbPath, int defaultStaleDays) {
@@ -34,6 +37,8 @@ public class BotConfig {
         this.whisperApiKey = whisperApiKey;
         this.notionApiKey = notionApiKey;
         this.notionDatabaseId = notionDatabaseId;
+        this.googleCredentialsPath = googleCredentialsPath;
+        this.googleTokensPath = googleTokensPath;
         this.allowedUserId = allowedUserId;
         this.zoneId = zoneId;
         this.morningSummaryTime = morningSummaryTime;
@@ -54,6 +59,8 @@ public class BotConfig {
         String whisperKey   = firstNonBlank(System.getenv("WHISPER_API_KEY"),   properties.getProperty("whisper.api.key"));
         String notionKey    = firstNonBlank(System.getenv("NOTION_API_KEY"),    properties.getProperty("notion.api.key"));
         String notionDbId   = firstNonBlank(System.getenv("NOTION_DATABASE_ID"), properties.getProperty("notion.database.id"));
+        String googleCreds  = firstNonBlank(System.getenv("GOOGLE_CREDENTIALS_PATH"), properties.getProperty("google.credentials.path"));
+        String googleTokens = firstNonBlank(System.getenv("GOOGLE_TOKENS_PATH"), properties.getProperty("google.tokens.path", "data/google_tokens"));
         String allowedUser  = firstNonBlank(System.getenv("ALLOWED_USER_ID"),     properties.getProperty("allowed.user.id", "0"));
         String timezone     = firstNonBlank(System.getenv("APP_TIMEZONE"),      properties.getProperty("app.timezone", "Asia/Singapore"));
         String morningTime  = firstNonBlank(System.getenv("APP_MORNING_SUMMARY_TIME"), properties.getProperty("app.morning.summary.time", "08:00"));
@@ -71,11 +78,13 @@ public class BotConfig {
         } catch (IOException e) { throw new RuntimeException("Failed to create database directory", e); }
 
         return new BotConfig(botUsername.trim(), botToken.trim(),
-                claudeApiKey != null ? claudeApiKey.trim() : null,
-                whisperKey   != null ? whisperKey.trim()   : null,
-                notionKey    != null ? notionKey.trim()    : null,
-                notionDbId   != null ? notionDbId.trim()   : null,
-                allowedUser  != null ? Long.parseLong(allowedUser.trim()) : 0L,
+                claudeApiKey   != null ? claudeApiKey.trim()   : null,
+                whisperKey     != null ? whisperKey.trim()     : null,
+                notionKey      != null ? notionKey.trim()      : null,
+                notionDbId     != null ? notionDbId.trim()     : null,
+                googleCreds    != null ? googleCreds.trim()    : null,
+                googleTokens   != null ? googleTokens.trim()   : "data/google_tokens",
+                allowedUser    != null ? Long.parseLong(allowedUser.trim()) : 0L,
                 ZoneId.of(timezone.trim()), LocalTime.parse(morningTime.trim()),
                 Integer.parseInt(interval.trim()), dbPath.trim(), Integer.parseInt(staleDays.trim()));
     }
@@ -89,6 +98,8 @@ public class BotConfig {
     public String getWhisperApiKey()             { return whisperApiKey; }
     public String getNotionApiKey()              { return notionApiKey; }
     public String getNotionDatabaseId()          { return notionDatabaseId; }
+    public String getGoogleCredentialsPath()     { return googleCredentialsPath; }
+    public String getGoogleTokensPath()          { return googleTokensPath; }
     public long getAllowedUserId()                { return allowedUserId; }
     public ZoneId getZoneId()                    { return zoneId; }
     public LocalTime getMorningSummaryTime()      { return morningSummaryTime; }

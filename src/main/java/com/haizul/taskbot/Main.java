@@ -13,7 +13,7 @@ public class Main {
 
         String claudeKey = config.getClaudeApiKey();
         ClaudeService claudeService = (claudeKey != null && !claudeKey.isBlank() && !claudeKey.equals("YOUR_CLAUDE_API_KEY"))
-                ? new ClaudeService(claudeKey, config.getZoneId()) : null;
+                ? new ClaudeService(claudeKey, config.getZoneId(), database) : null;
 
         String whisperKey = config.getWhisperApiKey();
         WhisperService whisperService = (whisperKey != null && !whisperKey.isBlank() && !whisperKey.equals("YOUR_WHISPER_API_KEY"))
@@ -27,7 +27,19 @@ public class Main {
         NoteService noteService = (claudeKey != null && !claudeKey.isBlank())
                 ? new NoteService(claudeKey) : null;
 
-        TaskBot taskBot = new TaskBot(config, taskService, claudeService, whisperService, notionService, noteService);
+        String googleCredsPath = config.getGoogleCredentialsPath();
+        GoogleAuthService googleAuthService = null;
+        if (googleCredsPath != null && !googleCredsPath.isBlank()) {
+            try {
+                googleAuthService = new GoogleAuthService(googleCredsPath, config.getGoogleTokensPath());
+                System.out.println("Google auth initialized. Authorized: " + googleAuthService.isAuthorized());
+            } catch (Exception e) {
+                System.err.println("Google auth init failed: " + e.getMessage());
+            }
+        }
+
+        TaskBot taskBot = new TaskBot(config, taskService, claudeService, whisperService, notionService, noteService,
+                googleAuthService);
 
         SchedulerService schedulerService = new SchedulerService(
                 taskService, taskBot, claudeService,
