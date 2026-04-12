@@ -16,6 +16,7 @@ public class BotConfig {
     private final String whisperApiKey;   // OpenAI key for voice transcription
     private final String notionApiKey;
     private final String notionDatabaseId;
+    private final long allowedUserId;
     private final ZoneId zoneId;
     private final LocalTime morningSummaryTime;
     private final int schedulerCheckIntervalSeconds;
@@ -24,6 +25,7 @@ public class BotConfig {
 
     private BotConfig(String botUsername, String botToken, String claudeApiKey, String whisperApiKey,
                       String notionApiKey, String notionDatabaseId,
+                      long allowedUserId,
                       ZoneId zoneId, LocalTime morningSummaryTime,
                       int schedulerCheckIntervalSeconds, String dbPath, int defaultStaleDays) {
         this.botUsername = botUsername;
@@ -32,6 +34,7 @@ public class BotConfig {
         this.whisperApiKey = whisperApiKey;
         this.notionApiKey = notionApiKey;
         this.notionDatabaseId = notionDatabaseId;
+        this.allowedUserId = allowedUserId;
         this.zoneId = zoneId;
         this.morningSummaryTime = morningSummaryTime;
         this.schedulerCheckIntervalSeconds = schedulerCheckIntervalSeconds;
@@ -51,6 +54,7 @@ public class BotConfig {
         String whisperKey   = firstNonBlank(System.getenv("WHISPER_API_KEY"),   properties.getProperty("whisper.api.key"));
         String notionKey    = firstNonBlank(System.getenv("NOTION_API_KEY"),    properties.getProperty("notion.api.key"));
         String notionDbId   = firstNonBlank(System.getenv("NOTION_DATABASE_ID"), properties.getProperty("notion.database.id"));
+        String allowedUser  = firstNonBlank(System.getenv("ALLOWED_USER_ID"),     properties.getProperty("allowed.user.id", "0"));
         String timezone     = firstNonBlank(System.getenv("APP_TIMEZONE"),      properties.getProperty("app.timezone", "Asia/Singapore"));
         String morningTime  = firstNonBlank(System.getenv("APP_MORNING_SUMMARY_TIME"), properties.getProperty("app.morning.summary.time", "08:00"));
         String interval     = firstNonBlank(System.getenv("APP_SCHEDULER_INTERVAL_SECONDS"), properties.getProperty("app.scheduler.check.interval.seconds", "60"));
@@ -71,6 +75,7 @@ public class BotConfig {
                 whisperKey   != null ? whisperKey.trim()   : null,
                 notionKey    != null ? notionKey.trim()    : null,
                 notionDbId   != null ? notionDbId.trim()   : null,
+                allowedUser  != null ? Long.parseLong(allowedUser.trim()) : 0L,
                 ZoneId.of(timezone.trim()), LocalTime.parse(morningTime.trim()),
                 Integer.parseInt(interval.trim()), dbPath.trim(), Integer.parseInt(staleDays.trim()));
     }
@@ -84,6 +89,7 @@ public class BotConfig {
     public String getWhisperApiKey()             { return whisperApiKey; }
     public String getNotionApiKey()              { return notionApiKey; }
     public String getNotionDatabaseId()          { return notionDatabaseId; }
+    public long getAllowedUserId()                { return allowedUserId; }
     public ZoneId getZoneId()                    { return zoneId; }
     public LocalTime getMorningSummaryTime()      { return morningSummaryTime; }
     public int getSchedulerCheckIntervalSeconds() { return schedulerCheckIntervalSeconds; }

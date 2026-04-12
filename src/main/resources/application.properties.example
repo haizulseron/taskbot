@@ -1,5 +1,4 @@
 # Copy this to application.properties and fill in your values.
-# application.properties is gitignored — never commit it.
 
 # Telegram bot settings
 bot.username=YOUR_BOT_USERNAME

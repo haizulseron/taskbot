@@ -42,8 +42,8 @@ public class SchedulerService {
     private void runCycle() {
         sendReminders();
         sendStaleTaskPings();
-        checkFocusSessions();
-        checkPomodoro();
+        checkPomodoro();       // must run before checkFocusSessions
+        checkFocusSessions();  // skips sessions already handled by pomodoro
         sendMorningSummaries();
         sendWeeklyDigests();
         cleanupKeys();
@@ -98,6 +98,10 @@ public class SchedulerService {
 
     private void checkFocusSessions() {
         for (FocusSession session : taskService.findUnnotifiedCompletedSessions()) {
+            // Skip sessions managed by Pomodoro cycle
+            UserSettings settings = taskService.getUserSettings(session.getUserId());
+            if (settings.getPomodoroState() != null && settings.getPomodoroState().startsWith("POMODORO:")) continue;
+
             String msg = "🎯 Focus session complete!\n\n"
                     + "You focused on: " + session.getTaskTitle() + "\n"
                     + "Duration: " + session.getDurationMinutes() + " minutes\n\n"
