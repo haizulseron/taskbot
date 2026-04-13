@@ -16,15 +16,27 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class ClaudeService {
 
-    private static final String API_URL = "https://api.anthropic.com/v1/messages";
-    private static final String MODEL   = "claude-haiku-4-5-20251001";
-    private static final int    MAX_TURNS = 8; // max tool call rounds per message
+    private static final String API_URL     = "https://api.anthropic.com/v1/messages";
+    private static final String MODEL_FAST  = "claude-haiku-4-5-20251001";  // default: fast & cheap
+    private static final String MODEL_SMART = "claude-sonnet-4-6";           // complex tasks only
+    private static final int    MAX_TURNS   = 8; // max tool call rounds per message
 
-    private static final String SYSTEM_PROMPT = """
-            You are Proton, a smart personal productivity assistant managing tasks, notes, email, calendar, and files.
+    private static final String BASE_SYSTEM_PROMPT = """
+            You are Proton, a smart personal productivity assistant for Zul (Haizul Ali Seron).
+            Timezone: Asia/Singapore. Default categories: work, school, personal, daily.
+
+            ══ TASK INTEGRITY — ABSOLUTE RULES, NO EXCEPTIONS ══
+            - Task data in conversation history IS ALWAYS STALE AND WRONG. Ignore it completely.
+            - NEVER tell the user what tasks they have based on memory or history.
+            - EVERY time the user asks about tasks (what tasks, how many, what's due, what's overdue, etc.) → call list_tasks or search_tasks FIRST. No exceptions.
+            - Only after the tool returns can you respond about tasks.
+            - Even if you think you know from earlier in this conversation — call the tool. Always.
+            ════════════════════════════════════════════════════
 
             Personality: friendly, casual, like a helpful mate. Keep responses concise.
             Always confirm what you did in plain English after using tools.
@@ -36,7 +48,6 @@ public class ClaudeService {
             - Examples that SHOULD trigger tools: "add gym tomorrow", "mark report done", "check my inbox", "what's on my calendar"
             - When in doubt whether to call a tool, DON'T — just respond conversationally
             - For multiple actions in one message, call multiple tools
-            - When listing tasks, format them clearly with priority emoji: 🔴 high, 🟡 medium, 🟢 low, 🔵 daily
             - Dates/times: always interpret relative to today's date in the system context
             - If a task isn't found by title, say so and ask the user to be more specific
             - For notes, always save them — don't ask for confirmation
@@ -45,6 +56,14 @@ public class ClaudeService {
             - Interpret all date/times relative to the current date/time in the system context
             - For add_event, if no end time given, default to 1 hour after start
             - For reschedule_event, use the event title as the hint
+            - If no specific time is given (e.g. "add holiday on 1 May", "block off Thursday"), set all_day=true and use only the date (yyyy-MM-dd) for start_datetime
+
+            EXAMPLES — correct task handling (follow exactly):
+            User: "what tasks do i have" → call list_tasks → then reply
+            User: "how many tasks left" → call list_tasks → then reply
+            User: "anything due today" → call list_tasks with filter=today → then reply
+            User: "find my gym task" → call search_tasks → then reply
+            WRONG (never do): responding with task details without calling list_tasks/search_tasks first
 
             DRIVE RULES:
             - search_drive ONLY lists files — it does NOT send anything to Telegram
@@ -67,9 +86,10 @@ public class ClaudeService {
     private final HttpClient http;
     private final ObjectMapper mapper;
     private final Database db;
+    private final ExecutorService memoryExtractor = Executors.newSingleThreadExecutor();
 
     // How many individual messages (user + assistant alternating) to keep per user
-    private static final int MAX_HISTORY = 20;
+    private static final int MAX_HISTORY = 10;
 
     public ClaudeService(String apiKey, ZoneId zoneId, Database db) {
         this.apiKey  = apiKey;
@@ -90,7 +110,8 @@ public class ClaudeService {
                        List<GmailService.Attachment> pendingAttachments,
                        MessageSender sender, FileSender fileSender) {
         String now = LocalDateTime.now(zoneId).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
-        String systemWithDate = SYSTEM_PROMPT + "\n\nCurrent date/time: " + now + " (" + zoneId + ")";
+        String systemWithDate = buildSystemPrompt(userId) + "\n\nCurrent date/time: " + now + " (" + zoneId + ")";
+        String model = pickModel(userMessage);
 
         // Build messages list — rolling history + current message
         List<Map<String, Object>> messages = new ArrayList<>(getHistory(userId));
@@ -98,10 +119,13 @@ public class ClaudeService {
 
         List<Map<String, Object>> tools = buildTools();
         StringBuilder allText = new StringBuilder();
+        // Track whether a DB-backed task tool was called so we don't save stale task
+        // data back into conversation history (which would cause future hallucinations).
+        boolean taskDataFetched = false;
 
         // Agentic loop
         for (int turn = 0; turn < MAX_TURNS; turn++) {
-            Map<String, Object> response = callApi(systemWithDate, messages, tools);
+            Map<String, Object> response = callApi(systemWithDate, messages, tools, model);
             if (response == null) return "Sorry, something went wrong. Please try again.";
 
             String stopReason = (String) response.get("stop_reason");
@@ -126,8 +150,13 @@ public class ClaudeService {
             // No tool calls — we are done
             if (toolUseBlocks.isEmpty()) {
                 String finalText = allText.toString().trim();
-                // Save exchange to history for follow-up context
-                addToHistory(userId, userMessage, finalText.isEmpty() ? "OK" : finalText);
+                // If we fetched live task data, save a neutral placeholder instead of
+                // Claude's verbose summary — prevents stale counts leaking into history.
+                String savedResponse = taskDataFetched
+                        ? "[Showed current task list from database]"
+                        : (finalText.isEmpty() ? "OK" : finalText);
+                addToHistory(userId, userMessage, savedResponse);
+                extractAndSaveMemory(userId, userMessage, savedResponse);
                 return finalText.isEmpty() ? "\uD83D\uDC4D" : finalText;
             }
 
@@ -137,6 +166,10 @@ public class ClaudeService {
                 String toolName  = (String) toolBlock.get("name");
                 String toolUseId = (String) toolBlock.get("id");
                 Map<String, Object> input = (Map<String, Object>) toolBlock.get("input");
+                // Track if any read-task tool was used this turn
+                if ("list_tasks".equals(toolName) || "search_tasks".equals(toolName) || "get_review".equals(toolName)) {
+                    taskDataFetched = true;
+                }
                 String result = executeTool(toolName, input, userId, taskService, notionService, noteService,
                         gmailService, calendarService, driveService, pendingAttachments, sender, fileSender);
                 System.out.println("Tool [" + toolName + "] result: " + result.substring(0, Math.min(120, result.length())));
@@ -431,8 +464,9 @@ public class ClaudeService {
                     String startDt = str(input, "start_datetime");
                     String endDt   = str(input, "end_datetime");
                     String desc    = str(input, "description");
-                    CalendarService.EventSummary created = calendarService.addEvent(title, startDt, endDt, desc);
-                    yield "Added to calendar: \"" + created.title() + "\" on " + created.start();
+                    boolean allDay = boolVal(input, "all_day");
+                    CalendarService.EventSummary created = calendarService.addEvent(title, startDt, endDt, desc, allDay);
+                    yield "Added to calendar: \"" + created.title() + "\" — " + created.start();
                 }
 
                 case "reschedule_event" -> {
@@ -602,8 +636,9 @@ public class ClaudeService {
         tools.add(tool("add_event", "Add a new event to Google Calendar",
                 props()
                     .req("title",          "string", "Event title")
-                    .req("start_datetime", "string", "Start datetime ISO-8601 e.g. 2026-04-15T09:00:00")
-                    .opt("end_datetime",   "string", "End datetime ISO-8601 (default: 1 hour after start)")
+                    .req("start_datetime", "string", "Start date or datetime. All-day: yyyy-MM-dd. Timed: ISO-8601 e.g. 2026-04-15T09:00:00")
+                    .opt("end_datetime",   "string", "End date/datetime (default: 1 hour after start, or next day for all-day)")
+                    .opt("all_day",        "boolean", "Set true for all-day events with no specific time")
                     .opt("description",    "string", "Event description or notes")
         ));
 
@@ -625,6 +660,124 @@ public class ClaudeService {
         ));
 
         return tools;
+    }
+
+    // ── System prompt with injected user profile ──────────────────────────────
+
+    private String buildSystemPrompt(long userId) {
+        StringBuilder sb = new StringBuilder(BASE_SYSTEM_PROMPT);
+        if (db != null) {
+            Map<String, String> profile = db.getProfile(userId);
+            if (!profile.isEmpty()) {
+                sb.append("\n\nRemembered user preferences:\n");
+                profile.forEach((k, v) -> sb.append("- ").append(k).append(": ").append(v).append("\n"));
+            }
+        }
+        return sb.toString();
+    }
+
+    // ── Model routing ─────────────────────────────────────────────────────────
+
+    /**
+     * Use Sonnet for tasks that need strong reasoning or long-form generation
+     * (emails, complex analysis). Everything else uses Haiku.
+     */
+    private String pickModel(String userMessage) {
+        String lower = userMessage.toLowerCase();
+        if (lower.contains("email") || lower.contains("draft") || lower.contains("reply")
+                || lower.contains("compose") || lower.contains("write")
+                || lower.contains("summarise") || lower.contains("summarize")
+                || lower.contains("explain") || lower.contains("analyse") || lower.contains("analyze")
+                || lower.contains("report")) {
+            return MODEL_SMART;
+        }
+        return MODEL_FAST;
+    }
+
+    // ── Async memory extraction (fires after every exchange) ──────────────────
+
+    private void extractAndSaveMemory(long userId, String userMessage, String assistantResponse) {
+        if (db == null) return;
+        memoryExtractor.execute(() -> {
+            try {
+                String prompt = "You extract user preferences and personal facts for a personal assistant app.\n\n"
+                        + "User message: " + userMessage + "\n"
+                        + "Assistant response: " + assistantResponse + "\n\n"
+                        + "Extract ONLY concrete facts/preferences explicitly stated by the user. Do not infer.\n"
+                        + "Good examples: name they prefer to be called, time preferences, working style, category preferences.\n"
+                        + "Skip: task content, reminders, casual chitchat, anything ephemeral.\n"
+                        + "Return JSON array: [{\"key\": \"snake_case_key\", \"value\": \"fact\"}] or [] if nothing to save.\n"
+                        + "Return ONLY the JSON array, no other text.";
+                Map<String, Object> body = new LinkedHashMap<>();
+                body.put("model", MODEL_FAST);
+                body.put("max_tokens", 300);
+                body.put("system", "You extract user preferences from chat exchanges. Return only a valid JSON array.");
+                body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
+                String resp = postJson(body);
+                JsonNode root = mapper.readTree(resp);
+                String text = root.path("content").get(0).path("text").asText("").trim();
+                if (text.isBlank() || text.equals("[]")) return;
+                JsonNode arr = mapper.readTree(text);
+                if (!arr.isArray()) return;
+                for (JsonNode item : arr) {
+                    String key   = item.path("key").asText("").trim();
+                    String value = item.path("value").asText("").trim();
+                    if (!key.isBlank() && !value.isBlank()) db.upsertProfile(userId, key, value);
+                }
+            } catch (Exception e) {
+                System.err.println("Memory extraction error: " + e.getMessage());
+            }
+        });
+    }
+
+    // ── Profile consolidation (called weekly by SchedulerService) ─────────────
+
+    public void consolidateProfile(long userId) {
+        if (db == null) return;
+        Map<String, String> profile = db.getProfile(userId);
+        if (profile.size() < 3) return;
+        try {
+            StringBuilder facts = new StringBuilder();
+            profile.forEach((k, v) -> facts.append(k).append(": ").append(v).append("\n"));
+            String prompt = "You manage a user profile for a personal assistant. Current stored facts:\n\n"
+                    + facts
+                    + "\nConsolidate: merge duplicates, remove redundant/outdated entries, keep most accurate values.\n"
+                    + "Return JSON object: {\"key\": \"value\", ...} with only the facts to keep.\n"
+                    + "Return ONLY the JSON object, no other text.";
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("model", MODEL_FAST);
+            body.put("max_tokens", 500);
+            body.put("system", "You consolidate user profile facts. Return only valid JSON.");
+            body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
+            String resp = postJson(body);
+            JsonNode root = mapper.readTree(resp);
+            String text = root.path("content").get(0).path("text").asText("").trim();
+            Map<String, String> consolidated = new LinkedHashMap<>();
+            mapper.readTree(text).fields().forEachRemaining(e -> consolidated.put(e.getKey(), e.getValue().asText()));
+            if (!consolidated.isEmpty()) db.replaceProfile(userId, consolidated);
+        } catch (Exception e) {
+            System.err.println("Profile consolidation error: " + e.getMessage());
+        }
+    }
+
+    // ── Profile helpers (used by TaskBot commands) ────────────────────────────
+
+    public String getProfileText(long userId) {
+        if (db == null) return "AI not configured.";
+        Map<String, String> profile = db.getProfile(userId);
+        if (profile.isEmpty()) return "No preferences saved yet. Just chat naturally and I'll learn your preferences over time!";
+        StringBuilder sb = new StringBuilder("🧠 Remembered Preferences\n─────────────────\n\n");
+        profile.forEach((k, v) -> sb.append("• ").append(k).append(": ").append(v).append("\n"));
+        sb.append("\nUse /forget <key> to remove a specific entry.");
+        return sb.toString();
+    }
+
+    public boolean forgetProfileKey(long userId, String key) {
+        if (db == null) return false;
+        Map<String, String> profile = db.getProfile(userId);
+        if (!profile.containsKey(key)) return false;
+        db.deleteProfileKey(userId, key);
+        return true;
     }
 
     // ── Conversation history (persisted to SQLite) ────────────────────────────
@@ -669,7 +822,7 @@ public class ClaudeService {
         String sys = "You write short reminder messages. Return ONLY the message — no JSON, no quotes.";
         try {
             Map<String, Object> body = new LinkedHashMap<>();
-            body.put("model", MODEL);
+            body.put("model", MODEL_FAST);
             body.put("max_tokens", 100);
             body.put("system", sys);
             body.put("messages", List.of(Map.of("role", "user", "content", prompt.toString())));
@@ -683,13 +836,27 @@ public class ClaudeService {
     // ── HTTP / builder helpers ────────────────────────────────────────────────
 
     private Map<String, Object> callApi(String system, List<Map<String, Object>> messages,
-                                         List<Map<String, Object>> tools) {
+                                         List<Map<String, Object>> tools, String model) {
         try {
             Map<String, Object> body = new LinkedHashMap<>();
-            body.put("model", MODEL);
+            body.put("model", model);
             body.put("max_tokens", 1024);
-            body.put("system", system);
-            body.put("tools", tools);
+
+            // Cache the system prompt — it's large and identical across turns
+            body.put("system", List.of(Map.of(
+                "type", "text",
+                "text", system,
+                "cache_control", Map.of("type", "ephemeral")
+            )));
+
+            // Cache the tool definitions — they never change per session
+            List<Map<String, Object>> cachedTools = new ArrayList<>(tools);
+            if (!cachedTools.isEmpty()) {
+                Map<String, Object> last = new LinkedHashMap<>(cachedTools.get(cachedTools.size() - 1));
+                last.put("cache_control", Map.of("type", "ephemeral"));
+                cachedTools.set(cachedTools.size() - 1, last);
+            }
+            body.put("tools", cachedTools);
             body.put("messages", messages);
 
             String resp = postJson(body);
@@ -735,6 +902,7 @@ public class ClaudeService {
                 .header("Content-Type", "application/json")
                 .header("x-api-key", apiKey)
                 .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", "prompt-caching-2024-07-31")
                 .POST(HttpRequest.BodyPublishers.ofString(bodyStr))
                 .build();
         HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());

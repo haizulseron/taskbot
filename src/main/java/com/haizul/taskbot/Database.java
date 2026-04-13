@@ -108,6 +108,18 @@ public class Database {
                     """);
             s.executeUpdate(
                     "CREATE INDEX IF NOT EXISTS idx_conv_user ON conversation_history(user_id, id)");
+            s.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS user_profile (
+                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id    INTEGER NOT NULL,
+                        key        TEXT    NOT NULL,
+                        value      TEXT    NOT NULL,
+                        updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                        UNIQUE(user_id, key)
+                    )
+                    """);
+            s.executeUpdate(
+                    "CREATE INDEX IF NOT EXISTS idx_profile_user ON user_profile(user_id)");
         } catch (SQLException e) {
             throw new RuntimeException("Failed to initialize database", e);
         }
@@ -182,6 +194,72 @@ public class Database {
             ps.executeUpdate();
         } catch (SQLException e) {
             System.err.println("Failed to prune conversation: " + e.getMessage());
+        }
+    }
+
+    // ── User profile (persistent memory) ─────────────────────────────────────
+
+    /** Insert or update a single key→value fact for a user. */
+    public void upsertProfile(long userId, String key, String value) {
+        String sql = "INSERT INTO user_profile (user_id, key, value) VALUES (?, ?, ?) " +
+                     "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, updated_at=strftime('%s','now')";
+        try (Connection c = getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setString(2, key);
+            ps.setString(3, value);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Failed to upsert profile: " + e.getMessage());
+        }
+    }
+
+    /** Load all key→value facts for a user, sorted by key. */
+    public Map<String, String> getProfile(long userId) {
+        String sql = "SELECT key, value FROM user_profile WHERE user_id = ? ORDER BY key";
+        Map<String, String> result = new LinkedHashMap<>();
+        try (Connection c = getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) result.put(rs.getString("key"), rs.getString("value"));
+        } catch (SQLException e) {
+            System.err.println("Failed to load profile: " + e.getMessage());
+        }
+        return result;
+    }
+
+    /** Delete a specific fact key for a user. */
+    public void deleteProfileKey(long userId, String key) {
+        String sql = "DELETE FROM user_profile WHERE user_id = ? AND key = ?";
+        try (Connection c = getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setString(2, key);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Failed to delete profile key: " + e.getMessage());
+        }
+    }
+
+    /** Replace all facts for a user with a new consolidated set (used by weekly consolidation). */
+    public void replaceProfile(long userId, Map<String, String> entries) {
+        try (Connection c = getConnection()) {
+            c.setAutoCommit(false);
+            try (PreparedStatement del = c.prepareStatement("DELETE FROM user_profile WHERE user_id = ?")) {
+                del.setLong(1, userId);
+                del.executeUpdate();
+            }
+            String sql = "INSERT INTO user_profile (user_id, key, value) VALUES (?, ?, ?)";
+            try (PreparedStatement ps = c.prepareStatement(sql)) {
+                for (Map.Entry<String, String> e : entries.entrySet()) {
+                    ps.setLong(1, userId);
+                    ps.setString(2, e.getKey());
+                    ps.setString(3, e.getValue());
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            c.commit();
+        } catch (SQLException e) {
+            System.err.println("Failed to replace profile: " + e.getMessage());
         }
     }
 

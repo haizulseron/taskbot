@@ -15,8 +15,9 @@ public class SchedulerService {
     private final LocalTime morningSummaryTime;
     private final int intervalSeconds;
     private final ScheduledExecutorService executor;
-    private final Set<String> sentMorningKeys = ConcurrentHashMap.newKeySet();
-    private final Set<String> sentWeeklyKeys  = ConcurrentHashMap.newKeySet();
+    private final Set<String> sentMorningKeys      = ConcurrentHashMap.newKeySet();
+    private final Set<String> sentWeeklyKeys       = ConcurrentHashMap.newKeySet();
+    private final Set<String> sentConsolidateKeys  = ConcurrentHashMap.newKeySet();
 
     public SchedulerService(TaskService taskService, TaskBot taskBot, ClaudeService claudeService,
                             ZoneId zoneId, LocalTime morningSummaryTime, int intervalSeconds) {
@@ -46,6 +47,7 @@ public class SchedulerService {
         checkFocusSessions();  // skips sessions already handled by pomodoro
         sendMorningSummaries();
         sendWeeklyDigests();
+        runWeeklyProfileConsolidation();
         cleanupKeys();
     }
 
@@ -157,6 +159,25 @@ public class SchedulerService {
     }
 
 
+    // ── Weekly profile consolidation ─────────────────────────────────────────
+
+    private void runWeeklyProfileConsolidation() {
+        if (claudeService == null) return;
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        if (now.getDayOfWeek() != DayOfWeek.SUNDAY) return;
+        // Run in a 5-minute window 10 minutes after morning summary (avoids clash)
+        LocalTime window = morningSummaryTime.plusMinutes(10);
+        if (now.toLocalTime().isBefore(window) || now.toLocalTime().isAfter(window.plusMinutes(5))) return;
+        for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
+            String key = uc.userId() + ":consolidate:" + LocalDate.now(zoneId);
+            if (sentConsolidateKeys.contains(key)) continue;
+            try { claudeService.consolidateProfile(uc.userId()); } catch (Exception e) {
+                System.err.println("Profile consolidation error for " + uc.userId() + ": " + e.getMessage());
+            }
+            sentConsolidateKeys.add(key);
+        }
+    }
+
     // ── Pomodoro ─────────────────────────────────────────────────────────────
 
     private void checkPomodoro() {
@@ -227,5 +248,6 @@ public class SchedulerService {
         LocalDate today = LocalDate.now(zoneId);
         sentMorningKeys.removeIf(k -> !k.contains(today.toString()));
         sentWeeklyKeys.removeIf(k -> !k.contains(today.toString()));
+        sentConsolidateKeys.removeIf(k -> !k.contains(today.toString()));
     }
 }

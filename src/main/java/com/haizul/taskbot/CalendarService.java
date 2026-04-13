@@ -7,6 +7,7 @@ import com.google.api.services.calendar.model.EventDateTime;
 import com.google.api.services.calendar.model.Events;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
@@ -56,17 +57,32 @@ public class CalendarService {
         return summaries;
     }
 
-    public EventSummary addEvent(String title, String startDatetime, String endDatetime, String description) throws Exception {
+    public EventSummary addEvent(String title, String startDatetime, String endDatetime,
+                                  String description, boolean allDay) throws Exception {
         Event event = new Event().setSummary(title);
         if (description != null && !description.isBlank()) event.setDescription(description);
 
-        DateTime start = parseDateTime(startDatetime);
-        DateTime end   = endDatetime != null
-                ? parseDateTime(endDatetime)
-                : new DateTime(start.getValue() + 3_600_000L);  // default 1h
+        // Detect all-day: explicit flag OR datetime string has no time component
+        boolean isAllDay = allDay || isDateOnly(startDatetime);
 
-        event.setStart(new EventDateTime().setDateTime(start).setTimeZone(zoneId.getId()));
-        event.setEnd(new EventDateTime().setDateTime(end).setTimeZone(zoneId.getId()));
+        if (isAllDay) {
+            String startDate = startDatetime.length() >= 10 ? startDatetime.substring(0, 10) : startDatetime;
+            String endDate;
+            if (endDatetime != null && !endDatetime.isBlank()) {
+                endDate = endDatetime.length() >= 10 ? endDatetime.substring(0, 10) : endDatetime;
+            } else {
+                endDate = LocalDate.parse(startDate).plusDays(1).toString();
+            }
+            event.setStart(new EventDateTime().setDate(new DateTime(startDate)));
+            event.setEnd(new EventDateTime().setDate(new DateTime(endDate)));
+        } else {
+            DateTime start = parseDateTime(startDatetime);
+            DateTime end   = endDatetime != null && !endDatetime.isBlank()
+                    ? parseDateTime(endDatetime)
+                    : new DateTime(start.getValue() + 3_600_000L);  // default 1h
+            event.setStart(new EventDateTime().setDateTime(start).setTimeZone(zoneId.getId()));
+            event.setEnd(new EventDateTime().setDateTime(end).setTimeZone(zoneId.getId()));
+        }
 
         Event created = calendar.events().insert("primary", event).execute();
         return new EventSummary(created.getId(), created.getSummary(),
@@ -83,19 +99,26 @@ public class CalendarService {
         if (match == null) return "Event not found matching: " + eventHint;
 
         Event event     = calendar.events().get("primary", match.id()).execute();
-        DateTime newStart = parseDateTime(newStartDatetime);
 
-        // Preserve original duration
-        long durationMs = 3_600_000L;
-        if (event.getStart() != null && event.getStart().getDateTime() != null
-                && event.getEnd() != null && event.getEnd().getDateTime() != null) {
-            durationMs = event.getEnd().getDateTime().getValue()
-                    - event.getStart().getDateTime().getValue();
+        // Preserve all-day type if the original was all-day
+        boolean wasAllDay = event.getStart() != null && event.getStart().getDate() != null;
+        if (wasAllDay || isDateOnly(newStartDatetime)) {
+            String startDate = newStartDatetime.length() >= 10 ? newStartDatetime.substring(0, 10) : newStartDatetime;
+            String endDate   = LocalDate.parse(startDate).plusDays(1).toString();
+            event.setStart(new EventDateTime().setDate(new DateTime(startDate)));
+            event.setEnd(new EventDateTime().setDate(new DateTime(endDate)));
+        } else {
+            DateTime newStart = parseDateTime(newStartDatetime);
+            long durationMs = 3_600_000L;
+            if (event.getStart() != null && event.getStart().getDateTime() != null
+                    && event.getEnd() != null && event.getEnd().getDateTime() != null) {
+                durationMs = event.getEnd().getDateTime().getValue()
+                        - event.getStart().getDateTime().getValue();
+            }
+            DateTime newEnd = new DateTime(newStart.getValue() + durationMs);
+            event.setStart(new EventDateTime().setDateTime(newStart).setTimeZone(zoneId.getId()));
+            event.setEnd(new EventDateTime().setDateTime(newEnd).setTimeZone(zoneId.getId()));
         }
-        DateTime newEnd = new DateTime(newStart.getValue() + durationMs);
-
-        event.setStart(new EventDateTime().setDateTime(newStart).setTimeZone(zoneId.getId()));
-        event.setEnd(new EventDateTime().setDateTime(newEnd).setTimeZone(zoneId.getId()));
         calendar.events().update("primary", event.getId(), event).execute();
 
         return "Rescheduled \"" + match.title() + "\" to " + newStartDatetime;
@@ -107,8 +130,22 @@ public class CalendarService {
             ZonedDateTime zdt = Instant.ofEpochMilli(edt.getDateTime().getValue()).atZone(zoneId);
             return zdt.format(DateTimeFormatter.ofPattern("EEE d MMM  HH:mm"));
         }
-        if (edt.getDate() != null) return edt.getDate().toString();
+        if (edt.getDate() != null) {
+            // All-day: parse the date string and format nicely
+            try {
+                LocalDate d = LocalDate.parse(edt.getDate().toString());
+                return "All day · " + d.format(DateTimeFormatter.ofPattern("EEE d MMM"));
+            } catch (Exception ignored) {}
+            return edt.getDate().toString();
+        }
         return "";
+    }
+
+    /** Returns true if the string looks like a date-only value (no time component). */
+    private static boolean isDateOnly(String s) {
+        if (s == null || s.isBlank()) return false;
+        // yyyy-MM-dd with nothing after, or with only non-digit after 10 chars that isn't 'T'
+        return s.length() == 10 || (s.length() > 10 && s.charAt(10) != 'T' && s.charAt(10) != ' ');
     }
 
     private DateTime parseDateTime(String s) {

@@ -229,6 +229,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             case "/start"        -> { sendText(chatId, "👋 Hey! I'm Proton, your personal productivity bot.\n\nJust talk to me naturally — add tasks, save notes, check what's due, anything. What do you need?"); return; }
             case "/help"         -> { sendText(chatId, helpText()); return; }
             case "/authorize"         -> { handleAuthorize(chatId, userId); return; }
+            case "/myprofile"         -> { sendText(chatId, claudeService != null ? claudeService.getProfileText(userId) : "AI not configured."); return; }
             case "/clearattachments"  -> {
                 List<GmailService.Attachment> removed = pendingAttachments.remove(userId);
                 sendText(chatId, removed != null && !removed.isEmpty()
@@ -254,6 +255,12 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             }
         }
 
+        if (text.startsWith("/forget ")) {
+            String key = text.substring(8).trim();
+            if (key.isBlank()) { sendText(chatId, "Usage: /forget <key>  (see /myprofile for key names)"); return; }
+            boolean removed = claudeService != null && claudeService.forgetProfileKey(userId, key);
+            sendText(chatId, removed ? "🗑 Forgot \"" + key + "\"." : "No preference found with key \"" + key + "\"."); return;
+        }
         if (text.startsWith("/pomodoro")) {
             String[] parts = text.trim().split("\\s+");
             int work   = parts.length > 1 ? parseIntSafe(parts[1], 25) : 25;
