@@ -86,6 +86,17 @@ public class ClaudeService {
             - search_notes shows a summary list only — NOT the full note content
             - To read the full content of a note, call read_note with the page_id from search_notes results
             - If the user asks to "read", "open", or "show full" a note, call search_notes first then read_note
+
+            ══ MEMORY SYSTEM — YOU HAVE PERSISTENT MEMORY ══
+            - Your "Remembered user preferences" section above is a real database that persists across ALL sessions and restarts.
+            - NEVER tell the user you don't have memory or can't remember things between sessions — you absolutely can and do.
+            - When the user asks you to remember, keep, or save a preference → call save_preference IMMEDIATELY with a clear key and value.
+            - Preferences shown to you at the start of each session are always up to date — apply them without being asked.
+            - EXAMPLES of when to call save_preference:
+              • "remember I prefer brief summaries" → save_preference(key="email_display_style", value="brief summary only, show full on request")
+              • "always reply casually" → save_preference(key="response_tone", value="casual and friendly")
+              • "my name is Zul" → save_preference(key="preferred_name", value="Zul")
+            ════════════════════════════════════════════════════
             """;
 
     private final String apiKey;
@@ -157,11 +168,15 @@ public class ClaudeService {
             // No tool calls — we are done
             if (toolUseBlocks.isEmpty()) {
                 String finalText = allText.toString().trim();
-                // If we fetched live task data, save a neutral placeholder instead of
-                // Claude's verbose summary — prevents stale counts leaking into history.
-                String savedResponse = taskDataFetched
-                        ? "[Showed current task list from database]"
-                        : (finalText.isEmpty() ? "OK" : finalText);
+                // If task data was fetched and Claude just listed/repeated tasks verbatim,
+                // save a placeholder to avoid stale counts in history.
+                // But if Claude generated real analysis/summary, save that — it's valuable.
+                String savedResponse;
+                if (taskDataFetched && finalText.isEmpty()) {
+                    savedResponse = "[Showed current task list from database]";
+                } else {
+                    savedResponse = finalText.isEmpty() ? "OK" : finalText;
+                }
                 addToHistory(userId, userMessage, savedResponse);
                 extractAndSaveMemory(userId, userMessage, savedResponse);
                 return finalText.isEmpty() ? "\uD83D\uDC4D" : finalText;
@@ -266,9 +281,24 @@ public class ClaudeService {
                             sb.append("   ").append(cat).append(due).append("\n\n");
                         }
                     }
-                    // Send directly as a Telegram message so Claude doesn't reformat it
+                    // Send the nicely formatted list directly to the user
                     sender.send(sb.toString().trim());
-                    yield "SENT_DIRECTLY";
+
+                    // Also return task data to Claude so it can analyse, summarise, or act on it
+                    StringBuilder data = new StringBuilder("Task list sent. Data for analysis (").append(tasks.size()).append(" tasks):\n");
+                    for (Task t : main) {
+                        String p = switch (t.getPriority()) { case HIGH -> "HIGH"; case MEDIUM -> "MED"; case LOW -> "LOW"; default -> ""; };
+                        data.append("• [").append(p).append("] ").append(t.getTitle());
+                        if (t.getDueAt() != null) data.append(" — due ").append(taskService.friendlyDate(t.getDueAt()));
+                        if (!"none".equals(t.getCategory())) data.append(" [").append(t.getCategory()).append("]");
+                        data.append("\n");
+                    }
+                    for (Task t : daily) {
+                        data.append("• [DAILY] ").append(t.getTitle());
+                        if (t.getDueAt() != null) data.append(" — due ").append(taskService.friendlyDate(t.getDueAt()));
+                        data.append("\n");
+                    }
+                    yield data.toString();
                 }
 
                 case "mark_done" -> {
@@ -490,7 +520,10 @@ public class ClaudeService {
                         sb.append("\n");
                     }
                     sender.send(sb.toString().trim());
-                    yield "SENT_DIRECTLY";
+                    // Return event data to Claude for analysis
+                    StringBuilder data = new StringBuilder("Calendar sent. Events for analysis:\n");
+                    events.forEach(e -> data.append("• ").append(e.start()).append(" — ").append(e.title()).append("\n"));
+                    yield data.toString();
                 }
 
                 case "add_event" -> {
@@ -540,6 +573,14 @@ public class ClaudeService {
                         yield "Downloaded file \"" + file.name() + "\" was empty. It may be a Google Workspace file that couldn't be exported, or access was denied.";
                     fileSender.send(file.name(), file.data());
                     yield "SENT_DIRECTLY";
+                }
+
+                case "save_preference" -> {
+                    String key   = str(input, "key");
+                    String value = str(input, "value");
+                    if (key == null || value == null) yield "Missing key or value.";
+                    if (db != null) db.upsertProfile(userId, key, value);
+                    yield "Saved preference: " + key + " = " + value;
                 }
 
                 default -> "Unknown tool: " + name;
@@ -647,6 +688,12 @@ public class ClaudeService {
                     .req("enable", "boolean", "true to enable, false to disable")
         ));
 
+        tools.add(tool("save_preference", "Save a user preference or personal fact to persistent memory (survives restarts and new sessions)",
+                props()
+                    .req("key",   "string", "Short snake_case identifier, e.g. email_display_style, response_tone, preferred_name")
+                    .req("value", "string", "The preference or fact to remember")
+        ));
+
         // ── Email tools ─────────────────────────────────────────────────────────
         tools.add(tool("read_emails", "List recent emails from Gmail inbox — shows subject, sender, snippet and ID only",
                 props()
@@ -745,13 +792,19 @@ public class ClaudeService {
         if (db == null) return;
         memoryExtractor.execute(() -> {
             try {
-                String prompt = "You extract user preferences and personal facts for a personal assistant app.\n\n"
+                String prompt = "You extract user preferences and personal facts from a conversation for a personal assistant.\n\n"
                         + "User message: " + userMessage + "\n"
                         + "Assistant response: " + assistantResponse + "\n\n"
-                        + "Extract ONLY concrete facts/preferences explicitly stated by the user. Do not infer.\n"
-                        + "Good examples: name they prefer to be called, time preferences, working style, category preferences.\n"
-                        + "Skip: task content, reminders, casual chitchat, anything ephemeral.\n"
-                        + "Return JSON array: [{\"key\": \"snake_case_key\", \"value\": \"fact\"}] or [] if nothing to save.\n"
+                        + "Extract any preference, habit, personal fact, or behavioural instruction the USER expressed.\n"
+                        + "Be generous — if the user stated how they want things done, save it.\n"
+                        + "Good examples to save:\n"
+                        + "  - How they want content displayed (brief vs full, formatted vs plain)\n"
+                        + "  - Communication style preferences (casual, concise, detailed)\n"
+                        + "  - Scheduling habits, working hours, routines\n"
+                        + "  - Personal context (job, school, family situation)\n"
+                        + "  - Names, nicknames, relationships\n"
+                        + "Skip: specific task content, one-off requests, casual greetings.\n"
+                        + "Return JSON array: [{\"key\": \"snake_case_key\", \"value\": \"preference\"}] or [] if nothing.\n"
                         + "Return ONLY the JSON array, no other text.";
                 Map<String, Object> body = new LinkedHashMap<>();
                 body.put("model", MODEL_FAST);
