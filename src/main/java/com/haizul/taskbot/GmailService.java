@@ -4,6 +4,7 @@ import com.google.api.services.gmail.Gmail;
 import com.google.api.services.gmail.model.Draft;
 import com.google.api.services.gmail.model.ListMessagesResponse;
 import com.google.api.services.gmail.model.Message;
+import com.google.api.services.gmail.model.MessagePart;
 import com.google.api.services.gmail.model.MessagePartHeader;
 
 import java.nio.charset.StandardCharsets;
@@ -36,6 +37,7 @@ Haizul Ali Seron""";
     // ── Records ───────────────────────────────────────────────────────────────
 
     public record EmailSummary(String id, String from, String subject, String date, String snippet) {}
+    public record EmailContent(String id, String from, String subject, String date, String body, String threadId) {}
     public record Attachment(String filename, byte[] data) {}
 
     // ── Read inbox ─────────────────────────────────────────────────────────────
@@ -64,6 +66,65 @@ Haizul Ali Seron""";
             emails.add(new EmailSummary(full.getId(), from, subject, date, snippet));
         }
         return emails;
+    }
+
+    // ── Read full email content ───────────────────────────────────────────────
+
+    /** Fetch and decode the full body of a specific email by message ID. */
+    public EmailContent readEmailContent(String messageId) throws Exception {
+        Message full = gmail.users().messages()
+                .get("me", messageId)
+                .setFormat("full")
+                .execute();
+        String from    = getHeader(full, "From");
+        String subject = getHeader(full, "Subject");
+        String date    = getHeader(full, "Date");
+        String body    = extractBody(full.getPayload());
+        return new EmailContent(full.getId(), from, subject, date, body, full.getThreadId());
+    }
+
+    /**
+     * Recursively extract plain-text body from a message payload.
+     * Prefers text/plain; falls back to text/html (tags stripped); recurses into multipart.
+     */
+    private String extractBody(MessagePart payload) {
+        if (payload == null) return "";
+        // Leaf part with data
+        if (payload.getBody() != null && payload.getBody().getData() != null) {
+            byte[] bytes = Base64.getUrlDecoder().decode(payload.getBody().getData());
+            String text  = new String(bytes, StandardCharsets.UTF_8);
+            if ("text/html".equalsIgnoreCase(payload.getMimeType())) {
+                text = text.replaceAll("(?i)<br\\s*/?>", "\n")
+                           .replaceAll("(?i)<p[^>]*>", "\n")
+                           .replaceAll("<[^>]+>", "")
+                           .replaceAll("&nbsp;", " ")
+                           .replaceAll("&amp;", "&")
+                           .replaceAll("&lt;", "<")
+                           .replaceAll("&gt;", ">")
+                           .replaceAll("\r\n|\r", "\n")
+                           .replaceAll("\n{3,}", "\n\n")
+                           .trim();
+            }
+            return text;
+        }
+        // Multipart: prefer text/plain, then text/html, then recurse
+        if (payload.getParts() != null) {
+            String plain = null, html = null;
+            for (MessagePart part : payload.getParts()) {
+                if ("text/plain".equalsIgnoreCase(part.getMimeType()))
+                    plain = extractBody(part);
+                else if ("text/html".equalsIgnoreCase(part.getMimeType()) && html == null)
+                    html = extractBody(part);
+            }
+            if (plain != null && !plain.isBlank()) return plain;
+            if (html  != null && !html.isBlank())  return html;
+            // Recurse into nested multipart (e.g. multipart/alternative inside multipart/mixed)
+            for (MessagePart part : payload.getParts()) {
+                String body = extractBody(part);
+                if (!body.isBlank()) return body;
+            }
+        }
+        return "";
     }
 
     // ── Create draft ──────────────────────────────────────────────────────────

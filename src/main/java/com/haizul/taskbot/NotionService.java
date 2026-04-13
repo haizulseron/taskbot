@@ -256,7 +256,7 @@ public class NotionService {
 
     // ── Search ────────────────────────────────────────────────────────────────
 
-    public record NoteResult(String title, String category, List<String> tags, String summary, String raw, String created) {}
+    public record NoteResult(String pageId, String title, String category, List<String> tags, String summary, String raw, String created) {}
 
     public List<NoteResult> searchNotes(String query, String categoryFilter, int limit) {
         try {
@@ -314,6 +314,7 @@ public class NotionService {
             List<NoteResult> notes = new ArrayList<>();
             for (JsonNode page : results) {
                 JsonNode p       = page.path("properties");
+                String pageId    = page.path("id").asText("");
                 String title     = extractTitle(p.path("Title"));
                 String category  = p.path("Category").path("select").path("name").asText("Other");
                 String summary   = extractRichText(p.path("Summary"));
@@ -323,7 +324,7 @@ public class NotionService {
                 for (JsonNode tag : p.path("Tags").path("multi_select")) {
                     tags.add(tag.path("name").asText());
                 }
-                notes.add(new NoteResult(title, category, tags, summary, raw, created));
+                notes.add(new NoteResult(pageId, title, category, tags, summary, raw, created));
             }
             return notes;
         } catch (Exception e) {
@@ -392,13 +393,57 @@ public class NotionService {
 
     private String extractRichText(JsonNode prop) {
         JsonNode arr = prop.path("rich_text");
-        if (arr.isArray() && arr.size() > 0) return arr.get(0).path("plain_text").asText("");
-        return "";
+        if (!arr.isArray() || arr.isEmpty()) return "";
+        // Concatenate all chunks — Notion splits long text across multiple rich_text items
+        StringBuilder sb = new StringBuilder();
+        for (JsonNode item : arr) sb.append(item.path("plain_text").asText(""));
+        return sb.toString();
     }
 
     private String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() <= max ? s : s.substring(0, max);
+    }
+
+    // ── Read full note content ────────────────────────────────────────────────
+
+    /**
+     * Fetch all paragraph/heading blocks from a Notion page and return them
+     * as a single string. This is how we read the full note content beyond
+     * the 2000-char property limit.
+     */
+    public String readNote(String pageId) {
+        try {
+            String response = get("/blocks/" + pageId + "/children?page_size=100");
+            JsonNode json   = mapper.readTree(response);
+            StringBuilder sb = new StringBuilder();
+            for (JsonNode block : json.path("results")) {
+                String type = block.path("type").asText("");
+                // All block types that have a rich_text array
+                JsonNode blockContent = block.path(type);
+                JsonNode richText     = blockContent.path("rich_text");
+                if (richText.isArray() && !richText.isEmpty()) {
+                    for (JsonNode rt : richText) sb.append(rt.path("plain_text").asText(""));
+                    sb.append("\n");
+                }
+            }
+            return sb.toString().trim();
+        } catch (Exception e) {
+            System.err.println("readNote error: " + e.getMessage());
+            return "";
+        }
+    }
+
+    private String get(String path) throws Exception {
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(BASE_URL + path))
+                .header("Authorization", "Bearer " + apiKey)
+                .header("Notion-Version", NOTION_VERSION)
+                .GET()
+                .build();
+        HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (res.statusCode() >= 400) throw new RuntimeException("Notion GET error " + res.statusCode() + ": " + res.body());
+        return res.body();
     }
 
     private String patch(String path, String body) throws Exception {

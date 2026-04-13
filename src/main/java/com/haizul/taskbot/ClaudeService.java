@@ -73,12 +73,19 @@ public class ClaudeService {
             - If the user asks for a specific file (e.g. "first one"), call send_drive_file with that file's id right away
 
             EMAIL RULES:
+            - read_emails shows inbox list (subject, sender, snippet + ID only) — NOT the full email body
+            - To read the actual content of an email, call read_email with the message_id
             - ALWAYS write emails in a professional, clear, and polished tone — no exceptions
             - Always open with an appropriate greeting (e.g. "Dear [Name]," or "Hi [Name]," depending on formality)
             - Do NOT add a sign-off or signature in the body — the system automatically appends "Warm regards, Haizul Ali Seron"
             - For draft_email: YOU compose the full subject AND body right now. Do not ask for more info.
             - For reply_email: write a professional reply body, then call the tool with the original message_id
             - Attached files from Telegram are automatically included when drafting/replying — no need to mention them
+
+            NOTES RULES:
+            - search_notes shows a summary list only — NOT the full note content
+            - To read the full content of a note, call read_note with the page_id from search_notes results
+            - If the user asks to "read", "open", or "show full" a note, call search_notes first then read_note
             """;
 
     private final String apiKey;
@@ -379,10 +386,22 @@ public class ClaudeService {
                         sb.append("   📁 ").append(note.category());
                         if (!note.tags().isEmpty()) sb.append("  🏷 ").append(String.join(", ", note.tags()));
                         sb.append("  📅 ").append(note.created()).append("\n");
-                        if (!note.summary().isBlank()) sb.append(note.summary()).append("\n");
+                        if (!note.summary().isBlank()) sb.append("   ").append(note.summary()).append("\n");
                         sb.append("\n");
                     }
                     sender.send(sb.toString().trim());
+                    // Return page IDs so Claude can read full content on request
+                    StringBuilder ids = new StringBuilder("Notes shown. Page IDs for read_note:\n");
+                    results.forEach(n -> ids.append("• ").append(n.title()).append(" → ").append(n.pageId()).append("\n"));
+                    yield ids.toString();
+                }
+
+                case "read_note" -> {
+                    if (notionService == null) yield "Notes not configured.";
+                    String pageId = str(input, "page_id");
+                    String content = notionService.readNote(pageId);
+                    if (content == null || content.isBlank()) yield "Note is empty or couldn't be read.";
+                    sender.send(content);
                     yield "SENT_DIRECTLY";
                 }
 
@@ -416,6 +435,22 @@ public class ClaudeService {
                     StringBuilder ids = new StringBuilder("Emails shown. Message IDs for reply:\n");
                     emails.forEach(e -> ids.append("• ").append(e.subject()).append(" → ").append(e.id()).append("\n"));
                     yield ids.toString();
+                }
+
+                case "read_email" -> {
+                    if (gmailService == null) yield "Gmail not connected. Send /authorize to link your Google account.";
+                    String messageId = str(input, "message_id");
+                    GmailService.EmailContent email = gmailService.readEmailContent(messageId);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("📧 ").append(email.subject()).append("\n");
+                    sb.append("From: ").append(email.from()).append("\n");
+                    sb.append("Date: ").append(email.date()).append("\n");
+                    sb.append("─────────────────\n\n");
+                    String body = email.body();
+                    if (body.length() > 3000) body = body.substring(0, 3000) + "\n\n[truncated — email is long]";
+                    sb.append(body);
+                    sender.send(sb.toString().trim());
+                    yield "Email content shown. Message ID for reply: " + email.id();
                 }
 
                 case "draft_email" -> {
@@ -594,11 +629,16 @@ public class ClaudeService {
                     .opt("source", "string", "text or voice")
         ));
 
-        tools.add(tool("search_notes", "Search or retrieve saved notes",
+        tools.add(tool("search_notes", "Search or retrieve saved notes (shows title, summary, category)",
                 props()
                     .opt("query", "string", "Search keywords")
                     .opt("category", "string", "Filter by category")
                     .opt("recent", "boolean", "Set true to get recent notes")
+        ));
+
+        tools.add(tool("read_note", "Read the full content of a specific note from Notion",
+                props()
+                    .req("page_id", "string", "Notion page ID from search_notes results")
         ));
 
         tools.add(tool("toggle_habit", "Mark or unmark a task as a habit",
@@ -608,9 +648,14 @@ public class ClaudeService {
         ));
 
         // ── Email tools ─────────────────────────────────────────────────────────
-        tools.add(tool("read_emails", "Read recent emails from Gmail inbox",
+        tools.add(tool("read_emails", "List recent emails from Gmail inbox — shows subject, sender, snippet and ID only",
                 props()
                     .opt("count", "integer", "Number of emails to fetch (default: 5, max: 10)")
+        ));
+
+        tools.add(tool("read_email", "Read the full body of a specific email by message ID",
+                props()
+                    .req("message_id", "string", "Message ID from read_emails results")
         ));
 
         tools.add(tool("draft_email", "Create a professional draft email in Gmail. Always use professional tone. YOU compose subject and body.",
