@@ -222,7 +222,6 @@ public class GoogleTasksService {
                 }
             } catch (Exception e) {
                 System.err.println("Failed to fetch tasks from '" + listName + "': " + e.getMessage());
-                throw new RuntimeException("Failed to fetch tasks from list: " + listName, e);
             }
         }
         return allTasks;

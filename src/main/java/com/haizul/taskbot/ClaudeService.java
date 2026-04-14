@@ -44,6 +44,22 @@ public class ClaudeService {
             Personality: friendly, casual, like a helpful mate. Keep responses concise.
             Always confirm what you did in plain English after using tools.
 
+            ══ KNOW YOUR CAPABILITIES ══
+            You have tools for: tasks, calendar, email, drive, notes, journal, mood, countdowns, goals, Google Tasks sync, preferences.
+            These features exist as SLASH COMMANDS (handled before reaching you — do NOT say they don't exist):
+            - /pomodoro [work] [break] [rounds] — start a Pomodoro focus timer
+            - /stoppomodoro — stop the current Pomodoro
+            - /brief — morning briefing
+            - /mood — log mood & energy
+            - /journal <entry> — save journal entry
+            - /countdown, /countdowns — manage countdowns
+            - /goal, /goals — manage goals
+            - /gtasks — view Google Tasks
+            - /synctasks — sync tasks to Google Tasks
+            - /authorize — link Google account
+            If the user asks about ANY of these, tell them the command exists. NEVER say "I don't have that feature" for anything listed above.
+            ════════════════════════════
+
             CRITICAL RULES:
             - Only call tools when the user clearly wants to DO something
             - Casual conversation, greetings, or venting → respond naturally with text, NO tool calls
@@ -244,6 +260,11 @@ public class ClaudeService {
                         taskService.markDone(userId, opt.get().shortId());
                         taskService.resetReminderIgnoredCount(opt.get().getId());
                         String result = "✅ Done! \"" + opt.get().getTitle() + "\" is marked complete.";
+                        addToHistory(userId, userMessage, result);
+                        return result;
+                    } else {
+                        // Task not found — don't let Claude's hallucinated "done" through
+                        String result = "❌ Couldn't find a task matching \"" + taskHint + "\". Check /tasks for your current list.";
                         addToHistory(userId, userMessage, result);
                         return result;
                     }
@@ -797,15 +818,13 @@ public class ClaudeService {
                 }
 
                 case "sync_google_tasks" -> {
-                    if (googleCalendarService == null) yield "Google not connected. Send /authorize to link your Google account.";
+                    if (googleTasksService == null) yield "Google Tasks not connected. Send /authorize to link your Google account.";
                     List<Task> active = taskService.getActiveTasks(userId);
                     int synced = 0;
                     for (Task task : active) {
                         if (task.getGoogleTaskId() == null) {
                             try {
-                                String listName = googleTasksService != null
-                                        ? googleTasksService.listNameForPriority(task.getPriority().name())
-                                        : "Medium Priority";
+                                String listName = googleTasksService.listNameForPriority(task.getPriority().name());
                                 String dueDate = task.getDueAt() != null
                                         ? task.getDueAt().toLocalDate().toString() : null;
                                 var gTask = googleTasksService.createGoogleTask(

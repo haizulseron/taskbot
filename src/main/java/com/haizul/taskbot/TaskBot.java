@@ -116,10 +116,6 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             if (allowedUserId != 0 && userId != allowedUserId) return;
 
             // Group chat inbox — everything goes through simple task-or-note flow
-            if (update.hasMessage()) {
-                System.out.println("[DEBUG] chatId=" + update.getMessage().getChatId()
-                        + " groupChatId=" + groupChatId + " match=" + (update.getMessage().getChatId() == groupChatId));
-            }
             if (update.hasMessage() && groupChatId != 0
                     && update.getMessage().getChatId() == groupChatId) {
                 handleGroupInbox(update);
@@ -130,6 +126,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 if (update.getMessage().hasText())           handleMessage(update);
                 else if (update.getMessage().hasVoice())     handleVoice(update);
                 else if (update.getMessage().hasDocument())  handleDocument(update);
+                else if (update.getMessage().hasPhoto())     handlePhoto(update);
                 else if (update.getMessage().hasLocation())  handleLocation(update);
             } else if (update.hasCallbackQuery()) {
                 handleCallback(update);
@@ -188,6 +185,37 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                     + " file(s) queued for your next email draft or reply.\n\nSay \"draft email to...\" or \"reply to [email]\" to use it.");
         } catch (Exception e) {
             sendText(chatId, "Couldn't save that file: " + e.getMessage());
+        }
+    }
+
+    // ── Incoming photo (queued for email attachment, or process caption) ────
+
+    private void handlePhoto(Update update) {
+        long chatId = update.getMessage().getChatId();
+        long userId = update.getMessage().getFrom().getId();
+        var photos  = update.getMessage().getPhoto();
+        // Get the largest resolution
+        String fileId = photos.get(photos.size() - 1).getFileId();
+
+        try {
+            byte[] data = downloadTelegramFile(fileId);
+            String filename = "photo_" + System.currentTimeMillis() + ".jpg";
+            pendingAttachments.computeIfAbsent(userId, k -> new ArrayList<>())
+                    .add(new GmailService.Attachment(filename, data));
+            pendingAttachmentTimestamps.put(userId, System.currentTimeMillis());
+            int total = pendingAttachments.get(userId).size();
+
+            String caption = update.getMessage().getCaption();
+            if (caption != null && !caption.isBlank()) {
+                // Photo with caption — queue the photo AND route the caption to Claude
+                sendText(chatId, "📎 Photo queued (" + total + " attachment(s) ready).");
+                routeToAgent(chatId, userId, caption);
+            } else {
+                sendText(chatId, "📎 Got photo (" + data.length / 1024 + " KB). " + total
+                        + " file(s) queued for your next email draft or reply.\n\nSay \"draft email to...\" or \"reply to [email]\" to use it.");
+            }
+        } catch (Exception e) {
+            sendText(chatId, "Couldn't save that photo: " + e.getMessage());
         }
     }
 
@@ -357,14 +385,20 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         // Java pre-processing for pomodoro keywords
         String lower = text.toLowerCase(java.util.Locale.ROOT);
         if (lower.contains("stop pomodoro") || lower.contains("cancel pomodoro")
-                || lower.contains("stop focus") || lower.contains("end session")) {
+                || lower.contains("stop the pomodoro") || lower.contains("end pomodoro")
+                || lower.contains("stop my pomodoro") || lower.contains("pause pomodoro")
+                || lower.contains("stop timer") || lower.contains("stop the timer")
+                || lower.contains("stop focus") || lower.contains("end session")
+                || lower.contains("end the session") || lower.contains("stop session")) {
             boolean stopped = taskService.stopFocusSession(userId);
             UserSettings us = taskService.getUserSettings(userId);
             taskService.saveUserSettings(userId, us.getQuietStart(), us.getQuietEnd(), null);
             sendText(chatId, stopped ? "⏹ Session stopped." : "No active session."); return;
         }
-        if (lower.contains("pomodoro") && !lower.contains("task") && !lower.contains("what")
-                && !lower.contains("show") && !lower.contains("list")) {
+        if ((lower.contains("pomodoro") || lower.contains("focus session") || lower.contains("focus timer"))
+                && !lower.contains("task") && !lower.contains("what")
+                && !lower.contains("show") && !lower.contains("list") && !lower.contains("stop")
+                && !lower.contains("cancel") && !lower.contains("end") && !lower.contains("pause")) {
             int work = 25, brk = 5, rounds = 4;
             java.util.regex.Matcher mWork = java.util.regex.Pattern.compile("(\\d+)\\s*min").matcher(lower);
             java.util.regex.Matcher mHour = java.util.regex.Pattern.compile("(\\d+)\\s*hour").matcher(lower);
