@@ -38,14 +38,63 @@ public class Main {
             }
         }
 
+        // ── New services ─────────────────────────────────────────────────────
+        MoodService moodService = new MoodService(database, config.getZoneId());
+        CountdownService countdownService = new CountdownService(database, config.getZoneId());
+        GoalService goalService = new GoalService(database, config.getZoneId());
+
+        // Journal — uses its own Notion API key + database ID
+        String notionJournalApiKey = config.getNotionJournalApiKey();
+        String notionJournalDbId = config.getNotionJournalDbId();
+        JournalService journalService = (notionJournalApiKey != null && !notionJournalApiKey.isBlank()
+                && notionJournalDbId != null && !notionJournalDbId.isBlank()
+                && claudeKey != null && !claudeKey.isBlank())
+                ? new JournalService(notionJournalApiKey, notionJournalDbId, claudeKey) : null;
+
+        // Inbox — needs Claude API key and bot token
+        InboxService inboxService = (claudeKey != null && !claudeKey.isBlank())
+                ? new InboxService(claudeKey, config.getBotToken()) : null;
+
+        // Google Tasks & Calendar — need Google auth
+        GoogleTasksService googleTasksService = null;
+        GoogleCalendarService googleCalendarService = null;
+        if (googleAuthService != null && googleAuthService.isAuthorized()) {
+            try {
+                googleTasksService = new GoogleTasksService(googleAuthService);
+                System.out.println("Google Tasks service initialized.");
+            } catch (Exception e) {
+                System.err.println("Google Tasks init failed: " + e.getMessage());
+            }
+            try {
+                googleCalendarService = new GoogleCalendarService(googleAuthService, config.getZoneId());
+                System.out.println("Google Calendar (v2) service initialized.");
+            } catch (Exception e) {
+                System.err.println("Google Calendar (v2) init failed: " + e.getMessage());
+            }
+        }
+
+        // ── Wire services into ClaudeService ─────────────────────────────────
+        if (claudeService != null) {
+            claudeService.setExtraServices(moodService, countdownService, goalService);
+            if (googleTasksService != null) claudeService.setGoogleTasksService(googleTasksService);
+        }
+
+        // ── Create bot ───────────────────────────────────────────────────────
         TaskBot taskBot = new TaskBot(config, taskService, claudeService, whisperService, notionService, noteService,
                 googleAuthService);
+        taskBot.setExtraServices(googleCalendarService, googleTasksService, journalService,
+                inboxService, moodService, countdownService, goalService);
 
+        // ── Scheduler ────────────────────────────────────────────────────────
         SchedulerService schedulerService = new SchedulerService(
                 taskService, taskBot, claudeService,
                 config.getZoneId(), config.getMorningSummaryTime(),
-                config.getSchedulerCheckIntervalSeconds()
+                config.getSchedulerCheckIntervalSeconds(),
+                config.getMorningBriefTime(), config.getMoodCheckinTime(),
+                config.getAllowedUserId()
         );
+        schedulerService.setExtraServices(moodService, countdownService, goalService,
+                googleCalendarService, googleTasksService);
 
         try (TelegramBotsLongPollingApplication application = new TelegramBotsLongPollingApplication()) {
             application.registerBot(config.getBotToken(), taskBot);

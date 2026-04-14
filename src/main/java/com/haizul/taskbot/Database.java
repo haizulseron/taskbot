@@ -19,11 +19,18 @@ public class Database {
     }
 
     public Connection getConnection() throws SQLException {
-        return DriverManager.getConnection(jdbcUrl);
+        Connection c = DriverManager.getConnection(jdbcUrl);
+        // Prevent SQLITE_BUSY under concurrent access from scheduler + bot threads
+        try (Statement s = c.createStatement()) {
+            s.execute("PRAGMA busy_timeout = 5000");
+        }
+        return c;
     }
 
     public void initialize() {
         try (Connection c = getConnection(); Statement s = c.createStatement()) {
+            // WAL mode allows concurrent readers + single writer without blocking
+            s.execute("PRAGMA journal_mode=WAL");
             s.executeUpdate("""
                     CREATE TABLE IF NOT EXISTS tasks (
                         id TEXT PRIMARY KEY,
@@ -124,7 +131,7 @@ public class Database {
             throw new RuntimeException("Failed to initialize database", e);
         }
 
-        // Safe migrations
+        // Safe migrations — existing
         migrate("ALTER TABLE tasks ADD COLUMN notes TEXT");
         migrate("ALTER TABLE tasks ADD COLUMN reminder_interval_minutes INTEGER");
         migrate("ALTER TABLE tasks ADD COLUMN repeat_reminder INTEGER DEFAULT 0");
@@ -134,6 +141,58 @@ public class Database {
         migrate("ALTER TABLE user_settings ADD COLUMN pomodoro_state TEXT");
         migrate("ALTER TABLE tasks ADD COLUMN reminder_lng REAL");
         migrate("ALTER TABLE tasks ADD COLUMN reminder_radius_meters INTEGER DEFAULT 200");
+
+        // Google sync columns on tasks
+        migrate("ALTER TABLE tasks ADD COLUMN google_task_id TEXT");
+        migrate("ALTER TABLE tasks ADD COLUMN google_tasklist_id TEXT");
+        migrate("ALTER TABLE tasks ADD COLUMN google_event_id TEXT");
+
+        // Mood log table (Feature 4)
+        try (Connection c = getConnection(); Statement s2 = c.createStatement()) {
+            s2.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS mood_log (
+                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id    INTEGER NOT NULL,
+                        date       TEXT    NOT NULL,
+                        mood       INTEGER,
+                        energy     INTEGER,
+                        created_at TEXT    NOT NULL,
+                        UNIQUE(user_id, date)
+                    )
+                    """);
+            // Countdowns table (Feature 8)
+            s2.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS countdowns (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id     INTEGER NOT NULL,
+                        name        TEXT    NOT NULL,
+                        target_date TEXT    NOT NULL,
+                        created_at  TEXT    NOT NULL
+                    )
+                    """);
+            // Goals table (Feature 9)
+            s2.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS goals (
+                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id      INTEGER NOT NULL,
+                        title        TEXT    NOT NULL,
+                        target_date  TEXT,
+                        status       TEXT    NOT NULL DEFAULT 'active',
+                        created_at   TEXT    NOT NULL,
+                        completed_at TEXT
+                    )
+                    """);
+            // Goal-task links (Feature 9)
+            s2.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS goal_task_links (
+                        goal_id INTEGER NOT NULL,
+                        task_id TEXT    NOT NULL,
+                        PRIMARY KEY (goal_id, task_id)
+                    )
+                    """);
+        } catch (SQLException e) {
+            System.err.println("Failed to create new tables: " + e.getMessage());
+        }
     }
 
     // ── Conversation history ──────────────────────────────────────────────────
@@ -243,23 +302,28 @@ public class Database {
     public void replaceProfile(long userId, Map<String, String> entries) {
         try (Connection c = getConnection()) {
             c.setAutoCommit(false);
-            try (PreparedStatement del = c.prepareStatement("DELETE FROM user_profile WHERE user_id = ?")) {
-                del.setLong(1, userId);
-                del.executeUpdate();
-            }
-            String sql = "INSERT INTO user_profile (user_id, key, value) VALUES (?, ?, ?)";
-            try (PreparedStatement ps = c.prepareStatement(sql)) {
-                for (Map.Entry<String, String> e : entries.entrySet()) {
-                    ps.setLong(1, userId);
-                    ps.setString(2, e.getKey());
-                    ps.setString(3, e.getValue());
-                    ps.addBatch();
+            try {
+                try (PreparedStatement del = c.prepareStatement("DELETE FROM user_profile WHERE user_id = ?")) {
+                    del.setLong(1, userId);
+                    del.executeUpdate();
                 }
-                ps.executeBatch();
+                String sql = "INSERT INTO user_profile (user_id, key, value) VALUES (?, ?, ?)";
+                try (PreparedStatement ps = c.prepareStatement(sql)) {
+                    for (Map.Entry<String, String> e : entries.entrySet()) {
+                        ps.setLong(1, userId);
+                        ps.setString(2, e.getKey());
+                        ps.setString(3, e.getValue());
+                        ps.addBatch();
+                    }
+                    ps.executeBatch();
+                }
+                c.commit();
+            } catch (SQLException e) {
+                try { c.rollback(); } catch (SQLException ignored) {}
+                System.err.println("Failed to replace profile (rolled back): " + e.getMessage());
             }
-            c.commit();
         } catch (SQLException e) {
-            System.err.println("Failed to replace profile: " + e.getMessage());
+            System.err.println("Failed to open connection for replaceProfile: " + e.getMessage());
         }
     }
 
@@ -268,6 +332,12 @@ public class Database {
     private void migrate(String sql) {
         try (Connection c = getConnection(); Statement s = c.createStatement()) {
             s.executeUpdate(sql);
-        } catch (SQLException ignored) {}
+        } catch (SQLException e) {
+            // "duplicate column" is expected for already-applied migrations — suppress silently.
+            // Anything else (disk full, locked, corrupt) should be logged.
+            String msg = e.getMessage();
+            if (msg != null && (msg.contains("duplicate column") || msg.contains("already exists"))) return;
+            System.err.println("Migration warning (" + sql.substring(0, Math.min(60, sql.length())) + "): " + msg);
+        }
     }
 }

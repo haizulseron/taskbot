@@ -37,7 +37,7 @@ public class CalendarService {
         ZonedDateTime cutoff = now.plusDays(days);
 
         Events events = calendar.events().list("primary")
-                .setMaxResults(20)
+                .setMaxResults(50)
                 .setTimeMin(new DateTime(now.toInstant().toEpochMilli()))
                 .setTimeMax(new DateTime(cutoff.toInstant().toEpochMilli()))
                 .setOrderBy("startTime")
@@ -90,7 +90,8 @@ public class CalendarService {
     }
 
     public String rescheduleEvent(String eventHint, String newStartDatetime) throws Exception {
-        List<EventSummary> upcoming = getUpcomingEvents(60);
+        // Search up to 1 year ahead (not just 60 days) so distant events are findable
+        List<EventSummary> upcoming = getUpcomingEvents(365);
         EventSummary match = upcoming.stream()
                 .filter(e -> e.title() != null
                         && e.title().toLowerCase().contains(eventHint.toLowerCase()))
@@ -104,7 +105,16 @@ public class CalendarService {
         boolean wasAllDay = event.getStart() != null && event.getStart().getDate() != null;
         if (wasAllDay || isDateOnly(newStartDatetime)) {
             String startDate = newStartDatetime.length() >= 10 ? newStartDatetime.substring(0, 10) : newStartDatetime;
-            String endDate   = LocalDate.parse(startDate).plusDays(1).toString();
+            // Preserve original duration for multi-day all-day events
+            long durationDays = 1;
+            if (wasAllDay && event.getEnd() != null && event.getEnd().getDate() != null) {
+                try {
+                    LocalDate origStart = LocalDate.parse(event.getStart().getDate().toString());
+                    LocalDate origEnd   = LocalDate.parse(event.getEnd().getDate().toString());
+                    durationDays = Math.max(1, java.time.temporal.ChronoUnit.DAYS.between(origStart, origEnd));
+                } catch (Exception ignored) {}
+            }
+            String endDate = LocalDate.parse(startDate).plusDays(durationDays).toString();
             event.setStart(new EventDateTime().setDate(new DateTime(startDate)));
             event.setEnd(new EventDateTime().setDate(new DateTime(endDate)));
         } else {

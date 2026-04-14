@@ -42,16 +42,29 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private final GoogleAuthService googleAuthService;
     private final String botUsername;
 
-    private GmailService gmailService;
-    private CalendarService calendarService;
-    private DriveService driveService;
+    private volatile GmailService gmailService;
+    private volatile CalendarService calendarService;
+    private volatile DriveService driveService;
+
+    // New services (set via setter after construction)
+    private GoogleCalendarService googleCalendarService;
+    private GoogleTasksService googleTasksService;
+    private JournalService journalService;
+    private InboxService inboxService;
+    private MoodService moodService;
+    private CountdownService countdownService;
+    private GoalService goalService;
 
     private final long allowedUserId;
+    private final long groupChatId;
     private final String botToken;
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final Map<Long, PendingInput> pendingInputs = new ConcurrentHashMap<>();
     // Files sent by the user via Telegram, queued for email attachment
     private final Map<Long, List<GmailService.Attachment>> pendingAttachments = new ConcurrentHashMap<>();
+    // Timestamps for pending data — used to expire stale entries
+    private final Map<Long, Long> pendingInputTimestamps     = new ConcurrentHashMap<>();
+    private final Map<Long, Long> pendingAttachmentTimestamps = new ConcurrentHashMap<>();
 
     public TaskBot(BotConfig config, TaskService taskService,
                    ClaudeService claudeService, WhisperService whisperService,
@@ -67,7 +80,20 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         this.googleAuthService = googleAuthService;
         this.botUsername      = config.getBotUsername();
         this.allowedUserId    = config.getAllowedUserId();
+        this.groupChatId      = config.getGroupChatId();
         initGoogleServices();
+    }
+
+    public void setExtraServices(GoogleCalendarService gcal, GoogleTasksService gtasks,
+                                  JournalService journal, InboxService inbox,
+                                  MoodService mood, CountdownService countdown, GoalService goal) {
+        this.googleCalendarService = gcal;
+        this.googleTasksService    = gtasks;
+        this.journalService        = journal;
+        this.inboxService          = inbox;
+        this.moodService           = mood;
+        this.countdownService      = countdown;
+        this.goalService           = goal;
     }
 
     private void initGoogleServices() {
@@ -88,6 +114,14 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             else if (update.hasCallbackQuery())
                 userId = update.getCallbackQuery().getFrom().getId();
             if (allowedUserId != 0 && userId != allowedUserId) return;
+
+            // Group chat inbox — everything goes through simple task-or-note flow
+            if (update.hasMessage() && groupChatId != 0
+                    && update.getMessage().getChatId() == groupChatId) {
+                handleGroupInbox(update);
+                return;
+            }
+
             if (update.hasMessage()) {
                 if (update.getMessage().hasText())           handleMessage(update);
                 else if (update.getMessage().hasVoice())     handleVoice(update);
@@ -98,7 +132,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             }
         } catch (Exception e) {
             e.printStackTrace();
-            if (update.hasMessage()) sendText(update.getMessage().getChatId(), "Something went wrong: " + e.getMessage());
+            if (update.hasMessage()) sendText(update.getMessage().getChatId(), "⚠️ Something went wrong. Please try again.");
         }
     }
 
@@ -126,16 +160,25 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
     // ── Incoming document (queued for email attachment) ───────────────────────
 
+    private static final long MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
+
     private void handleDocument(Update update) {
         long chatId   = update.getMessage().getChatId();
         long userId   = update.getMessage().getFrom().getId();
         var  doc      = update.getMessage().getDocument();
         String filename = doc.getFileName() != null ? doc.getFileName() : "attachment";
 
+        // Guard against OOM — reject files larger than 10 MB
+        if (doc.getFileSize() != null && doc.getFileSize() > MAX_ATTACHMENT_BYTES) {
+            sendText(chatId, "⚠️ File too large (" + doc.getFileSize() / (1024 * 1024) + " MB). Max is 10 MB.");
+            return;
+        }
+
         try {
             byte[] data = downloadTelegramFile(doc.getFileId());
             pendingAttachments.computeIfAbsent(userId, k -> new ArrayList<>())
                     .add(new GmailService.Attachment(filename, data));
+            pendingAttachmentTimestamps.put(userId, System.currentTimeMillis());
             int total = pendingAttachments.get(userId).size();
             sendText(chatId, "📎 Got \"" + filename + "\" (" + data.length / 1024 + " KB). " + total
                     + " file(s) queued for your next email draft or reply.\n\nSay \"draft email to...\" or \"reply to [email]\" to use it.");
@@ -164,6 +207,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         double lat  = update.getMessage().getLocation().getLatitude();
         double lng  = update.getMessage().getLocation().getLongitude();
 
+        expireStaleEntries();  // housekeeping
         PendingInput pending = pendingInputs.get(userId);
         if (pending != null && pending.kind() == PendingKind.LOCATION_TASK_HINT) {
             pendingInputs.remove(userId);
@@ -253,6 +297,12 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 taskService.saveUserSettings(userId, us.getQuietStart(), us.getQuietEnd(), null);
                 sendText(chatId, stopped ? "⏹ Pomodoro stopped." : "No active session."); return;
             }
+            case "/brief"        -> { handleBrief(chatId, userId); return; }
+            case "/mood"         -> { handleMoodPrompt(chatId, userId); return; }
+            case "/countdowns"   -> { handleCountdowns(chatId, userId); return; }
+            case "/goals"        -> { handleGoals(chatId, userId); return; }
+            case "/gtasks"       -> { handleGoogleTasks(chatId, userId); return; }
+            case "/synctasks"    -> { handleSyncTasks(chatId, userId); return; }
         }
 
         if (text.startsWith("/forget ")) {
@@ -270,6 +320,33 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         }
         if (text.startsWith("/search ")) {
             sendTaskList(chatId, "🔍 " + text.substring(8).trim(), taskService.searchTasks(userId, text.substring(8).trim())); return;
+        }
+        if (text.startsWith("/journal ")) {
+            handleJournal(chatId, userId, text.substring(9).trim()); return;
+        }
+        if (text.equals("/journal")) {
+            sendText(chatId, "Usage: /journal <your entry>\n\nExample: /journal Had a productive morning..."); return;
+        }
+        if (text.startsWith("/countdown ")) {
+            handleAddCountdown(chatId, userId, text.substring(11).trim()); return;
+        }
+        if (text.equals("/countdown")) {
+            sendText(chatId, "Usage: /countdown <name> <date>\n\nExample: /countdown birthday 2026-05-15"); return;
+        }
+        if (text.startsWith("/goal ")) {
+            handleAddGoal(chatId, userId, text.substring(6).trim()); return;
+        }
+        if (text.equals("/goal")) {
+            sendText(chatId, "Usage: /goal <title> [by <date>]\n\nExample: /goal Finish thesis by 2026-06-01"); return;
+        }
+        if (text.startsWith("/linktask ")) {
+            handleLinkTask(chatId, userId, text.substring(10).trim()); return;
+        }
+        if (text.equals("/linktask")) {
+            sendText(chatId, "Usage: /linktask <goal#> <task hint>\n\nExample: /linktask 1 write chapter"); return;
+        }
+        if (text.startsWith("/timeblock")) {
+            handleTimeBlock(chatId, userId); return;
         }
         if (text.startsWith("/")) { sendText(chatId, "Unknown command. Just talk to me naturally!"); return; }
 
@@ -294,9 +371,10 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
         // Set location reminder pending
         final String finalText = text;  // may have been reassigned above (reply context prepend)
-        if (lower.contains("location") && lower.contains("remind") || lower.contains("when i get to") || lower.contains("when i arrive")) {
+        if ((lower.contains("location") && lower.contains("remind")) || lower.contains("when i get to") || lower.contains("when i arrive")) {
             taskService.findTaskByTitleHint(userId, finalText).ifPresentOrElse(task -> {
                 pendingInputs.put(userId, new PendingInput(PendingKind.LOCATION_TASK_HINT, task.getTitle()));
+                pendingInputTimestamps.put(userId, System.currentTimeMillis());
                 sendText(chatId, "📍 Send me your location and I'll set a reminder for \"" + task.getTitle() + "\".");
             }, () -> routeToAgent(chatId, userId, finalText));
             return;
@@ -314,6 +392,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         String response = claudeService.chat(userId, chatId, text,
                 taskService, notionService, noteService,
                 gmailService, calendarService, driveService,
+                googleCalendarService, journalService,
                 attachments,
                 msg -> sendText(chatId, msg),
                 (filename, data) -> sendDocument(chatId, filename, data));
@@ -339,6 +418,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         }
         String url = googleAuthService.getAuthorizationUrl();
         pendingInputs.put(userId, new PendingInput(PendingKind.GOOGLE_OAUTH_CODE, null));
+        pendingInputTimestamps.put(userId, System.currentTimeMillis());
         sendText(chatId, "🔐 Authorize Google access:\n\n" + url
                 + "\n\n1. Open the link above\n2. Sign in and grant access\n3. Copy the code and send it here");
     }
@@ -354,6 +434,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         if (data.startsWith("done:")) {
             String id = data.substring(5);
             taskService.findTaskByShortId(userId, id).ifPresentOrElse(task -> {
+                syncCompleteToGoogle(task);
                 taskService.markDone(userId, id);
                 taskService.resetReminderIgnoredCount(task.getId());
                 try { answer(update, "Done!"); editMessage(chatId, messageId, "✅ " + task.getTitle(), null); }
@@ -364,6 +445,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         if (data.startsWith("delete:")) {
             String id = data.substring(7);
             taskService.findTaskByShortId(userId, id).ifPresentOrElse(task -> {
+                syncDeleteToGoogle(task);
                 taskService.deleteTask(userId, id);
                 try { answer(update, "Deleted"); editMessage(chatId, messageId, "🗑 " + task.getTitle(), null); }
                 catch (TelegramApiException e) { throw new RuntimeException(e); }
@@ -527,7 +609,24 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     }
 
     public void sendText(long chatId, String text) {
-        execute(SendMessage.builder().chatId(chatId).text(text).build());
+        if (text == null || text.isBlank()) return;
+        // Telegram max message length is 4096 characters
+        if (text.length() <= 4096) {
+            execute(SendMessage.builder().chatId(chatId).text(text).build());
+            return;
+        }
+        // Split into chunks, preferring line-break boundaries
+        int maxLen = 4096;
+        int start = 0;
+        while (start < text.length()) {
+            int end = Math.min(start + maxLen, text.length());
+            if (end < text.length()) {
+                int newline = text.lastIndexOf('\n', end);
+                if (newline > start) end = newline + 1;
+            }
+            execute(SendMessage.builder().chatId(chatId).text(text.substring(start, end)).build());
+            start = end;
+        }
     }
 
     public void sendDocument(long chatId, String filename, byte[] data) {
@@ -564,6 +663,278 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         return switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; };
     }
 
+    // ── Group chat inbox (forwarded media) ─────────────────────────────────
+
+    /**
+     * Group chat inbox — simple linear flow:
+     * 1. Extract text from whatever was sent (text, photo, PDF, voice)
+     * 2. Ask Claude: is this an actionable task? If yes → create task. If no → save as quick note.
+     */
+    private void handleGroupInbox(Update update) {
+        long chatId = update.getMessage().getChatId();
+        long userId = update.getMessage().getFrom().getId();
+        String content = null;
+
+        // Extract text from any message type
+        if (update.getMessage().hasText()) {
+            content = update.getMessage().getText();
+        } else if (update.getMessage().hasPhoto() && inboxService != null) {
+            var photos = update.getMessage().getPhoto();
+            String fileId = photos.get(photos.size() - 1).getFileId();
+            byte[] imageBytes = inboxService.downloadTelegramFile(fileId);
+            if (imageBytes != null) content = inboxService.extractTextFromImage(imageBytes);
+        } else if (update.getMessage().hasDocument() && inboxService != null) {
+            var doc = update.getMessage().getDocument();
+            String filename = doc.getFileName() != null ? doc.getFileName() : "";
+            byte[] data = inboxService.downloadTelegramFile(doc.getFileId());
+            if (data != null) {
+                content = filename.toLowerCase().endsWith(".pdf")
+                        ? inboxService.extractTextFromPdf(data)
+                        : new String(data, java.nio.charset.StandardCharsets.UTF_8);
+            }
+        } else if (update.getMessage().hasVoice() && whisperService != null) {
+            content = whisperService.transcribe(update.getMessage().getVoice().getFileId());
+        }
+
+        // Add caption if present (photos/docs often have captions)
+        String caption = update.getMessage().getCaption();
+        if (caption != null && !caption.isBlank()) {
+            content = (content != null ? caption + "\n\n" + content : caption);
+        }
+
+        if (content == null || content.isBlank()) return; // silently ignore unreadable content
+
+        // Use Claude to decide: task or note?
+        final String extracted = content;
+        if (inboxService != null) {
+            InboxService.ClassifiedContent classified = inboxService.classifyContent(extracted);
+            if (classified != null && "TASK".equalsIgnoreCase(classified.category())) {
+                // It's actionable — create a task
+                Task.Priority pri = classified.priority() != null
+                        ? Task.Priority.fromText(classified.priority()) : Task.Priority.MEDIUM;
+                java.time.LocalDateTime dueAt = null;
+                if (classified.dueDate() != null && !classified.dueDate().isBlank()) {
+                    try { dueAt = java.time.LocalDate.parse(classified.dueDate()).atTime(9, 0); }
+                    catch (Exception ignored) {}
+                }
+                String title = classified.title() != null ? classified.title() : extracted;
+                if (title.length() > 100) title = title.substring(0, 100);
+                TaskService.AddTaskRequest req = new TaskService.AddTaskRequest(
+                        title, pri, "inbox", dueAt, Task.Recurrence.NONE, classified.body());
+                Task task = taskService.createTask(userId, chatId, req);
+                sendText(chatId, "✅ " + task.getTitle()
+                        + (task.getDueAt() != null ? "\n📅 " + taskService.friendlyDate(task.getDueAt()) : ""));
+                return;
+            }
+        }
+
+        // Not a task (or no InboxService) — save as quick note
+        if (notionService != null) {
+            try {
+                String noteTitle = extracted.length() > 80 ? extracted.substring(0, 80) + "..." : extracted;
+                notionService.saveNote(noteTitle, "inbox", List.of("inbox"), extracted, null, "group-inbox");
+                sendText(chatId, "📝 " + noteTitle);
+            } catch (Exception e) {
+                sendText(chatId, "📝 Couldn't save note: " + e.getMessage());
+            }
+        } else {
+            // No Notion — fall back to creating a task anyway
+            String title = extracted.length() > 100 ? extracted.substring(0, 100) : extracted;
+            TaskService.AddTaskRequest req = new TaskService.AddTaskRequest(
+                    title, Task.Priority.MEDIUM, "inbox", null, Task.Recurrence.NONE, null);
+            taskService.createTask(userId, chatId, req);
+            sendText(chatId, "✅ " + title);
+        }
+    }
+
+    // ── New command handlers ─────────────────────────────────────────────────
+
+    private void handleBrief(long chatId, long userId) {
+        routeToAgent(chatId, userId, "Give me my morning brief — today's tasks, calendar, habits, countdowns, mood trend");
+    }
+
+    private void handleMoodPrompt(long chatId, long userId) {
+        if (moodService == null) { sendText(chatId, "Mood tracking not available."); return; }
+        var todayMood = moodService.getToday(userId);
+        if (todayMood.isPresent()) {
+            var entry = todayMood.get();
+            sendText(chatId, "Already logged today: mood " + entry.mood() + "/5, energy " + entry.energy() + "/5"
+                    + "\n\nTo update, just say \"mood 4 3\" (mood energy).");
+        } else {
+            sendText(chatId, "How are you feeling?\n\nRate your mood (1-5) and energy (1-5).\nExample: \"mood 4 3\"");
+        }
+    }
+
+    private void handleCountdowns(long chatId, long userId) {
+        if (countdownService == null) { sendText(chatId, "Countdown service not available."); return; }
+        var list = countdownService.getCountdowns(userId);
+        if (list.isEmpty()) { sendText(chatId, "No countdowns set.\n\nUse: /countdown <name> <date>"); return; }
+        StringBuilder sb = new StringBuilder("⏳ Countdowns\n─────────────────\n");
+        list.forEach(c -> sb.append(countdownService.formatCountdown(c)).append("\n"));
+        sendText(chatId, sb.toString().trim());
+    }
+
+    private void handleAddCountdown(long chatId, long userId, String args) {
+        if (countdownService == null) { sendText(chatId, "Countdown service not available."); return; }
+        // Parse: name date (e.g., "birthday 2026-05-15")
+        int lastSpace = args.lastIndexOf(' ');
+        if (lastSpace <= 0) { sendText(chatId, "Usage: /countdown <name> <date>\nExample: /countdown birthday 2026-05-15"); return; }
+        String name = args.substring(0, lastSpace).trim();
+        String dateStr = args.substring(lastSpace + 1).trim();
+        try {
+            java.time.LocalDate target = java.time.LocalDate.parse(dateStr);
+            countdownService.addCountdown(userId, name, target);
+            long days = java.time.temporal.ChronoUnit.DAYS.between(java.time.LocalDate.now(countdownService.getZoneId()), target);
+            sendText(chatId, "⏳ Countdown set: " + name + " — " + days + " days away!");
+        } catch (Exception e) {
+            sendText(chatId, "Invalid date format. Use yyyy-MM-dd (e.g., 2026-05-15)");
+        }
+    }
+
+    private void handleGoals(long chatId, long userId) {
+        if (goalService == null) { sendText(chatId, "Goal tracking not available."); return; }
+        var goals = goalService.getActiveGoals(userId);
+        if (goals.isEmpty()) { sendText(chatId, "No active goals.\n\nUse: /goal <title> [by <date>]"); return; }
+        StringBuilder sb = new StringBuilder("🎯 Active Goals\n─────────────────\n");
+        goals.forEach(g -> sb.append(goalService.formatGoal(g)).append("\n\n"));
+        sendText(chatId, sb.toString().trim());
+    }
+
+    private void handleAddGoal(long chatId, long userId, String args) {
+        if (goalService == null) { sendText(chatId, "Goal tracking not available."); return; }
+        String title = args;
+        java.time.LocalDate targetDate = null;
+        // Parse "by <date>" at the end
+        int byIdx = args.toLowerCase().lastIndexOf(" by ");
+        if (byIdx > 0) {
+            title = args.substring(0, byIdx).trim();
+            String dateStr = args.substring(byIdx + 4).trim();
+            try { targetDate = java.time.LocalDate.parse(dateStr); } catch (Exception ignored) {}
+        }
+        goalService.createGoal(userId, title, targetDate);
+        sendText(chatId, "🎯 Goal created: " + title
+                + (targetDate != null ? "\n📅 Target: " + targetDate : ""));
+    }
+
+    private void handleLinkTask(long chatId, long userId, String args) {
+        if (goalService == null) { sendText(chatId, "Goal tracking not available."); return; }
+        String[] parts = args.split("\\s+", 2);
+        if (parts.length < 2) { sendText(chatId, "Usage: /linktask <goal#> <task hint>"); return; }
+        try {
+            int goalId = Integer.parseInt(parts[0]);
+            String taskHint = parts[1].trim();
+            taskService.findTaskByTitleHint(userId, taskHint).ifPresentOrElse(task -> {
+                goalService.linkTask(goalId, task.getId());
+                sendText(chatId, "🔗 Linked \"" + task.getTitle() + "\" to goal #" + goalId);
+            }, () -> sendText(chatId, "Task not found: " + taskHint));
+        } catch (NumberFormatException e) {
+            sendText(chatId, "First argument must be a goal number. Use /goals to see IDs.");
+        }
+    }
+
+    private void handleJournal(long chatId, long userId, String content) {
+        if (journalService == null) { sendText(chatId, "Journal not configured. Set NOTION_API_KEY and NOTION_JOURNAL_DB_ID."); return; }
+        sendText(chatId, "📔 Saving journal entry...");
+        try {
+            JournalService.JournalResult result = journalService.saveJournal(
+                    content, null, null, java.time.ZoneId.of("Asia/Singapore"));
+            StringBuilder sb = new StringBuilder("📔 Journal saved!\n");
+            sb.append("Title: ").append(result.title()).append("\n");
+            if (result.tags() != null && !result.tags().isEmpty()) {
+                sb.append("Tags: ").append(String.join(", ", result.tags())).append("\n");
+            }
+            sendText(chatId, sb.toString().trim());
+        } catch (Exception e) {
+            sendText(chatId, "Failed to save journal: " + e.getMessage());
+        }
+    }
+
+    private void handleTimeBlock(long chatId, long userId) {
+        if (googleCalendarService == null) { sendText(chatId, "Google Calendar not linked. Use /authorize first."); return; }
+        routeToAgent(chatId, userId, "Suggest time blocks for my pending tasks based on today's calendar gaps");
+    }
+
+    private void handleGoogleTasks(long chatId, long userId) {
+        if (googleTasksService == null) { sendText(chatId, "Google Tasks not linked. Use /authorize first."); return; }
+        sendText(chatId, "📋 Fetching Google Tasks...");
+        try {
+            var grouped = googleTasksService.fetchTasksForDisplay();
+            boolean empty = grouped.values().stream().allMatch(List::isEmpty);
+            if (empty) { sendText(chatId, "No tasks in Google Tasks."); return; }
+            StringBuilder sb = new StringBuilder("📋 Google Tasks\n─────────────────\n");
+            for (var entry : grouped.entrySet()) {
+                if (entry.getValue().isEmpty()) continue;
+                sb.append("\n📁 ").append(entry.getKey()).append("\n");
+                for (var item : entry.getValue()) {
+                    sb.append("  • ").append(item.title());
+                    if (item.due() != null) sb.append(" (due: ").append(item.due()).append(")");
+                    sb.append("\n");
+                }
+            }
+            sendText(chatId, sb.toString().trim());
+        } catch (Exception e) {
+            sendText(chatId, "Failed to fetch Google Tasks: " + e.getMessage());
+        }
+    }
+
+    private void handleSyncTasks(long chatId, long userId) {
+        if (googleTasksService == null) { sendText(chatId, "Google Tasks not linked. Use /authorize first."); return; }
+        sendText(chatId, "🔄 Syncing tasks to Google Tasks...");
+        try {
+            List<Task> active = taskService.getActiveTasks(userId);
+            int synced = 0;
+            for (Task task : active) {
+                if (task.getGoogleTaskId() == null) {
+                    String listName = googleTasksService.listNameForPriority(task.getPriority().name());
+                    String dueDate = task.getDueAt() != null
+                            ? task.getDueAt().toLocalDate().toString() : null;
+                    String gTaskId = googleTasksService.createGoogleTask(
+                            task.getTitle(), task.getNotes(), dueDate, listName);
+                    taskService.setGoogleTaskId(task.getId(), gTaskId, listName);
+                    synced++;
+                }
+            }
+            sendText(chatId, "✅ Synced " + synced + " new task(s) to Google Tasks."
+                    + (synced == 0 ? " All tasks already synced." : ""));
+        } catch (Exception e) {
+            sendText(chatId, "Sync failed: " + e.getMessage());
+        }
+    }
+
+    // ── Google Tasks sync helpers ──────────────────────────────────────────
+
+    private void syncCompleteToGoogle(Task task) {
+        if (googleTasksService == null || task.getGoogleTaskId() == null) return;
+        try {
+            googleTasksService.completeGoogleTask(task.getGoogleTaskId(), task.getGoogleTasklistId());
+        } catch (Exception e) {
+            System.err.println("Failed to sync completion to Google Tasks: " + e.getMessage());
+        }
+    }
+
+    private void syncDeleteToGoogle(Task task) {
+        if (googleTasksService == null || task.getGoogleTaskId() == null) return;
+        try {
+            googleTasksService.deleteGoogleTask(task.getGoogleTaskId(), task.getGoogleTasklistId());
+        } catch (Exception e) {
+            System.err.println("Failed to sync deletion to Google Tasks: " + e.getMessage());
+        }
+    }
+
+    /** Expire pending inputs/attachments older than 1 hour to prevent memory leaks. */
+    private void expireStaleEntries() {
+        long now = System.currentTimeMillis();
+        long ttl = 60 * 60 * 1000L; // 1 hour
+        pendingInputTimestamps.entrySet().removeIf(e -> {
+            if (now - e.getValue() > ttl) { pendingInputs.remove(e.getKey()); return true; }
+            return false;
+        });
+        pendingAttachmentTimestamps.entrySet().removeIf(e -> {
+            if (now - e.getValue() > ttl) { pendingAttachments.remove(e.getKey()); return true; }
+            return false;
+        });
+    }
+
     private static int parseIntSafe(String s, int fallback) {
         try { return Integer.parseInt(s.trim()); } catch (Exception e) { return fallback; }
     }
@@ -571,7 +942,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private static String helpText() {
         return """
                 I'm Proton — just talk to me naturally!
-                
+
                 Examples:
                 "add gym tomorrow 9am"
                 "add report friday 3pm #school high priority"
@@ -584,13 +955,25 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 "when is Jacob's birthday?"
                 "mark daily quran as a habit"
                 "no reminders after 10pm"
-                
+                "mood 4 3"
+
                 Commands:
                 /tasks /today /overdue /review /habits
                 /recentnotes /setupnotes /edittasks
+                /brief — morning briefing on demand
+                /mood — log mood & energy
+                /journal <entry> — save journal to Notion
+                /countdown <name> <date> — add countdown
+                /countdowns — list countdowns
+                /goal <title> [by <date>] — create a goal
+                /goals — list active goals
+                /linktask <goal#> <task hint> — link task to goal
+                /timeblock — AI time-blocking suggestions
+                /gtasks — show Google Tasks
+                /synctasks — sync tasks to Google Tasks
                 /pomodoro [work] [break] [rounds]
                 /stoppomodoro /doneitems /cleardone
-                /authorize — link Google (Gmail, Calendar, Drive)
+                /authorize — link Google (Gmail, Calendar, Drive, Tasks)
                 """;
     }
 }

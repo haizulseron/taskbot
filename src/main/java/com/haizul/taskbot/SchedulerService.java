@@ -11,23 +11,44 @@ public class SchedulerService {
     private final TaskService taskService;
     private final TaskBot taskBot;
     private final ClaudeService claudeService;
+    private MoodService moodService;
+    private CountdownService countdownService;
+    private GoalService goalService;
+    private GoogleCalendarService googleCalendarService;
+    private GoogleTasksService googleTasksService;
     private final ZoneId zoneId;
     private final LocalTime morningSummaryTime;
     private final int intervalSeconds;
+    private final LocalTime morningBriefTime;
+    private final LocalTime moodCheckinTime;
+    private final long allowedUserId;
     private final ScheduledExecutorService executor;
     private final Set<String> sentMorningKeys      = ConcurrentHashMap.newKeySet();
     private final Set<String> sentWeeklyKeys       = ConcurrentHashMap.newKeySet();
     private final Set<String> sentConsolidateKeys  = ConcurrentHashMap.newKeySet();
 
     public SchedulerService(TaskService taskService, TaskBot taskBot, ClaudeService claudeService,
-                            ZoneId zoneId, LocalTime morningSummaryTime, int intervalSeconds) {
+                            ZoneId zoneId, LocalTime morningSummaryTime, int intervalSeconds,
+                            LocalTime morningBriefTime, LocalTime moodCheckinTime, long allowedUserId) {
         this.taskService        = taskService;
         this.taskBot            = taskBot;
         this.claudeService      = claudeService;
         this.zoneId             = zoneId;
         this.morningSummaryTime = morningSummaryTime;
         this.intervalSeconds    = intervalSeconds;
+        this.morningBriefTime   = morningBriefTime;
+        this.moodCheckinTime    = moodCheckinTime;
+        this.allowedUserId      = allowedUserId;
         this.executor           = Executors.newSingleThreadScheduledExecutor();
+    }
+
+    public void setExtraServices(MoodService mood, CountdownService countdown, GoalService goal,
+                                  GoogleCalendarService gcal, GoogleTasksService gtasks) {
+        this.moodService = mood;
+        this.countdownService = countdown;
+        this.goalService = goal;
+        this.googleCalendarService = gcal;
+        this.googleTasksService = gtasks;
     }
 
     public void start() {
@@ -48,6 +69,9 @@ public class SchedulerService {
         sendMorningSummaries();
         sendWeeklyDigests();
         runWeeklyProfileConsolidation();
+        sendMorningBrief();
+        sendMoodCheckin();
+        syncGoogleTaskCompletions();
         cleanupKeys();
     }
 
@@ -68,6 +92,8 @@ public class SchedulerService {
             // Build reminder message — contextual if Claude available, escalating if ignored enough
             String messageText = buildReminderText(task, reminder.label(), ignoredCount);
             taskBot.sendText(task.getChatId(), messageText);
+            // Increment AFTER sending — this means the NEXT reminder knows this one was "seen".
+            // The count represents "reminders sent without user action" and resets when task is marked done.
             taskService.updateLastReminderAt(task.getId());
             taskService.incrementReminderIgnoredCount(task.getId());
         }
@@ -131,8 +157,10 @@ public class SchedulerService {
 
     private void sendMorningSummaries() {
         LocalDateTime now = LocalDateTime.now(zoneId);
+        // Window must be wider than one scheduler interval to avoid misses
+        int windowSeconds = Math.max(300, intervalSeconds + 60);
         if (now.toLocalTime().isBefore(morningSummaryTime) ||
-                now.toLocalTime().isAfter(morningSummaryTime.plusMinutes(5))) return;
+                now.toLocalTime().isAfter(morningSummaryTime.plusSeconds(windowSeconds))) return;
         for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
             String key = uc.userId() + ":morning:" + LocalDate.now(zoneId);
             if (sentMorningKeys.contains(key)) continue;
@@ -146,8 +174,9 @@ public class SchedulerService {
     private void sendWeeklyDigests() {
         LocalDateTime now = LocalDateTime.now(zoneId);
         if (now.getDayOfWeek() != DayOfWeek.SUNDAY) return;
+        int wdWindowSeconds = Math.max(300, intervalSeconds + 60);
         if (now.toLocalTime().isBefore(morningSummaryTime) ||
-                now.toLocalTime().isAfter(morningSummaryTime.plusMinutes(5))) return;
+                now.toLocalTime().isAfter(morningSummaryTime.plusSeconds(wdWindowSeconds))) return;
         for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
             UserSettings settings = taskService.getUserSettings(uc.userId());
             if (!settings.isWeeklyDigest()) continue;
@@ -165,9 +194,10 @@ public class SchedulerService {
         if (claudeService == null) return;
         LocalDateTime now = LocalDateTime.now(zoneId);
         if (now.getDayOfWeek() != DayOfWeek.SUNDAY) return;
-        // Run in a 5-minute window 10 minutes after morning summary (avoids clash)
+        // Run in a window 10 minutes after morning summary (avoids clash)
         LocalTime window = morningSummaryTime.plusMinutes(10);
-        if (now.toLocalTime().isBefore(window) || now.toLocalTime().isAfter(window.plusMinutes(5))) return;
+        int cpWindowSeconds = Math.max(300, intervalSeconds + 60);
+        if (now.toLocalTime().isBefore(window) || now.toLocalTime().isAfter(window.plusSeconds(cpWindowSeconds))) return;
         for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
             String key = uc.userId() + ":consolidate:" + LocalDate.now(zoneId);
             if (sentConsolidateKeys.contains(key)) continue;
@@ -244,10 +274,160 @@ public class SchedulerService {
         }
     }
 
+    // ── Enhanced Morning Brief ──────────────────────────────────────────────
+
+    private final Set<String> sentBriefKeys = ConcurrentHashMap.newKeySet();
+
+    private void sendMorningBrief() {
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        int windowSeconds = Math.max(300, intervalSeconds + 60);
+        if (now.toLocalTime().isBefore(morningBriefTime) ||
+                now.toLocalTime().isAfter(morningBriefTime.plusSeconds(windowSeconds))) return;
+        for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
+            String key = uc.userId() + ":brief:" + LocalDate.now(zoneId);
+            if (sentBriefKeys.contains(key)) continue;
+            try {
+                String brief = buildMorningBrief(uc.userId());
+                taskBot.sendText(uc.chatId(), brief);
+            } catch (Exception e) {
+                System.err.println("Morning brief error: " + e.getMessage());
+            }
+            sentBriefKeys.add(key);
+        }
+    }
+
+    private String buildMorningBrief(long userId) {
+        LocalDate today = LocalDate.now(zoneId);
+        StringBuilder sb = new StringBuilder();
+
+        // 1. Greeting
+        sb.append("☀️ Good morning! Today is ")
+          .append(today.format(java.time.format.DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy")))
+          .append("\n\n");
+
+        // 2. Countdowns
+        if (countdownService != null) {
+            var countdowns = countdownService.getUpcomingForBrief(userId);
+            if (!countdowns.isEmpty()) {
+                countdowns.forEach(cd -> sb.append(countdownService.formatCountdown(cd)).append("\n"));
+                sb.append("\n");
+            }
+        }
+
+        // 3. Calendar events
+        if (googleCalendarService != null) {
+            try {
+                var events = googleCalendarService.getTodayEvents();
+                if (!events.isEmpty()) {
+                    sb.append("📅 Today's Calendar\n");
+                    events.forEach(e -> sb.append("  • ").append(e.startDate()).append(" — ").append(e.title()).append("\n"));
+                    sb.append("\n");
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 4. Overdue tasks (max 3)
+        var overdue = taskService.getOverdueTasks(userId);
+        if (!overdue.isEmpty()) {
+            sb.append("❗ Overdue\n");
+            overdue.stream().limit(3).forEach(t ->
+                sb.append("  • ").append(t.getTitle())
+                  .append(t.getDueAt() != null ? " (due " + taskService.friendlyDate(t.getDueAt()) + ")" : "")
+                  .append("\n"));
+            if (overdue.size() > 3) sb.append("  ... and ").append(overdue.size() - 3).append(" more\n");
+            sb.append("\n");
+        }
+
+        // 5. Today's tasks
+        var todayTasks = taskService.getTodayTasks(userId);
+        if (!todayTasks.isEmpty()) {
+            sb.append("📋 Due Today\n");
+            todayTasks.forEach(t -> sb.append("  • ").append(t.getTitle()).append("\n"));
+            sb.append("\n");
+        }
+
+        // 6. Habits with streaks
+        var habits = taskService.getHabits(userId);
+        if (!habits.isEmpty()) {
+            sb.append("🔄 Habits\n");
+            habits.forEach(h -> sb.append("  • ").append(h.getTitle())
+                    .append(" — 🔥 ").append(taskService.getHabitStreak(h.getId())).append(" day streak\n"));
+            sb.append("\n");
+        }
+
+        // 7. Mood trend
+        if (moodService != null) {
+            String moodNote = moodService.getMoodTrendNote(userId);
+            if (moodNote != null) sb.append(moodNote).append("\n\n");
+        }
+
+        // 8. Quick summary
+        var active = taskService.getActiveTasks(userId);
+        long high = active.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
+        sb.append("📊 ").append(active.size()).append(" active tasks");
+        if (high > 0) sb.append(" (").append(high).append(" high priority)");
+        sb.append("\n");
+
+        return sb.toString().trim();
+    }
+
+    // ── Mood check-in ───────────────────────────────────────────────────────
+
+    private final Set<String> sentMoodKeys = ConcurrentHashMap.newKeySet();
+
+    private void sendMoodCheckin() {
+        if (moodService == null) return;
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        int windowSeconds = Math.max(300, intervalSeconds + 60);
+        if (now.toLocalTime().isBefore(moodCheckinTime) ||
+                now.toLocalTime().isAfter(moodCheckinTime.plusSeconds(windowSeconds))) return;
+        for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
+            String key = uc.userId() + ":mood:" + LocalDate.now(zoneId);
+            if (sentMoodKeys.contains(key)) continue;
+            taskBot.sendText(uc.chatId(),
+                    "How are you feeling today? Reply with two numbers (mood energy) from 1-5.\nExample: 4 3");
+            sentMoodKeys.add(key);
+            // Check for low mood streak
+            if (moodService.isLowMoodStreak(uc.userId(), 3)) {
+                taskBot.sendText(uc.chatId(),
+                        "You've been feeling low for a few days. Take it easy — focus on just 1 important thing today. \uD83E\uDEF6");
+            }
+        }
+    }
+
+    // ── Google Tasks → Bot sync (every 10 minutes) ────────────────────────
+
+    private Instant lastGoogleTaskSync = Instant.EPOCH;
+
+    private void syncGoogleTaskCompletions() {
+        if (googleTasksService == null) return;
+        Instant now = Instant.now();
+        if (now.isBefore(lastGoogleTaskSync.plusSeconds(600))) return; // every 10 min
+        lastGoogleTaskSync = now;
+
+        try {
+            var completed = googleTasksService.fetchRecentlyCompleted();
+            for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
+                for (var item : completed) {
+                    taskService.findByGoogleTaskId(uc.userId(), item.taskId()).ifPresent(task -> {
+                        if (task.getStatus() == Task.Status.ACTIVE) {
+                            taskService.markDone(uc.userId(), task.shortId());
+                            taskBot.sendText(uc.chatId(), "✅ \"" + task.getTitle() + "\" completed in Google Tasks.");
+                        }
+                    });
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Google Tasks sync error: " + e.getMessage());
+        }
+    }
+
     private void cleanupKeys() {
         LocalDate today = LocalDate.now(zoneId);
         sentMorningKeys.removeIf(k -> !k.contains(today.toString()));
         sentWeeklyKeys.removeIf(k -> !k.contains(today.toString()));
         sentConsolidateKeys.removeIf(k -> !k.contains(today.toString()));
+        sentBriefKeys.removeIf(k -> !k.contains(today.toString()));
+        sentMoodKeys.removeIf(k -> !k.contains(today.toString()));
     }
 }

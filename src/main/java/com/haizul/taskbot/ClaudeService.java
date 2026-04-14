@@ -52,6 +52,13 @@ public class ClaudeService {
             - If a task isn't found by title, say so and ask the user to be more specific
             - For notes, always save them — don't ask for confirmation
 
+            TASK-TO-CALENDAR RULES:
+            - When creating a task, decide whether to set add_to_calendar=true
+            - SET TRUE for: deadlines, exams, appointments, meetings, interviews, project due dates, events with specific times
+            - SET FALSE for: quick todos, chores, daily habits, grocery runs, small errands, routine tasks
+            - Only works if the task has a due date — skip for undated tasks
+            - Calendar events are one-way: tasks go to calendar, but calendar events do NOT create tasks
+
             CALENDAR RULES:
             - Interpret all date/times relative to the current date/time in the system context
             - For add_event, if no end time given, default to 1 hour after start
@@ -87,6 +94,18 @@ public class ClaudeService {
             - To read the full content of a note, call read_note with the page_id from search_notes results
             - If the user asks to "read", "open", or "show full" a note, call search_notes first then read_note
 
+            MOOD RULES:
+            - When the user tells you how they're feeling or says a mood number, call log_mood
+            - If they give two numbers like "4 3", first is mood, second is energy
+
+            JOURNAL RULES:
+            - When the user wants to write a journal entry, call add_journal with the content
+            - Save the raw text they provide as the journal content
+
+            GOAL RULES:
+            - When the user talks about goals, objectives, or targets, use add_goal or list_goals
+            - When creating a task that relates to an existing goal, call link_task_to_goal after creating the task
+
             ══ MEMORY SYSTEM — YOU HAVE PERSISTENT MEMORY ══
             - Your "Remembered user preferences" section above is a real database that persists across ALL sessions and restarts.
             - NEVER tell the user you don't have memory or can't remember things between sessions — you absolutely can and do.
@@ -105,6 +124,32 @@ public class ClaudeService {
     private final ObjectMapper mapper;
     private final Database db;
     private final ExecutorService memoryExtractor = Executors.newSingleThreadExecutor();
+    private MoodService moodService;
+    private CountdownService countdownService;
+    private GoalService goalService;
+    private GoogleTasksService googleTasksService;
+
+    public void setExtraServices(MoodService mood, CountdownService countdown, GoalService goal) {
+        this.moodService = mood;
+        this.countdownService = countdown;
+        this.goalService = goal;
+    }
+
+    public void setGoogleTasksService(GoogleTasksService gts) {
+        this.googleTasksService = gts;
+    }
+
+    private void syncCompleteToGoogle(Task task) {
+        if (googleTasksService == null || task.getGoogleTaskId() == null) return;
+        try { googleTasksService.completeGoogleTask(task.getGoogleTaskId(), task.getGoogleTasklistId()); }
+        catch (Exception e) { System.err.println("Google Tasks sync (complete) failed: " + e.getMessage()); }
+    }
+
+    private void syncDeleteToGoogle(Task task) {
+        if (googleTasksService == null || task.getGoogleTaskId() == null) return;
+        try { googleTasksService.deleteGoogleTask(task.getGoogleTaskId(), task.getGoogleTasklistId()); }
+        catch (Exception e) { System.err.println("Google Tasks sync (delete) failed: " + e.getMessage()); }
+    }
 
     // How many individual messages (user + assistant alternating) to keep per user
     private static final int MAX_HISTORY = 10;
@@ -125,6 +170,7 @@ public class ClaudeService {
     public String chat(long userId, long chatId, String userMessage,
                        TaskService taskService, NotionService notionService, NoteService noteService,
                        GmailService gmailService, CalendarService calendarService, DriveService driveService,
+                       GoogleCalendarService googleCalendarService, JournalService journalService,
                        List<GmailService.Attachment> pendingAttachments,
                        MessageSender sender, FileSender fileSender) {
         String now = LocalDateTime.now(zoneId).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
@@ -193,7 +239,8 @@ public class ClaudeService {
                     taskDataFetched = true;
                 }
                 String result = executeTool(toolName, input, userId, taskService, notionService, noteService,
-                        gmailService, calendarService, driveService, pendingAttachments, sender, fileSender);
+                        gmailService, calendarService, driveService, googleCalendarService, journalService,
+                        pendingAttachments, sender, fileSender);
                 System.out.println("Tool [" + toolName + "] result: " + result.substring(0, Math.min(120, result.length())));
                 toolResults.add(Map.of("type", "tool_result", "tool_use_id", toolUseId, "content", result));
             }
@@ -209,6 +256,7 @@ public class ClaudeService {
     private String executeTool(String name, Map<String, Object> input, long userId,
                                 TaskService taskService, NotionService notionService, NoteService noteService,
                                 GmailService gmailService, CalendarService calendarService, DriveService driveService,
+                                GoogleCalendarService googleCalendarService, JournalService journalService,
                                 List<GmailService.Attachment> pendingAttachments,
                                 MessageSender sender, FileSender fileSender) {
         try {
@@ -220,6 +268,7 @@ public class ClaudeService {
                     String dueStr     = str(input, "due_date");
                     String recurrence = str(input, "recurrence", "none");
                     String notes      = str(input, "notes");
+                    boolean addToCal  = bool(input, "add_to_calendar");
 
                     LocalDateTime due = parseDate(dueStr);
                     Task.Priority p   = Task.Priority.fromText(priority);
@@ -227,7 +276,19 @@ public class ClaudeService {
 
                     Task created = taskService.createTask(userId, userId,
                             new TaskService.AddTaskRequest(title, p, category, due, r, notes));
-                    yield "Created task: " + taskService.formatTask(created);
+
+                    String calNote = "";
+                    if (addToCal && googleCalendarService != null && due != null) {
+                        try {
+                            String eventId = googleCalendarService.createEventForTask(
+                                    title, due.toLocalDate().toString(), notes, priority.toUpperCase());
+                            taskService.setGoogleEventId(created.getId(), eventId);
+                            calNote = "\n📅 Also added to Google Calendar.";
+                        } catch (Exception e) {
+                            calNote = "\n(Calendar sync failed: " + e.getMessage() + ")";
+                        }
+                    }
+                    yield "Created task: " + taskService.formatTask(created) + calNote;
                 }
 
                 case "list_tasks" -> {
@@ -305,6 +366,7 @@ public class ClaudeService {
                     String hint = str(input, "task_hint");
                     var opt = taskService.findTaskByTitleHint(userId, hint);
                     if (opt.isEmpty()) yield "Task not found: " + hint;
+                    syncCompleteToGoogle(opt.get());
                     taskService.markDone(userId, opt.get().shortId());
                     taskService.resetReminderIgnoredCount(opt.get().getId());
                     yield "Marked done: " + opt.get().getTitle();
@@ -325,6 +387,7 @@ public class ClaudeService {
                     String hint = str(input, "task_hint");
                     var opt = taskService.findTaskByTitleHint(userId, hint);
                     if (opt.isEmpty()) yield "Task not found: " + hint;
+                    syncDeleteToGoogle(opt.get());
                     taskService.deleteTask(userId, opt.get().shortId());
                     yield "Deleted: " + opt.get().getTitle();
                 }
@@ -583,11 +646,125 @@ public class ClaudeService {
                     yield "Saved preference: " + key + " = " + value;
                 }
 
+                case "log_mood" -> {
+                    if (moodService == null) yield "Mood tracking not configured.";
+                    int mood = intVal(input, "mood", 0);
+                    Integer energy = input.containsKey("energy") ? intVal(input, "energy", 0) : null;
+                    if (energy != null && energy == 0) energy = null;
+                    MoodService.MoodEntry entry = moodService.logMood(userId, mood, energy);
+                    yield moodService.formatMoodLog(entry);
+                }
+
+                case "add_journal" -> {
+                    if (journalService == null) yield "Journal not configured. Set NOTION_JOURNAL_DB_ID.";
+                    String content = str(input, "content");
+                    Integer mood = input.containsKey("mood") ? intVal(input, "mood", 0) : null;
+                    Integer energy = input.containsKey("energy") ? intVal(input, "energy", 0) : null;
+                    if (mood != null && mood == 0) mood = null;
+                    if (energy != null && energy == 0) energy = null;
+                    var result = journalService.saveJournal(content, mood, energy, zoneId);
+                    yield "\uD83D\uDCD3 Journal saved: \"" + result.title() + "\" [" + result.type() + "] \u2014 tagged: " + String.join(", ", result.tags());
+                }
+
+                case "add_countdown" -> {
+                    if (countdownService == null) yield "Countdown service not available.";
+                    String name2 = str(input, "name");
+                    String dateStr = str(input, "target_date");
+                    java.time.LocalDate target;
+                    try { target = java.time.LocalDate.parse(dateStr); } catch (Exception e) { yield "Couldn't parse date: " + dateStr; }
+                    var cd = countdownService.addCountdown(userId, name2, target);
+                    yield countdownService.formatCountdown(cd);
+                }
+
+                case "list_countdowns" -> {
+                    if (countdownService == null) yield "Countdown service not available.";
+                    var list = countdownService.getCountdowns(userId);
+                    if (list.isEmpty()) yield "No countdowns set.";
+                    StringBuilder sb = new StringBuilder("\u23F3 Countdowns\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n");
+                    list.forEach(cd -> sb.append(countdownService.formatCountdown(cd)).append("\n"));
+                    sender.send(sb.toString().trim());
+                    yield "Countdowns shown.";
+                }
+
+                case "add_goal" -> {
+                    if (goalService == null) yield "Goal service not available.";
+                    String title = str(input, "title");
+                    String dateStr = str(input, "target_date");
+                    java.time.LocalDate target = null;
+                    if (dateStr != null && !dateStr.isBlank()) {
+                        try { target = java.time.LocalDate.parse(dateStr); } catch (Exception ignored) {}
+                    }
+                    var goal = goalService.createGoal(userId, title, target);
+                    yield "\uD83C\uDFAF Goal set: " + goal.title() + (goal.targetDate() != null ? " \u2014 target: " + goal.targetDate() : "");
+                }
+
+                case "list_goals" -> {
+                    if (goalService == null) yield "Goal service not available.";
+                    var goals = goalService.getActiveGoals(userId);
+                    if (goals.isEmpty()) yield "No active goals.";
+                    StringBuilder sb = new StringBuilder("\uD83C\uDFAF Goals\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n");
+                    goals.forEach(g -> sb.append(goalService.formatGoal(g)).append("\n\n"));
+                    sender.send(sb.toString().trim());
+                    yield "Goals shown.";
+                }
+
+                case "link_task_to_goal" -> {
+                    if (goalService == null) yield "Goal service not available.";
+                    String goalHint = str(input, "goal_hint");
+                    String taskHint = str(input, "task_hint");
+                    var goal = goalService.findGoalByHint(userId, goalHint);
+                    if (goal.isEmpty()) yield "Goal not found: " + goalHint;
+                    var task = taskService.findTaskByTitleHint(userId, taskHint);
+                    if (task.isEmpty()) yield "Task not found: " + taskHint;
+                    goalService.linkTask(goal.get().id(), task.get().getId());
+                    yield "Linked \"" + task.get().getTitle() + "\" to goal \"" + goal.get().title() + "\".";
+                }
+
+                case "sync_google_tasks" -> {
+                    if (googleCalendarService == null) yield "Google not connected. Send /authorize to link your Google account.";
+                    List<Task> active = taskService.getActiveTasks(userId);
+                    int synced = 0;
+                    for (Task task : active) {
+                        if (task.getGoogleTaskId() == null) {
+                            try {
+                                String listName = googleTasksService != null
+                                        ? googleTasksService.listNameForPriority(task.getPriority().name())
+                                        : "Medium Priority";
+                                String dueDate = task.getDueAt() != null
+                                        ? task.getDueAt().toLocalDate().toString() : null;
+                                String gTaskId = googleTasksService.createGoogleTask(
+                                        task.getTitle(), task.getNotes(), dueDate, listName);
+                                taskService.setGoogleTaskId(task.getId(), gTaskId, listName);
+                                synced++;
+                            } catch (Exception e) {
+                                System.err.println("Failed to sync task " + task.getTitle() + ": " + e.getMessage());
+                            }
+                        }
+                    }
+                    yield "Synced " + synced + " new task(s) to Google Tasks." + (synced == 0 ? " All tasks already synced." : "");
+                }
+
+                case "time_block_suggestion" -> {
+                    if (googleCalendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    var events = googleCalendarService.getEventsForTimeBlocking(2);
+                    var tasks = taskService.getTopPendingTasks(userId, 5);
+                    if (tasks.isEmpty()) yield "No pending tasks to schedule.";
+                    StringBuilder prompt = new StringBuilder("Here are my calendar events for today/tomorrow:\n");
+                    events.forEach(e -> prompt.append("- ").append(e.startDate()).append(" to ").append(e.endDate()).append(": ").append(e.title()).append("\n"));
+                    prompt.append("\nHere are my top pending tasks:\n");
+                    tasks.forEach(t -> prompt.append("- [").append(t.getPriority()).append("] ").append(t.getTitle())
+                            .append(t.getDueAt() != null ? " (due " + taskService.friendlyDate(t.getDueAt()) + ")" : "").append("\n"));
+                    prompt.append("\nIdentify free time gaps of 30 minutes or more. Suggest which tasks to schedule in which gaps, with reasoning. Return as a friendly, conversational message with specific time slots.");
+                    // Use main agent to generate the suggestion
+                    yield prompt.toString();
+                }
+
                 default -> "Unknown tool: " + name;
             };
         } catch (Exception e) {
             System.err.println("Tool execution error [" + name + "]: " + e.getMessage());
-            return "Error executing " + name + ": " + e.getMessage();
+            // Sanitize — don't leak SQL errors, file paths, or stack details to the LLM
+            return "Error: could not complete " + name + ". Please try again.";
         }
     }
 
@@ -604,6 +781,7 @@ public class ClaudeService {
                     .opt("due_date", "string", "ISO-8601 datetime e.g. 2026-04-15T09:00:00")
                     .opt("recurrence", "string", "none, daily, weekly, monthly")
                     .opt("notes", "string", "Extra notes for the task")
+                    .opt("add_to_calendar", "boolean", "Set true to also create a Google Calendar event. Use your judgement: set true for significant tasks with a due date (meetings, deadlines, exams, appointments) and false for small/routine tasks (chores, daily habits, quick todos)")
         ));
 
         tools.add(tool("list_tasks", "List tasks",
@@ -751,6 +929,44 @@ public class ClaudeService {
                     .req("file_id", "string", "Google Drive file ID (from search_drive results)")
         ));
 
+        tools.add(tool("log_mood", "Log the user's mood and/or energy level (1-5 each)",
+                props()
+                    .req("mood", "integer", "Mood rating 1-5")
+                    .opt("energy", "integer", "Energy rating 1-5")
+        ));
+
+        tools.add(tool("add_journal", "Save a journal entry to Notion",
+                props()
+                    .req("content", "string", "The journal text")
+                    .opt("mood", "integer", "Mood 1-5 if mentioned")
+                    .opt("energy", "integer", "Energy 1-5 if mentioned")
+        ));
+
+        tools.add(tool("add_countdown", "Create a countdown to a future date",
+                props()
+                    .req("name", "string", "Name of the event/milestone")
+                    .req("target_date", "string", "Target date yyyy-MM-dd")
+        ));
+
+        tools.add(tool("list_countdowns", "List all countdown milestones", props()));
+
+        tools.add(tool("add_goal", "Create a new goal to track",
+                props()
+                    .req("title", "string", "Goal title")
+                    .opt("target_date", "string", "Target date yyyy-MM-dd if applicable")
+        ));
+
+        tools.add(tool("list_goals", "List all active goals with progress", props()));
+
+        tools.add(tool("link_task_to_goal", "Link a task to a goal",
+                props()
+                    .req("goal_hint", "string", "Keywords from the goal title")
+                    .req("task_hint", "string", "Keywords from the task title")
+        ));
+
+        tools.add(tool("sync_google_tasks", "Sync all unsynced local tasks to Google Tasks. Use when the user asks to sync, update, or push tasks to Google Tasks.", props()));
+        tools.add(tool("time_block_suggestion", "Suggest time blocks for tasks based on calendar availability", props()));
+
         return tools;
     }
 
@@ -813,7 +1029,7 @@ public class ClaudeService {
                 body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
                 String resp = postJson(body);
                 JsonNode root = mapper.readTree(resp);
-                String text = root.path("content").get(0).path("text").asText("").trim();
+                String text = root.path("content").path(0).path("text").asText("").trim();
                 if (text.isBlank() || text.equals("[]")) return;
                 JsonNode arr = mapper.readTree(text);
                 if (!arr.isArray()) return;
@@ -849,7 +1065,7 @@ public class ClaudeService {
             body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
             String resp = postJson(body);
             JsonNode root = mapper.readTree(resp);
-            String text = root.path("content").get(0).path("text").asText("").trim();
+            String text = root.path("content").path(0).path("text").asText("").trim();
             Map<String, String> consolidated = new LinkedHashMap<>();
             mapper.readTree(text).fields().forEachRemaining(e -> consolidated.put(e.getKey(), e.getValue().asText()));
             if (!consolidated.isEmpty()) db.replaceProfile(userId, consolidated);
@@ -926,7 +1142,7 @@ public class ClaudeService {
             body.put("messages", List.of(Map.of("role", "user", "content", prompt.toString())));
             String resp = postJson(body);
             JsonNode root = mapper.readTree(resp);
-            String text = root.path("content").get(0).path("text").asText("").trim();
+            String text = root.path("content").path(0).path("text").asText("").trim();
             return text.isBlank() ? null : text;
         } catch (Exception e) { return null; }
     }
@@ -938,7 +1154,7 @@ public class ClaudeService {
         try {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);
-            body.put("max_tokens", 1024);
+            body.put("max_tokens", MODEL_SMART.equals(model) ? 4096 : 1024);
 
             // Cache the system prompt — it's large and identical across turns
             body.put("system", List.of(Map.of(
@@ -999,7 +1215,7 @@ public class ClaudeService {
                 .uri(URI.create(API_URL))
                 .header("Content-Type", "application/json")
                 .header("x-api-key", apiKey)
-                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-version", "2023-06-01") // stable version; new features via anthropic-beta header
                 .header("anthropic-beta", "prompt-caching-2024-07-31")
                 .POST(HttpRequest.BodyPublishers.ofString(bodyStr))
                 .build();
@@ -1054,6 +1270,12 @@ public class ClaudeService {
     private String str(Map<String, Object> m, String key, String fallback) {
         String v = str(m, key); return v == null ? fallback : v;
     }
+    private boolean bool(Map<String, Object> m, String key) {
+        Object v = m.get(key);
+        if (v == null) return false;
+        if (v instanceof Boolean b) return b;
+        return "true".equalsIgnoreCase(v.toString().trim());
+    }
     private int intVal(Map<String, Object> m, String key, int fallback) {
         Object v = m.get(key);
         if (v == null) return fallback;
@@ -1067,8 +1289,10 @@ public class ClaudeService {
 
     private LocalDateTime parseDate(String s) {
         if (s == null || s.isBlank() || "null".equals(s)) return null;
-        try { return LocalDateTime.parse(s, DateTimeFormatter.ISO_LOCAL_DATE_TIME); } catch (Exception e) {}
-        try { return LocalDateTime.parse(s, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")); } catch (Exception e) {}
+        try { return LocalDateTime.parse(s, DateTimeFormatter.ISO_LOCAL_DATE_TIME); } catch (Exception ignored) {}
+        try { return LocalDateTime.parse(s, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")); } catch (Exception ignored) {}
+        // Date-only (e.g. "2026-04-15") → treat as start of day
+        try { return java.time.LocalDate.parse(s).atStartOfDay(); } catch (Exception ignored) {}
         return null;
     }
 }

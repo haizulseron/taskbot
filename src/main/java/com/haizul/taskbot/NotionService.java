@@ -112,7 +112,7 @@ public class NotionService {
             body.set("properties", props);
 
             String response = post("/databases", body.toString());
-            System.err.println("Notion search response: " + response);
+            // response logged at debug level only
             JsonNode json = mapper.readTree(response);
             return json.path("id").asText(null);
         } catch (Exception e) {
@@ -244,7 +244,7 @@ public class NotionService {
             body.set("children", children);
 
             String response = post("/pages", body.toString());
-            System.err.println("Notion search response: " + response);
+            // response logged at debug level only
             JsonNode json   = mapper.readTree(response);
             String pageId   = json.path("id").asText("");
 
@@ -307,7 +307,7 @@ public class NotionService {
             body.set("sorts", sorts);
 
             String response = post("/databases/" + databaseId + "/query", body.toString());
-            System.err.println("Notion search response: " + response);
+            // response logged at debug level only
             JsonNode json   = mapper.readTree(response);
             JsonNode results = json.path("results");
 
@@ -319,7 +319,8 @@ public class NotionService {
                 String category  = p.path("Category").path("select").path("name").asText("Other");
                 String summary   = extractRichText(p.path("Summary"));
                 String raw       = extractRichText(p.path("Raw"));
-                String created   = page.path("created_time").asText("").substring(0, 10);
+                String ct = page.path("created_time").asText("");
+                String created = ct.length() >= 10 ? ct.substring(0, 10) : ct;
                 List<String> tags = new ArrayList<>();
                 for (JsonNode tag : p.path("Tags").path("multi_select")) {
                     tags.add(tag.path("name").asText());
@@ -414,19 +415,26 @@ public class NotionService {
      */
     public String readNote(String pageId) {
         try {
-            String response = get("/blocks/" + pageId + "/children?page_size=100");
-            JsonNode json   = mapper.readTree(response);
             StringBuilder sb = new StringBuilder();
-            for (JsonNode block : json.path("results")) {
-                String type = block.path("type").asText("");
-                // All block types that have a rich_text array
-                JsonNode blockContent = block.path(type);
-                JsonNode richText     = blockContent.path("rich_text");
-                if (richText.isArray() && !richText.isEmpty()) {
-                    for (JsonNode rt : richText) sb.append(rt.path("plain_text").asText(""));
-                    sb.append("\n");
+            String cursor = null;
+            // Paginate through all blocks (Notion returns max 100 per page)
+            do {
+                String url = "/blocks/" + pageId + "/children?page_size=100"
+                        + (cursor != null ? "&start_cursor=" + cursor : "");
+                String response = get(url);
+                JsonNode json   = mapper.readTree(response);
+                for (JsonNode block : json.path("results")) {
+                    String type = block.path("type").asText("");
+                    JsonNode blockContent = block.path(type);
+                    JsonNode richText     = blockContent.path("rich_text");
+                    if (richText.isArray() && !richText.isEmpty()) {
+                        for (JsonNode rt : richText) sb.append(rt.path("plain_text").asText(""));
+                        sb.append("\n");
+                    }
                 }
-            }
+                cursor = json.path("has_more").asBoolean(false)
+                        ? json.path("next_cursor").asText(null) : null;
+            } while (cursor != null);
             return sb.toString().trim();
         } catch (Exception e) {
             System.err.println("readNote error: " + e.getMessage());

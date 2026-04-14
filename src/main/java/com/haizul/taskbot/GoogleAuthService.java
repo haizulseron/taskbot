@@ -18,17 +18,22 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 
 public class GoogleAuthService {
 
     private static final String TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+    // NOTE: OOB redirect is deprecated by Google for new OAuth clients (Jan 2023).
+    // Existing clients still work, but new ones must use a loopback redirect (http://127.0.0.1:PORT).
+    // If Google disables this, switch to a local HTTP server redirect flow.
     private static final String REDIRECT_URI   = "urn:ietf:wg:oauth:2.0:oob";
     private static final List<String> SCOPES = List.of(
             "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/gmail.compose",
             "https://www.googleapis.com/auth/calendar",
-            "https://www.googleapis.com/auth/drive.readonly"
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/tasks"
     );
 
     private final Path tokensFile;
@@ -37,9 +42,11 @@ public class GoogleAuthService {
 
     private String clientId;
     private String clientSecret;
-    private String refreshToken;
+    private volatile String refreshToken;
     private NetHttpTransport httpTransport;
-    private boolean initialized = false;
+    private volatile boolean initialized = false;
+    // Cached credentials adapter — avoids refreshing the access token on every API call
+    private volatile HttpCredentialsAdapter cachedCredentials;
 
     public GoogleAuthService(String credentialsPath, String tokensPath) {
         this.tokensFile = Path.of(tokensPath, "tokens.json");
@@ -109,11 +116,24 @@ public class GoogleAuthService {
                 return false;
             }
 
-            this.refreshToken = json.get("refresh_token").asText();
+            String rt = json.path("refresh_token").asText(null);
+            if (rt == null || rt.isBlank()) {
+                // Google may not return refresh_token on re-auth; keep existing one
+                if (this.refreshToken == null) {
+                    System.err.println("No refresh_token in response and none stored.");
+                    return false;
+                }
+            } else {
+                this.refreshToken = rt;
+            }
+            this.cachedCredentials = null; // invalidate cache
             Files.createDirectories(tokensFile.getParent());
             ObjectNode stored = mapper.createObjectNode();
             stored.put("refresh_token", refreshToken);
             mapper.writeValue(tokensFile.toFile(), stored);
+            // Restrict token file to owner-only (rw-------)
+            try { Files.setPosixFilePermissions(tokensFile, PosixFilePermissions.fromString("rw-------")); }
+            catch (UnsupportedOperationException ignored) {} // non-POSIX OS
             return true;
         } catch (Exception e) {
             System.err.println("OAuth code exchange failed: " + e.getMessage());
@@ -123,12 +143,17 @@ public class GoogleAuthService {
 
     public HttpCredentialsAdapter getHttpCredentials() {
         if (!isAuthorized()) return null;
+        // Cache the adapter so the access token is reused across calls
+        HttpCredentialsAdapter cached = this.cachedCredentials;
+        if (cached != null) return cached;
         UserCredentials creds = UserCredentials.newBuilder()
                 .setClientId(clientId)
                 .setClientSecret(clientSecret)
                 .setRefreshToken(refreshToken)
                 .build();
-        return new HttpCredentialsAdapter(creds);
+        cached = new HttpCredentialsAdapter(creds);
+        this.cachedCredentials = cached;
+        return cached;
     }
 
     public NetHttpTransport getHttpTransport()  { return httpTransport; }

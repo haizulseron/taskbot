@@ -133,8 +133,9 @@ public class TaskService {
                      INSERT INTO tasks (id,user_id,chat_id,title,priority,category,due_at,status,recurrence,
                          stale_after_days,created_at,updated_at,reminder_stage,last_reminder_at,stale_notified_at,
                          notes,reminder_interval_minutes,repeat_reminder,is_habit,reminder_ignored_count,
-                         reminder_lat,reminder_lng,reminder_radius_meters)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         reminder_lat,reminder_lng,reminder_radius_meters,
+                         google_task_id,google_tasklist_id,google_event_id)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                      """)) {
             bindTask(s, task); s.executeUpdate();
         } catch (SQLException e) { throw new RuntimeException("Failed to create task", e); }
@@ -1026,7 +1027,8 @@ public class TaskService {
                      UPDATE tasks SET title=?,priority=?,category=?,due_at=?,status=?,recurrence=?,
                          stale_after_days=?,updated_at=?,reminder_stage=?,last_reminder_at=?,stale_notified_at=?,
                          notes=?,reminder_interval_minutes=?,repeat_reminder=?,is_habit=?,reminder_ignored_count=?,
-                         reminder_lat=?,reminder_lng=?,reminder_radius_meters=?
+                         reminder_lat=?,reminder_lng=?,reminder_radius_meters=?,
+                         google_task_id=?,google_tasklist_id=?,google_event_id=?
                      WHERE id=?
                      """)) {
             s.setString(1, task.getTitle()); s.setString(2, task.getPriority().name());
@@ -1048,7 +1050,10 @@ public class TaskService {
             else s.setNull(18, java.sql.Types.REAL);
             if (task.getReminderRadiusMeters() != null) s.setInt(19, task.getReminderRadiusMeters());
             else s.setNull(19, java.sql.Types.INTEGER);
-            s.setString(20, task.getId());
+            s.setString(20, task.getGoogleTaskId());
+            s.setString(21, task.getGoogleTasklistId());
+            s.setString(22, task.getGoogleEventId());
+            s.setString(23, task.getId());
             s.executeUpdate();
         } catch (SQLException e) { throw new RuntimeException("Failed to update task", e); }
     }
@@ -1075,6 +1080,9 @@ public class TaskService {
         else s.setNull(22, java.sql.Types.REAL);
         if (task.getReminderRadiusMeters() != null) s.setInt(23, task.getReminderRadiusMeters());
         else s.setNull(23, java.sql.Types.INTEGER);
+        s.setString(24, task.getGoogleTaskId());
+        s.setString(25, task.getGoogleTasklistId());
+        s.setString(26, task.getGoogleEventId());
     }
 
     private Task mapTask(ResultSet rs) throws SQLException {
@@ -1095,6 +1103,9 @@ public class TaskService {
         try { double lat = rs.getDouble("reminder_lat"); if (!rs.wasNull()) task.setReminderLat(lat); } catch (SQLException ignored) {}
         try { double lng = rs.getDouble("reminder_lng"); if (!rs.wasNull()) task.setReminderLng(lng); } catch (SQLException ignored) {}
         try { int rad = rs.getInt("reminder_radius_meters"); if (!rs.wasNull()) task.setReminderRadiusMeters(rad); } catch (SQLException ignored) {}
+        try { task.setGoogleTaskId(rs.getString("google_task_id")); } catch (SQLException ignored) {}
+        try { task.setGoogleTasklistId(rs.getString("google_tasklist_id")); } catch (SQLException ignored) {}
+        try { task.setGoogleEventId(rs.getString("google_event_id")); } catch (SQLException ignored) {}
         return task;
     }
 
@@ -1108,6 +1119,54 @@ public class TaskService {
     private static String capitalize(String s) {
         if (s == null || s.isBlank()) return s;
         return s.substring(0, 1).toUpperCase() + s.substring(1).toLowerCase();
+    }
+
+    // ── Google sync helpers ────────────────────────────────────────────────
+
+    public void setGoogleTaskId(String taskId, String googleTaskId, String googleTasklistId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("UPDATE tasks SET google_task_id=?, google_tasklist_id=? WHERE id=?")) {
+            s.setString(1, googleTaskId); s.setString(2, googleTasklistId); s.setString(3, taskId);
+            s.executeUpdate();
+        } catch (SQLException e) { System.err.println("Failed to set google_task_id: " + e.getMessage()); }
+    }
+
+    public void setGoogleEventId(String taskId, String googleEventId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("UPDATE tasks SET google_event_id=? WHERE id=?")) {
+            s.setString(1, googleEventId); s.setString(2, taskId);
+            s.executeUpdate();
+        } catch (SQLException e) { System.err.println("Failed to set google_event_id: " + e.getMessage()); }
+    }
+
+    public Optional<Task> findByGoogleTaskId(long userId, String googleTaskId) {
+        return getActiveTasks(userId).stream()
+                .filter(t -> googleTaskId.equals(t.getGoogleTaskId()))
+                .findFirst();
+    }
+
+    public Optional<Task> findByGoogleEventId(long userId, String googleEventId) {
+        return queryTasks("SELECT * FROM tasks WHERE user_id=?", userId).stream()
+                .filter(t -> googleEventId.equals(t.getGoogleEventId()))
+                .findFirst();
+    }
+
+    public Set<String> getAllGoogleEventIds(long userId) {
+        Set<String> ids = new java.util.HashSet<>();
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("SELECT google_event_id FROM tasks WHERE user_id=? AND google_event_id IS NOT NULL")) {
+            s.setLong(1, userId);
+            try (ResultSet rs = s.executeQuery()) { while (rs.next()) ids.add(rs.getString("google_event_id")); }
+        } catch (SQLException e) { System.err.println("Failed to get google event ids: " + e.getMessage()); }
+        return ids;
+    }
+
+    /** Get top N tasks sorted by priority then due date (for time blocking suggestions). */
+    public List<Task> getTopPendingTasks(long userId, int limit) {
+        return getActiveTasks(userId).stream()
+                .filter(t -> t.getPriority() != Task.Priority.DAILY)
+                .limit(limit)
+                .collect(Collectors.toList());
     }
 
     public LocalDateTime parseDateTime(String input) {

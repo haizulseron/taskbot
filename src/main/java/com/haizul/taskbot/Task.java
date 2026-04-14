@@ -47,6 +47,9 @@ public class Task {
     private Double reminderLat;
     private Double reminderLng;
     private Integer reminderRadiusMeters;
+    private String googleTaskId;
+    private String googleTasklistId;
+    private String googleEventId;
 
     public String getId()                              { return id; }
     public void setId(String id)                       { this.id = id; }
@@ -94,6 +97,12 @@ public class Task {
     public void setReminderLng(Double lng)             { this.reminderLng = lng; }
     public Integer getReminderRadiusMeters()           { return reminderRadiusMeters; }
     public void setReminderRadiusMeters(Integer r)     { this.reminderRadiusMeters = r; }
+    public String getGoogleTaskId()                    { return googleTaskId; }
+    public void setGoogleTaskId(String id)             { this.googleTaskId = id; }
+    public String getGoogleTasklistId()                { return googleTasklistId; }
+    public void setGoogleTasklistId(String id)         { this.googleTasklistId = id; }
+    public String getGoogleEventId()                   { return googleEventId; }
+    public void setGoogleEventId(String id)            { this.googleEventId = id; }
 
     public String shortId() {
         if (id == null) return "";
