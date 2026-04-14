@@ -17,6 +17,8 @@ public class GoogleTasksService {
     public record GoogleTaskItem(String taskId, String taskListId, String listName,
                                  String title, String notes, String due) {}
 
+    public record CreatedGoogleTask(String taskId, String taskListId) {}
+
     private static final String[] PRIORITY_LIST_NAMES = {
             "High Priority", "Medium Priority", "Low Priority", "Daily"
     };
@@ -78,7 +80,7 @@ public class GoogleTasksService {
      * @param listName the task list name (e.g. "High Priority")
      * @return the Google Tasks ID of the created task
      */
-    public String createGoogleTask(String title, String notes, String dueDate, String listName) {
+    public CreatedGoogleTask createGoogleTask(String title, String notes, String dueDate, String listName) {
         try {
             TaskList taskList = getOrCreateTaskList(listName);
 
@@ -92,10 +94,28 @@ public class GoogleTasksService {
             }
 
             Task created = tasksClient.tasks().insert(taskList.getId(), task).execute();
-            return created.getId();
+            return new CreatedGoogleTask(created.getId(), taskList.getId());
         } catch (Exception e) {
             System.err.println("Failed to create Google Task '" + title + "': " + e.getMessage());
             throw new RuntimeException("Failed to create Google Task: " + title, e);
+        }
+    }
+
+    /**
+     * Updates a task's title, notes, and/or due date in Google Tasks.
+     */
+    public void updateGoogleTask(String taskId, String taskListId,
+                                  String newTitle, String newNotes, String newDueDate) {
+        try {
+            Task task = tasksClient.tasks().get(taskListId, taskId).execute();
+            if (newTitle != null && !newTitle.isBlank()) task.setTitle(newTitle);
+            if (newNotes != null) task.setNotes(newNotes.isBlank() ? null : newNotes);
+            if (newDueDate != null && !newDueDate.isBlank()) {
+                task.setDue(new DateTime(newDueDate + "T00:00:00.000Z").toStringRfc3339());
+            }
+            tasksClient.tasks().update(taskListId, taskId, task).execute();
+        } catch (Exception e) {
+            System.err.println("Failed to update Google Task " + taskId + ": " + e.getMessage());
         }
     }
 

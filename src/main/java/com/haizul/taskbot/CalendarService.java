@@ -92,10 +92,7 @@ public class CalendarService {
     public String rescheduleEvent(String eventHint, String newStartDatetime) throws Exception {
         // Search up to 1 year ahead (not just 60 days) so distant events are findable
         List<EventSummary> upcoming = getUpcomingEvents(365);
-        EventSummary match = upcoming.stream()
-                .filter(e -> e.title() != null
-                        && e.title().toLowerCase().contains(eventHint.toLowerCase()))
-                .findFirst().orElse(null);
+        EventSummary match = findBestMatch(upcoming, eventHint);
 
         if (match == null) return "Event not found matching: " + eventHint;
 
@@ -132,6 +129,82 @@ public class CalendarService {
         calendar.events().update("primary", event.getId(), event).execute();
 
         return "Rescheduled \"" + match.title() + "\" to " + newStartDatetime;
+    }
+
+    public String editEvent(String eventHint, String newTitle, String newDescription) throws Exception {
+        List<EventSummary> upcoming = getUpcomingEvents(365);
+        EventSummary match = findBestMatch(upcoming, eventHint);
+        if (match == null) return "Event not found matching: " + eventHint;
+
+        Event event = calendar.events().get("primary", match.id()).execute();
+        if (newTitle != null && !newTitle.isBlank()) event.setSummary(newTitle);
+        if (newDescription != null) event.setDescription(newDescription);
+        calendar.events().update("primary", event.getId(), event).execute();
+
+        return "Updated \"" + match.title() + "\""
+                + (newTitle != null ? " → \"" + newTitle + "\"" : "");
+    }
+
+    public String deleteEvent(String eventHint) throws Exception {
+        List<EventSummary> upcoming = getUpcomingEvents(365);
+        EventSummary match = findBestMatch(upcoming, eventHint);
+        if (match == null) return "Event not found matching: " + eventHint;
+
+        calendar.events().delete("primary", match.id()).execute();
+        return "Deleted event: \"" + match.title() + "\"";
+    }
+
+    /**
+     * Fuzzy-match an event by splitting the hint into keywords and scoring
+     * events by how many keywords appear in the title.  Ignores common
+     * date/time words so "9th June MRI CGH" matches an event titled "MRI CGH".
+     */
+    private EventSummary findBestMatch(List<EventSummary> events, String hint) {
+        if (hint == null || hint.isBlank()) return null;
+
+        // Strip common date/time noise words
+        String cleaned = hint.toLowerCase()
+                .replaceAll("\\b(the|my|on|at|for|to|in|of|a|an|st|nd|rd|th)\\b", "")
+                .replaceAll("\\b(january|february|march|april|may|june|july|august|september|october|november|december)\\b", "")
+                .replaceAll("\\b(jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\\b", "")
+                .replaceAll("\\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\\b", "")
+                .replaceAll("\\b(mon|tue|wed|thu|fri|sat|sun)\\b", "")
+                .replaceAll("\\b(today|tomorrow|yesterday|next|this|am|pm)\\b", "")
+                .replaceAll("\\d+", "")   // remove numbers (dates, times)
+                .trim();
+
+        String[] keywords = cleaned.split("\\s+");
+        // Filter out empty tokens
+        List<String> kw = new ArrayList<>();
+        for (String k : keywords) {
+            if (!k.isBlank() && k.length() >= 2) kw.add(k);
+        }
+
+        if (kw.isEmpty()) {
+            // Fallback: try exact contains with original hint
+            return events.stream()
+                    .filter(e -> e.title() != null
+                            && e.title().toLowerCase().contains(hint.toLowerCase()))
+                    .findFirst().orElse(null);
+        }
+
+        EventSummary best = null;
+        int bestScore = 0;
+
+        for (EventSummary e : events) {
+            if (e.title() == null) continue;
+            String title = e.title().toLowerCase();
+            int score = 0;
+            for (String k : kw) {
+                if (title.contains(k)) score++;
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                best = e;
+            }
+        }
+
+        return best; // null if no keyword matched any event
     }
 
     private String formatEventTime(EventDateTime edt) {

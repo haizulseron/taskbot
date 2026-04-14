@@ -395,17 +395,18 @@ public class SchedulerService {
         }
     }
 
-    // ── Google Tasks → Bot sync (every 10 minutes) ────────────────────────
+    // ── Google Tasks → Bot sync (every 5 minutes) ─────────────────────────
 
     private Instant lastGoogleTaskSync = Instant.EPOCH;
 
     private void syncGoogleTaskCompletions() {
         if (googleTasksService == null) return;
         Instant now = Instant.now();
-        if (now.isBefore(lastGoogleTaskSync.plusSeconds(600))) return; // every 10 min
+        if (now.isBefore(lastGoogleTaskSync.plusSeconds(300))) return; // every 5 min
         lastGoogleTaskSync = now;
 
         try {
+            // 1. Sync completions from Google → bot
             var completed = googleTasksService.fetchRecentlyCompleted();
             for (TaskService.UserChat uc : taskService.getKnownUserChats()) {
                 for (var item : completed) {
@@ -413,6 +414,34 @@ public class SchedulerService {
                         if (task.getStatus() == Task.Status.ACTIVE) {
                             taskService.markDone(uc.userId(), task.shortId());
                             taskBot.sendText(uc.chatId(), "✅ \"" + task.getTitle() + "\" completed in Google Tasks.");
+                        }
+                    });
+                }
+
+                // 2. Sync edits (title/due changes) from Google → bot
+                var allGoogleTasks = googleTasksService.fetchAllIncompleteTasks();
+                for (var item : allGoogleTasks) {
+                    taskService.findByGoogleTaskId(uc.userId(), item.taskId()).ifPresent(task -> {
+                        boolean changed = false;
+                        // Title changed in Google Tasks
+                        if (item.title() != null && !item.title().equals(task.getTitle())) {
+                            taskService.editTaskField(uc.userId(), task.getTitle(), "title", item.title());
+                            changed = true;
+                        }
+                        // Due date changed in Google Tasks
+                        if (item.due() != null) {
+                            try {
+                                String gDue = item.due().substring(0, 10); // yyyy-MM-dd
+                                String localDue = task.getDueAt() != null ? task.getDueAt().toLocalDate().toString() : null;
+                                if (!gDue.equals(localDue)) {
+                                    java.time.LocalDateTime newDue = java.time.LocalDate.parse(gDue).atTime(9, 0);
+                                    taskService.updateTaskDueAtDirectly(uc.userId(), task.shortId(), newDue);
+                                    changed = true;
+                                }
+                            } catch (Exception ignored) {}
+                        }
+                        if (changed) {
+                            taskBot.sendText(uc.chatId(), "🔄 \"" + task.getTitle() + "\" updated from Google Tasks.");
                         }
                     });
                 }

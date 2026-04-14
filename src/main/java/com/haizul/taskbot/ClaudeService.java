@@ -31,11 +31,14 @@ public class ClaudeService {
             Timezone: Asia/Singapore. Default categories: work, school, personal, daily.
 
             ══ TASK INTEGRITY — ABSOLUTE RULES, NO EXCEPTIONS ══
-            - Task data in conversation history IS ALWAYS STALE AND WRONG. Ignore it completely.
-            - NEVER tell the user what tasks they have based on memory or history.
-            - EVERY time the user asks about tasks (what tasks, how many, what's due, what's overdue, etc.) → call list_tasks or search_tasks FIRST. No exceptions.
-            - Only after the tool returns can you respond about tasks.
-            - Even if you think you know from earlier in this conversation — call the tool. Always.
+            YOU MUST NEVER CLAIM A TASK ACTION HAPPENED WITHOUT CALLING THE TOOL.
+            - To mark done → MUST call mark_done tool. NEVER say "marked done" without calling it.
+            - To create → MUST call create_task tool. NEVER say "created" without calling it.
+            - To delete → MUST call delete_task tool. NEVER say "deleted" without calling it.
+            - To list/check → MUST call list_tasks or search_tasks FIRST, then respond.
+            - Task data in conversation history IS ALWAYS STALE. Ignore it completely.
+            - If mark_done returns "Task not found", tell the user — do NOT pretend it worked.
+            - EVERY time the user asks about tasks → call list_tasks FIRST. No exceptions.
             ════════════════════════════════════════════════════
 
             Personality: friendly, casual, like a helpful mate. Keep responses concise.
@@ -45,7 +48,8 @@ public class ClaudeService {
             - Only call tools when the user clearly wants to DO something
             - Casual conversation, greetings, or venting → respond naturally with text, NO tool calls
             - Examples that should NEVER trigger tools: "whats up", "how are you", "thanks", "ok", "lol"
-            - Examples that SHOULD trigger tools: "add gym tomorrow", "mark report done", "check my inbox", "what's on my calendar"
+            - Examples that SHOULD trigger tools: "add gym tomorrow", "mark report done", "check my inbox", "what's on my calendar", "complete X", "done with X", "finish X"
+            - "complete X", "done X", "finish X" → ALWAYS call mark_done with task_hint=X
             - When in doubt whether to call a tool, DON'T — just respond conversationally
             - For multiple actions in one message, call multiple tools
             - Dates/times: always interpret relative to today's date in the system context
@@ -62,8 +66,9 @@ public class ClaudeService {
             CALENDAR RULES:
             - Interpret all date/times relative to the current date/time in the system context
             - For add_event, if no end time given, default to 1 hour after start
-            - For reschedule_event, use the event title as the hint
+            - For edit_event, delete_event, reschedule_event: the event_hint should be ONLY the key words from the event title — strip out dates, times, and filler words. Example: user says "change my 9th June MRI CGH appointment" → event_hint = "MRI CGH"
             - If no specific time is given (e.g. "add holiday on 1 May", "block off Thursday"), set all_day=true and use only the date (yyyy-MM-dd) for start_datetime
+            - When user asks to add something to calendar, ALWAYS use the add_event tool — this creates a Google Calendar event directly
 
             EXAMPLES — correct task handling (follow exactly):
             User: "what tasks do i have" → call list_tasks → then reply
@@ -101,6 +106,8 @@ public class ClaudeService {
             JOURNAL RULES:
             - When the user wants to write a journal entry, call add_journal with the content
             - Save the raw text they provide as the journal content
+            - If the user mentions mood or energy in the journal (e.g. "mood is 4", "feeling great", "energy low"), include the mood and/or energy parameters (1-5 scale)
+            - Mood and energy logged via journal are automatically synced to the mood tracker
 
             GOAL RULES:
             - When the user talks about goals, objectives, or targets, use add_goal or list_goals
@@ -149,6 +156,15 @@ public class ClaudeService {
         if (googleTasksService == null || task.getGoogleTaskId() == null) return;
         try { googleTasksService.deleteGoogleTask(task.getGoogleTaskId(), task.getGoogleTasklistId()); }
         catch (Exception e) { System.err.println("Google Tasks sync (delete) failed: " + e.getMessage()); }
+    }
+
+    private void syncEditToGoogle(Task task) {
+        if (googleTasksService == null || task.getGoogleTaskId() == null) return;
+        try {
+            String dueDate = task.getDueAt() != null ? task.getDueAt().toLocalDate().toString() : null;
+            googleTasksService.updateGoogleTask(task.getGoogleTaskId(), task.getGoogleTasklistId(),
+                    task.getTitle(), task.getNotes(), dueDate);
+        } catch (Exception e) { System.err.println("Google Tasks sync (edit) failed: " + e.getMessage()); }
     }
 
     // How many individual messages (user + assistant alternating) to keep per user
@@ -213,6 +229,25 @@ public class ClaudeService {
 
             // No tool calls — we are done
             if (toolUseBlocks.isEmpty()) {
+                // Safety net: if user asked to complete/done a task but Claude didn't call mark_done,
+                // force the tool call ourselves instead of letting Claude hallucinate.
+                String lowerMsg = userMessage.toLowerCase().trim();
+                java.util.regex.Matcher completeMatcher = java.util.regex.Pattern
+                        .compile("(?i)^(?:complete|done|finish|mark done|mark as done|completed)\\s+(.+)")
+                        .matcher(lowerMsg);
+                if (completeMatcher.find() && !taskDataFetched) {
+                    String taskHint = completeMatcher.group(1).replaceAll("(?i)^(my|the|task)\\s+", "").trim();
+                    System.err.println("[SAFETY] Claude skipped mark_done — forcing for: " + taskHint);
+                    var opt = taskService.findTaskByTitleHint(userId, taskHint);
+                    if (opt.isPresent()) {
+                        syncCompleteToGoogle(opt.get());
+                        taskService.markDone(userId, opt.get().shortId());
+                        taskService.resetReminderIgnoredCount(opt.get().getId());
+                        String result = "✅ Done! \"" + opt.get().getTitle() + "\" is marked complete.";
+                        addToHistory(userId, userMessage, result);
+                        return result;
+                    }
+                }
                 String finalText = allText.toString().trim();
                 // If task data was fetched and Claude just listed/repeated tasks verbatim,
                 // save a placeholder to avoid stale counts in history.
@@ -276,6 +311,18 @@ public class ClaudeService {
 
                     Task created = taskService.createTask(userId, userId,
                             new TaskService.AddTaskRequest(title, p, category, due, r, notes));
+
+                    // Auto-sync to Google Tasks
+                    if (googleTasksService != null) {
+                        try {
+                            String listName = googleTasksService.listNameForPriority(priority.toUpperCase());
+                            String dueDate = due != null ? due.toLocalDate().toString() : null;
+                            var gTask = googleTasksService.createGoogleTask(title, notes, dueDate, listName);
+                            taskService.setGoogleTaskId(created.getId(), gTask.taskId(), gTask.taskListId());
+                        } catch (Exception e) {
+                            System.err.println("Auto-sync to Google Tasks failed: " + e.getMessage());
+                        }
+                    }
 
                     String calNote = "";
                     if (addToCal && googleCalendarService != null && due != null) {
@@ -409,6 +456,9 @@ public class ClaudeService {
                     LocalDateTime dt = parseDate(newDue);
                     if (dt == null) yield "Couldn't parse date: " + newDue;
                     taskService.updateTaskDueAtDirectly(userId, opt.get().shortId(), dt);
+                    // Re-fetch to get updated state, then sync
+                    var updated = taskService.findTaskByTitleHint(userId, hint);
+                    updated.ifPresent(this::syncEditToGoogle);
                     yield "Rescheduled \"" + opt.get().getTitle() + "\" to " + taskService.friendlyDate(dt);
                 }
 
@@ -417,6 +467,10 @@ public class ClaudeService {
                     String field = str(input, "field");
                     String value = str(input, "value");
                     boolean ok = taskService.editTaskField(userId, hint, field, value);
+                    if (ok) {
+                        // Sync updated task to Google Tasks
+                        taskService.findTaskByTitleHint(userId, hint).ifPresent(this::syncEditToGoogle);
+                    }
                     yield ok ? "Updated " + field + " for task matching \"" + hint + "\"."
                              : "Task not found or unknown field: " + hint + " / " + field;
                 }
@@ -607,6 +661,20 @@ public class ClaudeService {
                     yield calendarService.rescheduleEvent(hint, newDt);
                 }
 
+                case "edit_event" -> {
+                    if (calendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    String hint    = str(input, "event_hint");
+                    String newTitle = str(input, "new_title");
+                    String newDesc  = str(input, "new_description");
+                    yield calendarService.editEvent(hint, newTitle, newDesc);
+                }
+
+                case "delete_event" -> {
+                    if (calendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    String hint = str(input, "event_hint");
+                    yield calendarService.deleteEvent(hint);
+                }
+
                 // ── Google Drive ───────────────────────────────────────────────────
                 case "search_drive" -> {
                     if (driveService == null) yield "Drive not connected. Send /authorize to link your Google account.";
@@ -662,8 +730,16 @@ public class ClaudeService {
                     Integer energy = input.containsKey("energy") ? intVal(input, "energy", 0) : null;
                     if (mood != null && mood == 0) mood = null;
                     if (energy != null && energy == 0) energy = null;
+                    // Sync mood/energy to MoodService so they're tracked together
+                    if (moodService != null && mood != null) {
+                        moodService.logMood(userId, mood, energy);
+                    }
                     var result = journalService.saveJournal(content, mood, energy, zoneId);
-                    yield "\uD83D\uDCD3 Journal saved: \"" + result.title() + "\" [" + result.type() + "] \u2014 tagged: " + String.join(", ", result.tags());
+                    StringBuilder resp = new StringBuilder("\uD83D\uDCD3 Journal saved: \"" + result.title() + "\" [" + result.type() + "]");
+                    if (!result.tags().isEmpty()) resp.append("\nTags: ").append(String.join(", ", result.tags()));
+                    if (mood != null) resp.append("\nMood: ").append(mood).append("/5");
+                    if (energy != null) resp.append(" | Energy: ").append(energy).append("/5");
+                    yield resp.toString();
                 }
 
                 case "add_countdown" -> {
@@ -732,9 +808,9 @@ public class ClaudeService {
                                         : "Medium Priority";
                                 String dueDate = task.getDueAt() != null
                                         ? task.getDueAt().toLocalDate().toString() : null;
-                                String gTaskId = googleTasksService.createGoogleTask(
+                                var gTask = googleTasksService.createGoogleTask(
                                         task.getTitle(), task.getNotes(), dueDate, listName);
-                                taskService.setGoogleTaskId(task.getId(), gTaskId, listName);
+                                taskService.setGoogleTaskId(task.getId(), gTask.taskId(), gTask.taskListId());
                                 synced++;
                             } catch (Exception e) {
                                 System.err.println("Failed to sync task " + task.getTitle() + ": " + e.getMessage());
@@ -912,6 +988,18 @@ public class ClaudeService {
                     .opt("description",    "string", "Event description or notes")
         ));
 
+        tools.add(tool("edit_event", "Edit a Google Calendar event's title or description",
+                props()
+                    .req("event_hint", "string", "Keywords from the event title to find it")
+                    .opt("new_title", "string", "New title for the event")
+                    .opt("new_description", "string", "New description for the event")
+        ));
+
+        tools.add(tool("delete_event", "Delete/cancel a Google Calendar event",
+                props()
+                    .req("event_hint", "string", "Keywords from the event title to find it")
+        ));
+
         tools.add(tool("reschedule_event", "Move a Google Calendar event to a new time",
                 props()
                     .req("event_hint",        "string", "Keywords from the event title")
@@ -1030,6 +1118,10 @@ public class ClaudeService {
                 String resp = postJson(body);
                 JsonNode root = mapper.readTree(resp);
                 String text = root.path("content").path(0).path("text").asText("").trim();
+                // Strip markdown code fences if Claude wraps JSON in ```json ... ```
+                if (text.startsWith("```")) {
+                    text = text.replaceAll("^```[a-z]*\\s*", "").replaceAll("\\s*```$", "").trim();
+                }
                 if (text.isBlank() || text.equals("[]")) return;
                 JsonNode arr = mapper.readTree(text);
                 if (!arr.isArray()) return;

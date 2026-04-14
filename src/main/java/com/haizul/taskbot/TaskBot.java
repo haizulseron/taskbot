@@ -99,7 +99,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private void initGoogleServices() {
         if (googleAuthService == null || !googleAuthService.isAuthorized()) return;
         try { this.gmailService    = new GmailService(googleAuthService);    } catch (Exception e) { System.err.println("GmailService init failed: "    + e.getMessage()); }
-        try { this.calendarService = new CalendarService(googleAuthService, java.time.ZoneId.systemDefault()); } catch (Exception e) { System.err.println("CalendarService init failed: " + e.getMessage()); }
+        try { this.calendarService = new CalendarService(googleAuthService, java.time.ZoneId.of("Asia/Singapore")); } catch (Exception e) { System.err.println("CalendarService init failed: " + e.getMessage()); }
         try { this.driveService    = new DriveService(googleAuthService);    } catch (Exception e) { System.err.println("DriveService init failed: "    + e.getMessage()); }
         System.out.println("Google services initialized (Gmail, Calendar, Drive).");
     }
@@ -116,6 +116,10 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             if (allowedUserId != 0 && userId != allowedUserId) return;
 
             // Group chat inbox — everything goes through simple task-or-note flow
+            if (update.hasMessage()) {
+                System.out.println("[DEBUG] chatId=" + update.getMessage().getChatId()
+                        + " groupChatId=" + groupChatId + " match=" + (update.getMessage().getChatId() == groupChatId));
+            }
             if (update.hasMessage() && groupChatId != 0
                     && update.getMessage().getChatId() == groupChatId) {
                 handleGroupInbox(update);
@@ -722,6 +726,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 TaskService.AddTaskRequest req = new TaskService.AddTaskRequest(
                         title, pri, "inbox", dueAt, Task.Recurrence.NONE, classified.body());
                 Task task = taskService.createTask(userId, chatId, req);
+                autoSyncNewTaskToGoogle(task);
                 sendText(chatId, "✅ " + task.getTitle()
                         + (task.getDueAt() != null ? "\n📅 " + taskService.friendlyDate(task.getDueAt()) : ""));
                 return;
@@ -742,7 +747,8 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             String title = extracted.length() > 100 ? extracted.substring(0, 100) : extracted;
             TaskService.AddTaskRequest req = new TaskService.AddTaskRequest(
                     title, Task.Priority.MEDIUM, "inbox", null, Task.Recurrence.NONE, null);
-            taskService.createTask(userId, chatId, req);
+            Task task = taskService.createTask(userId, chatId, req);
+            autoSyncNewTaskToGoogle(task);
             sendText(chatId, "✅ " + title);
         }
     }
@@ -833,20 +839,50 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     }
 
     private void handleJournal(long chatId, long userId, String content) {
-        if (journalService == null) { sendText(chatId, "Journal not configured. Set NOTION_API_KEY and NOTION_JOURNAL_DB_ID."); return; }
+        if (journalService == null) { sendText(chatId, "Journal not configured. Set NOTION_JOURNAL_API_KEY and NOTION_JOURNAL_DB_ID."); return; }
         sendText(chatId, "📔 Saving journal entry...");
         try {
+            // Parse mood/energy directly from journal text
+            Integer mood = extractNumber(content, "mood");
+            Integer energy = extractNumber(content, "energy");
+            // Fallback: pull today's mood/energy if not mentioned in text
+            if (mood == null && energy == null && moodService != null) {
+                var todayMood = moodService.getToday(userId);
+                if (todayMood.isPresent()) {
+                    mood = todayMood.get().mood();
+                    energy = todayMood.get().energy();
+                }
+            }
+            // Sync to mood tracker
+            if (moodService != null && mood != null) {
+                moodService.logMood(userId, mood, energy);
+            }
             JournalService.JournalResult result = journalService.saveJournal(
-                    content, null, null, java.time.ZoneId.of("Asia/Singapore"));
+                    content, mood, energy, java.time.ZoneId.of("Asia/Singapore"));
             StringBuilder sb = new StringBuilder("📔 Journal saved!\n");
             sb.append("Title: ").append(result.title()).append("\n");
             if (result.tags() != null && !result.tags().isEmpty()) {
                 sb.append("Tags: ").append(String.join(", ", result.tags())).append("\n");
             }
+            if (mood != null) sb.append("Mood: ").append(mood).append("/5");
+            if (energy != null) sb.append(" | Energy: ").append(energy).append("/5");
             sendText(chatId, sb.toString().trim());
         } catch (Exception e) {
             sendText(chatId, "Failed to save journal: " + e.getMessage());
         }
+    }
+
+    /** Extract a number (1-5) following a keyword like "mood" or "energy" in text. */
+    private static Integer extractNumber(String text, String keyword) {
+        if (text == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?i)" + keyword + "\\s*(?:is|:|=)?\\s*(\\d)")
+                .matcher(text);
+        if (m.find()) {
+            int val = Integer.parseInt(m.group(1));
+            return (val >= 1 && val <= 5) ? val : null;
+        }
+        return null;
     }
 
     private void handleTimeBlock(long chatId, long userId) {
@@ -888,9 +924,9 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                     String listName = googleTasksService.listNameForPriority(task.getPriority().name());
                     String dueDate = task.getDueAt() != null
                             ? task.getDueAt().toLocalDate().toString() : null;
-                    String gTaskId = googleTasksService.createGoogleTask(
+                    var gTask = googleTasksService.createGoogleTask(
                             task.getTitle(), task.getNotes(), dueDate, listName);
-                    taskService.setGoogleTaskId(task.getId(), gTaskId, listName);
+                    taskService.setGoogleTaskId(task.getId(), gTask.taskId(), gTask.taskListId());
                     synced++;
                 }
             }
@@ -918,6 +954,29 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             googleTasksService.deleteGoogleTask(task.getGoogleTaskId(), task.getGoogleTasklistId());
         } catch (Exception e) {
             System.err.println("Failed to sync deletion to Google Tasks: " + e.getMessage());
+        }
+    }
+
+    private void autoSyncNewTaskToGoogle(Task task) {
+        if (googleTasksService == null) return;
+        try {
+            String listName = googleTasksService.listNameForPriority(task.getPriority().name());
+            String dueDate = task.getDueAt() != null ? task.getDueAt().toLocalDate().toString() : null;
+            var gTask = googleTasksService.createGoogleTask(task.getTitle(), task.getNotes(), dueDate, listName);
+            taskService.setGoogleTaskId(task.getId(), gTask.taskId(), gTask.taskListId());
+        } catch (Exception e) {
+            System.err.println("Auto-sync new task to Google Tasks failed: " + e.getMessage());
+        }
+    }
+
+    private void syncEditToGoogle(Task task) {
+        if (googleTasksService == null || task.getGoogleTaskId() == null) return;
+        try {
+            String dueDate = task.getDueAt() != null ? task.getDueAt().toLocalDate().toString() : null;
+            googleTasksService.updateGoogleTask(task.getGoogleTaskId(), task.getGoogleTasklistId(),
+                    task.getTitle(), task.getNotes(), dueDate);
+        } catch (Exception e) {
+            System.err.println("Failed to sync edit to Google Tasks: " + e.getMessage());
         }
     }
 
