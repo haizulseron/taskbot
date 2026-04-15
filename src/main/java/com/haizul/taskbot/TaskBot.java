@@ -408,6 +408,37 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             handleStartPomodoro(chatId, userId, "your session", work, brk, rounds); return;
         }
 
+        // ── Java pre-processing: task completion ─────────────────────────────
+        // Handle directly in Java — far more reliable than depending on LLM tool calls.
+        String bulkFilter = extractBulkDoneFilter(lower);
+        if (bulkFilter != null) {
+            if (bulkFilter.matches("(?i)daily|high|medium|low")) {
+                Task.Priority p = Task.Priority.fromText(bulkFilter);
+                int n = taskService.markAllDoneByPriority(userId, p);
+                sendText(chatId, n > 0 ? "✅ Marked " + n + " " + bulkFilter + " task(s) done!"
+                                       : "No active " + bulkFilter + " tasks to complete.");
+            } else {
+                int n = taskService.markAllDone(userId);
+                sendText(chatId, n > 0 ? "✅ Marked all " + n + " task(s) done!"
+                                       : "No active tasks to complete.");
+            }
+            return;
+        }
+
+        String doneHint = extractMarkDoneHint(lower);
+        if (doneHint != null) {
+            var opt = taskService.findTaskByTitleHint(userId, doneHint);
+            if (opt.isPresent()) {
+                Task task = opt.get();
+                syncCompleteToGoogle(task);
+                taskService.markDone(userId, task.shortId());
+                taskService.resetReminderIgnoredCount(task.getId());
+                sendText(chatId, "✅ Done! \"" + esc(task.getTitle()) + "\" marked complete.");
+                return;
+            }
+            // No match — fall through to Claude, it might interpret differently
+        }
+
         // Set location reminder pending
         final String finalText = text;  // may have been reassigned above (reply context prepend)
         if ((lower.contains("location") && lower.contains("remind")) || lower.contains("when i get to") || lower.contains("when i arrive")) {
@@ -693,8 +724,25 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     }
 
     private void execute(SendMessage msg) {
-        try { telegramClient.execute(msg); }
-        catch (TelegramApiException e) { throw new RuntimeException("Failed to send message", e); }
+        try {
+            telegramClient.execute(msg);
+        } catch (TelegramApiException e) {
+            // If HTML parsing failed, retry without parse mode
+            if (e.getMessage() != null && e.getMessage().contains("can't parse entities")) {
+                System.err.println("HTML parse failed, retrying as plain text: " + e.getMessage());
+                try {
+                    // Strip HTML tags and send as plain text
+                    String plainText = msg.getText().replaceAll("<[^>]+>", "").replace("&lt;", "<")
+                            .replace("&gt;", ">").replace("&amp;", "&");
+                    telegramClient.execute(SendMessage.builder()
+                            .chatId(msg.getChatId()).text(plainText).build());
+                } catch (TelegramApiException e2) {
+                    throw new RuntimeException("Failed to send message (even as plain text)", e2);
+                }
+            } else {
+                throw new RuntimeException("Failed to send message", e);
+            }
+        }
     }
 
     private String dot(Task t) {
@@ -1076,5 +1124,58 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 /authorize — link Google
                 /help — this menu
                 """;
+    }
+
+    // ── Task completion pattern matching ─────────────────────────────────────
+    // These run in Java BEFORE Claude sees the message — instant and reliable.
+
+    /**
+     * Extract a task hint from mark-done messages. Returns null if no pattern matches.
+     * Covers: "mark X done", "mark X as done", "complete X", "done X", "finish X",
+     * "done with X", "i'm done with X", "finished X", "completed X"
+     */
+    private static String extractMarkDoneHint(String lower) {
+        java.util.regex.Matcher m;
+        // "mark X done" / "mark X as done"
+        m = java.util.regex.Pattern.compile("^mark\\s+(.+?)\\s+(?:as\\s+)?done\\s*$").matcher(lower);
+        if (m.find()) return cleanHint(m.group(1));
+        // "complete X" / "done X" / "finish X" / "finished X" / "completed X"
+        m = java.util.regex.Pattern.compile("^(?:complete|done|finish|finished|completed)\\s+(.+?)\\s*$").matcher(lower);
+        if (m.find()) return cleanHint(m.group(1));
+        // "done with X" / "i'm done with X" / "i am done with X"
+        m = java.util.regex.Pattern.compile("^(?:i'?m\\s+|i\\s+am\\s+)?done\\s+with\\s+(.+?)\\s*$").matcher(lower);
+        if (m.find()) return cleanHint(m.group(1));
+        // "X is done" / "X done"
+        m = java.util.regex.Pattern.compile("^(.+?)\\s+(?:is\\s+)?done\\s*$").matcher(lower);
+        if (m.find()) {
+            String hint = m.group(1).trim();
+            // Avoid false positives on common phrases
+            if (!hint.matches("(?i)it|that|this|what|everything|all|nothing")) return cleanHint(hint);
+        }
+        return null;
+    }
+
+    /**
+     * Detect bulk completion patterns. Returns priority filter (e.g. "daily") or "all".
+     * Returns null if not a bulk pattern.
+     */
+    private static String extractBulkDoneFilter(String lower) {
+        java.util.regex.Matcher m;
+        // "complete all daily tasks" / "done all daily" / "mark all daily done" / "finish all daily tasks"
+        m = java.util.regex.Pattern.compile("^(?:complete|done|finish|mark)\\s+(?:all|both|every)\\s+(?:(?:my|the)\\s+)?(daily|high|medium|low)(?:\\s+tasks?)?(?:\\s+(?:as\\s+)?done)?\\s*$").matcher(lower);
+        if (m.find()) return m.group(1);
+        // "mark all daily tasks done" / "mark all daily as done"
+        m = java.util.regex.Pattern.compile("^mark\\s+(?:all|both|every)\\s+(?:(?:my|the)\\s+)?(daily|high|medium|low)(?:\\s+tasks?)?\\s+(?:as\\s+)?done\\s*$").matcher(lower);
+        if (m.find()) return m.group(1);
+        // "complete all tasks" / "done everything" / "mark all done" / "mark everything done"
+        m = java.util.regex.Pattern.compile("^(?:complete|done|finish|mark)\\s+(?:all(?:\\s+(?:my|the))?(?:\\s+tasks?)?|everything)(?:\\s+(?:as\\s+)?done)?\\s*$").matcher(lower);
+        if (m.find()) return "all";
+        return null;
+    }
+
+    private static String cleanHint(String hint) {
+        return hint.replaceAll("(?i)^(my|the|a|task|tasks)\\s+", "")
+                   .replaceAll("(?i)\\s+(task|tasks)$", "")
+                   .trim();
     }
 }

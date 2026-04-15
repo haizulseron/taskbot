@@ -219,8 +219,33 @@ public class TaskService {
     public Optional<Task> findTaskByTitleHint(long userId, String hint) {
         if (hint == null || hint.isBlank()) return Optional.empty();
         String lower = hint.toLowerCase(Locale.ROOT);
-        return getActiveTasks(userId).stream()
-                .filter(t -> t.getTitle().toLowerCase(Locale.ROOT).contains(lower)).findFirst();
+        List<Task> active = getActiveTasks(userId);
+
+        // 1. Exact substring match (fast path)
+        Optional<Task> exact = active.stream()
+                .filter(t -> t.getTitle().toLowerCase(Locale.ROOT).contains(lower))
+                .findFirst();
+        if (exact.isPresent()) return exact;
+
+        // 2. Word-based fuzzy match — handles word-order mismatches
+        //    e.g. hint "mock cs2030de paper" matches title "CS2030DE Mock Paper"
+        String[] hintWords = lower.split("\\s+");
+        Task best = null;
+        int bestScore = 0;
+        for (Task t : active) {
+            String titleLower = t.getTitle().toLowerCase(Locale.ROOT);
+            int score = 0;
+            for (String w : hintWords) {
+                if (w.length() >= 2 && titleLower.contains(w)) score++;
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                best = t;
+            }
+        }
+        // Require at least half the hint words to match (or at least 1 for short hints)
+        int minScore = Math.max(1, (hintWords.length + 1) / 2);
+        return bestScore >= minScore ? Optional.of(best) : Optional.empty();
     }
 
     public boolean markDone(long userId, String shortId) {

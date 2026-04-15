@@ -74,12 +74,11 @@ public class ClaudeService {
             - If a task isn't found by title, say so and ask the user to be more specific
             - For notes, always save them — don't ask for confirmation
 
-            TASK-TO-CALENDAR RULES:
-            - When creating a task, decide whether to set add_to_calendar=true
-            - SET TRUE for: deadlines, exams, appointments, meetings, interviews, project due dates, events with specific times
-            - SET FALSE for: quick todos, chores, daily habits, grocery runs, small errands, routine tasks
-            - Only works if the task has a due date — skip for undated tasks
-            - Calendar events are one-way: tasks go to calendar, but calendar events do NOT create tasks
+            TASK vs CALENDAR — SEPARATE SYSTEMS:
+            - Tasks and calendar are SEPARATE. Creating a task NEVER adds to Google Calendar.
+            - If the user says "add to calendar" or mentions a class/event/appointment → use add_event (calendar tool)
+            - If the user says "add task" or a todo/reminder → use create_task (task tool)
+            - Do NOT use both for the same item unless explicitly asked
 
             CALENDAR RULES:
             - Interpret all date/times relative to the current date/time in the system context
@@ -352,7 +351,6 @@ public class ClaudeService {
                     String dueStr     = str(input, "due_date");
                     String recurrence = str(input, "recurrence", "none");
                     String notes      = str(input, "notes");
-                    boolean addToCal  = bool(input, "add_to_calendar");
 
                     LocalDateTime due = parseDate(dueStr);
                     Task.Priority p   = Task.Priority.fromText(priority);
@@ -373,18 +371,7 @@ public class ClaudeService {
                         }
                     }
 
-                    String calNote = "";
-                    if (addToCal && googleCalendarService != null && due != null) {
-                        try {
-                            String eventId = googleCalendarService.createEventForTask(
-                                    title, due.toLocalDate().toString(), notes, priority.toUpperCase());
-                            taskService.setGoogleEventId(created.getId(), eventId);
-                            calNote = "\n📅 Also added to Google Calendar.";
-                        } catch (Exception e) {
-                            calNote = "\n(Calendar sync failed: " + e.getMessage() + ")";
-                        }
-                    }
-                    yield "Created task: " + taskService.formatTask(created) + calNote;
+                    yield "Created task: " + taskService.formatTask(created);
                 }
 
                 case "list_tasks" -> {
@@ -863,7 +850,7 @@ public class ClaudeService {
     private List<Map<String, Object>> buildTools() {
         List<Map<String, Object>> tools = new ArrayList<>();
 
-        tools.add(tool("create_task", "Create a new task or reminder",
+        tools.add(tool("create_task", "Create a new task or reminder. Does NOT add to Google Calendar — use add_event for calendar.",
                 props()
                     .req("title", "string", "Task title")
                     .opt("priority", "string", "high, medium, low, or daily (default: medium)")
@@ -871,7 +858,6 @@ public class ClaudeService {
                     .opt("due_date", "string", "ISO-8601 datetime e.g. 2026-04-15T09:00:00")
                     .opt("recurrence", "string", "none, daily, weekly, monthly")
                     .opt("notes", "string", "Extra notes for the task")
-                    .opt("add_to_calendar", "boolean", "Set true to also create a Google Calendar event. Use your judgement: set true for significant tasks with a due date (meetings, deadlines, exams, appointments) and false for small/routine tasks (chores, daily habits, quick todos)")
         ));
 
         tools.add(tool("list_tasks", "List tasks",
