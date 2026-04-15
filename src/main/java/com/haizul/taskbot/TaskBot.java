@@ -863,7 +863,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private void handleLinkTask(long chatId, long userId, String args) {
         if (goalService == null) { sendText(chatId, "Goal tracking not available."); return; }
         String[] parts = args.split("\\s+", 2);
-        if (parts.length < 2) { sendText(chatId, "Usage: /linktask <goal#> <task hint>"); return; }
+        if (parts.length < 2) { sendText(chatId, "Usage: /linktask &lt;goal#&gt; &lt;task hint&gt;"); return; }
         try {
             int goalId = Integer.parseInt(parts[0]);
             String taskHint = parts[1].trim();
@@ -898,9 +898,9 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             JournalService.JournalResult result = journalService.saveJournal(
                     content, mood, energy, java.time.ZoneId.of("Asia/Singapore"));
             StringBuilder sb = new StringBuilder("📔 Journal saved!\n");
-            sb.append("Title: ").append(result.title()).append("\n");
+            sb.append("Title: ").append(esc(result.title())).append("\n");
             if (result.tags() != null && !result.tags().isEmpty()) {
-                sb.append("Tags: ").append(String.join(", ", result.tags())).append("\n");
+                sb.append("Tags: ").append(esc(String.join(", ", result.tags()))).append("\n");
             }
             if (mood != null) sb.append("Mood: ").append(mood).append("/5");
             if (energy != null) sb.append(" | Energy: ").append(energy).append("/5");
@@ -938,9 +938,9 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             StringBuilder sb = new StringBuilder("📋 Google Tasks\n─────────────────\n");
             for (var entry : grouped.entrySet()) {
                 if (entry.getValue().isEmpty()) continue;
-                sb.append("\n📁 ").append(entry.getKey()).append("\n");
+                sb.append("\n📁 ").append(esc(entry.getKey())).append("\n");
                 for (var item : entry.getValue()) {
-                    sb.append("  • ").append(item.title());
+                    sb.append("  • ").append(esc(item.title()));
                     if (item.due() != null) sb.append(" (due: ").append(item.due()).append(")");
                     sb.append("\n");
                 }
@@ -1040,10 +1040,11 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         return """
                 I'm Proton — just talk to me naturally!
 
-                Examples:
+                <b>Examples:</b>
                 "add gym tomorrow 9am"
                 "add report friday 3pm #school high priority"
                 "mark gym done"
+                "complete all daily tasks"
                 "reschedule report to next monday"
                 "snooze all overdue tasks by 2 hours"
                 "what's due today?"
@@ -1054,23 +1055,26 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 "no reminders after 10pm"
                 "mood 4 3"
 
-                Commands:
+                <b>Commands:</b>
                 /tasks /today /overdue /review /habits
                 /recentnotes /setupnotes /edittasks
                 /brief — morning briefing on demand
-                /mood — log mood & energy
-                /journal <entry> — save journal to Notion
-                /countdown <name> <date> — add countdown
+                /mood — log mood &amp; energy
+                /journal — save journal to Notion
+                /countdown — add countdown
                 /countdowns — list countdowns
-                /goal <title> [by <date>] — create a goal
+                /goal — create a goal
                 /goals — list active goals
-                /linktask <goal#> <task hint> — link task to goal
+                /linktask — link task to goal
                 /timeblock — AI time-blocking suggestions
                 /gtasks — show Google Tasks
                 /synctasks — sync tasks to Google Tasks
-                /pomodoro [work] [break] [rounds]
+                /pomodoro — focus timer
                 /stoppomodoro /doneitems /cleardone
-                /authorize — link Google (Gmail, Calendar, Drive, Tasks)
+                /myprofile — view saved preferences
+                /forget — remove a preference
+                /authorize — link Google
+                /help — this menu
                 """;
     }
 }

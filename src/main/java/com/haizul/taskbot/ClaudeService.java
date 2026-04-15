@@ -66,6 +66,8 @@ public class ClaudeService {
             - Examples that should NEVER trigger tools: "whats up", "how are you", "thanks", "ok", "lol"
             - Examples that SHOULD trigger tools: "add gym tomorrow", "mark report done", "check my inbox", "what's on my calendar", "complete X", "done with X", "finish X"
             - "complete X", "done X", "finish X" → ALWAYS call mark_done with task_hint=X
+            - "complete all daily tasks", "done both daily tasks", "finish all daily" → call mark_all_done with priority_filter=daily
+            - "complete all tasks", "mark everything done" → call mark_all_done (no filter)
             - When in doubt whether to call a tool, DON'T — just respond conversationally
             - For multiple actions in one message, call multiple tools
             - Dates/times: always interpret relative to today's date in the system context
@@ -245,9 +247,35 @@ public class ClaudeService {
 
             // No tool calls — we are done
             if (toolUseBlocks.isEmpty()) {
-                // Safety net: if user asked to complete/done a task but Claude didn't call mark_done,
+                // Safety net: if user asked to complete/done tasks but Claude didn't call the tool,
                 // force the tool call ourselves instead of letting Claude hallucinate.
                 String lowerMsg = userMessage.toLowerCase().trim();
+
+                // ── Bulk completion patterns (must check before single-task) ──
+                java.util.regex.Matcher bulkMatcher = java.util.regex.Pattern
+                        .compile("(?i)^(?:complete|done|finish|mark done|mark as done|completed)\\s+(?:all|both|every)\\s+(?:(?:my|the)\\s+)?(.+?)(?:\\s+tasks?)?$")
+                        .matcher(lowerMsg);
+                if (bulkMatcher.find() && !taskDataFetched) {
+                    String qualifier = bulkMatcher.group(1).trim();
+                    System.err.println("[SAFETY] Claude skipped mark_all_done — forcing for: " + qualifier);
+                    // Check if it's a priority filter
+                    String result;
+                    if (qualifier.matches("(?i)daily|high|medium|low")) {
+                        Task.Priority p = Task.Priority.fromText(qualifier);
+                        int n = taskService.markAllDoneByPriority(userId, p);
+                        result = n > 0 ? "✅ Marked " + n + " " + qualifier + " task(s) done!"
+                                       : "No active " + qualifier + " tasks to complete.";
+                    } else {
+                        // Might be a category or just "all tasks"
+                        int n = taskService.markAllDone(userId);
+                        result = n > 0 ? "✅ Marked all " + n + " task(s) done!"
+                                       : "No active tasks to complete.";
+                    }
+                    addToHistory(userId, userMessage, result);
+                    return result;
+                }
+
+                // ── Single task completion ──
                 java.util.regex.Matcher completeMatcher = java.util.regex.Pattern
                         .compile("(?i)^(?:complete|done|finish|mark done|mark as done|completed)\\s+(.+)")
                         .matcher(lowerMsg);
@@ -1080,26 +1108,38 @@ public class ClaudeService {
 
     private void extractAndSaveMemory(long userId, String userMessage, String assistantResponse) {
         if (db == null) return;
+        // Skip extraction for very short or clearly non-preference messages
+        String lower = userMessage.toLowerCase().trim();
+        if (lower.length() < 10 || lower.matches("(?i)^(ok|yes|no|thanks|lol|haha|cool|nice|done|hi|hey|yo|sup|what|how).*")) return;
+        // Skip task commands — these don't contain preference info
+        if (lower.matches("(?i)^(add|create|mark|complete|delete|done|finish|snooze|reschedule|show|list|check|search)\\s.*")) return;
+
         memoryExtractor.execute(() -> {
             try {
-                String prompt = "You extract user preferences and personal facts from a conversation for a personal assistant.\n\n"
+                // Load existing preferences so the extractor can avoid duplicates
+                Map<String, String> existing = db.getProfile(userId);
+                StringBuilder existingStr = new StringBuilder();
+                if (!existing.isEmpty()) {
+                    existingStr.append("\nAlready stored preferences (DO NOT re-save these or similar):\n");
+                    existing.forEach((k, v) -> existingStr.append("- ").append(k).append(": ").append(v).append("\n"));
+                }
+
+                String prompt = "You extract user preferences from a conversation for a personal assistant.\n\n"
                         + "User message: " + userMessage + "\n"
-                        + "Assistant response: " + assistantResponse + "\n\n"
-                        + "Extract any preference, habit, personal fact, or behavioural instruction the USER expressed.\n"
-                        + "Be generous — if the user stated how they want things done, save it.\n"
-                        + "Good examples to save:\n"
-                        + "  - How they want content displayed (brief vs full, formatted vs plain)\n"
-                        + "  - Communication style preferences (casual, concise, detailed)\n"
-                        + "  - Scheduling habits, working hours, routines\n"
-                        + "  - Personal context (job, school, family situation)\n"
-                        + "  - Names, nicknames, relationships\n"
-                        + "Skip: specific task content, one-off requests, casual greetings.\n"
-                        + "Return JSON array: [{\"key\": \"snake_case_key\", \"value\": \"preference\"}] or [] if nothing.\n"
+                        + "Assistant response: " + assistantResponse + "\n"
+                        + existingStr + "\n"
+                        + "Rules:\n"
+                        + "- ONLY extract explicit, durable preferences or personal facts the USER stated.\n"
+                        + "- DO NOT extract anything already covered by existing preferences above.\n"
+                        + "- DO NOT create multiple keys for the same concept — use ONE canonical key.\n"
+                        + "- Skip: task content, one-off requests, greetings, commands, things the assistant said.\n"
+                        + "- Be conservative — when in doubt, return [].\n"
+                        + "Return JSON array: [{\"key\": \"snake_case_key\", \"value\": \"preference\"}] or [] if nothing new.\n"
                         + "Return ONLY the JSON array, no other text.";
                 Map<String, Object> body = new LinkedHashMap<>();
                 body.put("model", MODEL_FAST);
-                body.put("max_tokens", 300);
-                body.put("system", "You extract user preferences from chat exchanges. Return only a valid JSON array.");
+                body.put("max_tokens", 200);
+                body.put("system", "You extract NEW user preferences from chat. Return only a valid JSON array. Be conservative — only extract clear, durable preferences not already stored.");
                 body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
                 String resp = postJson(body);
                 JsonNode root = mapper.readTree(resp);
@@ -1127,26 +1167,37 @@ public class ClaudeService {
     public void consolidateProfile(long userId) {
         if (db == null) return;
         Map<String, String> profile = db.getProfile(userId);
-        if (profile.size() < 3) return;
+        if (profile.size() < 5) return;
         try {
             StringBuilder facts = new StringBuilder();
             profile.forEach((k, v) -> facts.append(k).append(": ").append(v).append("\n"));
-            String prompt = "You manage a user profile for a personal assistant. Current stored facts:\n\n"
+            String prompt = "You manage a user profile for a personal assistant. Current stored facts (" + profile.size() + " entries):\n\n"
                     + facts
-                    + "\nConsolidate: merge duplicates, remove redundant/outdated entries, keep most accurate values.\n"
-                    + "Return JSON object: {\"key\": \"value\", ...} with only the facts to keep.\n"
+                    + "\nAggressively consolidate this profile:\n"
+                    + "1. MERGE all entries about the same topic into ONE canonical key (e.g. merge daily_arabic_habit, arabic_learning_routine, daily_arabic_study into just daily_routines)\n"
+                    + "2. REMOVE redundant entries that repeat the same information\n"
+                    + "3. REMOVE obvious/low-value entries (e.g. has_child: yes if already stated in family context)\n"
+                    + "4. Keep max 15-20 high-value entries total\n"
+                    + "5. Use clear, concise values — no redundancy\n"
+                    + "Return JSON object: {\"key\": \"value\", ...} with only the consolidated facts.\n"
                     + "Return ONLY the JSON object, no other text.";
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", MODEL_FAST);
-            body.put("max_tokens", 500);
-            body.put("system", "You consolidate user profile facts. Return only valid JSON.");
+            body.put("max_tokens", 600);
+            body.put("system", "You aggressively consolidate user profile data. Merge duplicates, remove redundancy. Target 15-20 entries max. Return only valid JSON.");
             body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
             String resp = postJson(body);
             JsonNode root = mapper.readTree(resp);
             String text = root.path("content").path(0).path("text").asText("").trim();
+            if (text.startsWith("```")) {
+                text = text.replaceAll("^```[a-z]*\\s*", "").replaceAll("\\s*```$", "").trim();
+            }
             Map<String, String> consolidated = new LinkedHashMap<>();
             mapper.readTree(text).fields().forEachRemaining(e -> consolidated.put(e.getKey(), e.getValue().asText()));
-            if (!consolidated.isEmpty()) db.replaceProfile(userId, consolidated);
+            if (!consolidated.isEmpty() && consolidated.size() <= profile.size()) {
+                db.replaceProfile(userId, consolidated);
+                System.out.println("Profile consolidated: " + profile.size() + " → " + consolidated.size() + " entries");
+            }
         } catch (Exception e) {
             System.err.println("Profile consolidation error: " + e.getMessage());
         }
@@ -1158,9 +1209,9 @@ public class ClaudeService {
         if (db == null) return "AI not configured.";
         Map<String, String> profile = db.getProfile(userId);
         if (profile.isEmpty()) return "No preferences saved yet. Just chat naturally and I'll learn your preferences over time!";
-        StringBuilder sb = new StringBuilder("🧠 Remembered Preferences\n─────────────────\n\n");
-        profile.forEach((k, v) -> sb.append("• ").append(k).append(": ").append(v).append("\n"));
-        sb.append("\nUse /forget <key> to remove a specific entry.");
+        StringBuilder sb = new StringBuilder("🧠 <b>Remembered Preferences</b>\n─────────────────\n\n");
+        profile.forEach((k, v) -> sb.append("• ").append(TaskService.esc(k)).append(": ").append(TaskService.esc(v)).append("\n"));
+        sb.append("\nUse /forget &lt;key&gt; to remove a specific entry.");
         return sb.toString();
     }
 
