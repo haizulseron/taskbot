@@ -369,13 +369,6 @@ public class ClaudeService {
                         default        -> taskService.getActiveTasks(userId);
                     };
                     if (tasks.isEmpty()) yield "No tasks found.";
-                    // Build the same formatted list as /tasks command
-                    List<Task> main  = tasks.stream().filter(t -> t.getPriority() != Task.Priority.DAILY).toList();
-                    List<Task> daily = tasks.stream().filter(t -> t.getPriority() == Task.Priority.DAILY).toList();
-                    long high = main.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
-                    long med  = main.stream().filter(t -> t.getPriority() == Task.Priority.MEDIUM).count();
-                    long low  = main.stream().filter(t -> t.getPriority() == Task.Priority.LOW).count();
-                    StringBuilder sb = new StringBuilder();
                     String title = switch(filter) {
                         case "today"   -> "🗓 Due Today";
                         case "overdue" -> "⚠️ Overdue";
@@ -383,37 +376,12 @@ public class ClaudeService {
                         case "done"    -> "✅ Completed";
                         default        -> "📋 Active Tasks";
                     };
-                    sb.append(title).append("  (").append(tasks.size()).append(")\n");
-                    if (high > 0) sb.append("🔴 ").append(high).append(" high   ");
-                    if (med  > 0) sb.append("🟡 ").append(med).append(" medium   ");
-                    if (low  > 0) sb.append("🟢 ").append(low).append(" low");
-                    if (!daily.isEmpty()) sb.append("  🔵 ").append(daily.size()).append(" daily");
-                    sb.append("\n─────────────────\n");
-                    for (int i = 0; i < main.size(); i++) {
-                        Task t = main.get(i);
-                        String dot = switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; };
-                        String due = t.getDueAt() != null ? "  📅 " + taskService.friendlyDate(t.getDueAt()) : "";
-                        String cat = "none".equals(t.getCategory()) ? "" : "  📁 " + t.getCategory();
-                        sb.append(dot).append(" ").append(t.getTitle()).append("\n");
-                        sb.append("   ").append(cat).append(due);
-                        if (t.isHabit()) sb.append("  🔄");
-                        sb.append("\n");
-                        if (i < main.size() - 1) sb.append("\n");
-                    }
-                    if (!daily.isEmpty()) {
-                        if (!main.isEmpty()) sb.append("\n");
-                        sb.append("─────────────────\n🔵 Daily\n─────────────────\n");
-                        for (Task t : daily) {
-                            String due = t.getDueAt() != null ? "  📅 " + taskService.friendlyDate(t.getDueAt()) : "";
-                            String cat = "none".equals(t.getCategory()) ? "" : "  📁 " + t.getCategory();
-                            sb.append("🔵 ").append(t.getTitle()).append("\n");
-                            sb.append("   ").append(cat).append(due).append("\n\n");
-                        }
-                    }
-                    // Send the nicely formatted list directly to the user
-                    sender.send(sb.toString().trim());
+                    // Send the compact HTML list directly to the user
+                    sender.send(taskService.formatTaskListHtml(title, tasks));
 
-                    // Also return task data to Claude so it can analyse, summarise, or act on it
+                    // Also return plain task data to Claude so it can analyse or act on it
+                    List<Task> main  = tasks.stream().filter(t -> t.getPriority() != Task.Priority.DAILY).toList();
+                    List<Task> daily = tasks.stream().filter(t -> t.getPriority() == Task.Priority.DAILY).toList();
                     StringBuilder data = new StringBuilder("Task list sent. Data for analysis (").append(tasks.size()).append(" tasks):\n");
                     for (Task t : main) {
                         String p = switch (t.getPriority()) { case HIGH -> "HIGH"; case MEDIUM -> "MED"; case LOW -> "LOW"; default -> ""; };
@@ -550,11 +518,11 @@ public class ClaudeService {
                     StringBuilder sb = new StringBuilder();
                     sb.append("📝 Notes\n─────────────────\n\n");
                     for (NotionService.NoteResult note : results) {
-                        sb.append("📌 ").append(note.title()).append("\n");
-                        sb.append("   📁 ").append(note.category());
-                        if (!note.tags().isEmpty()) sb.append("  🏷 ").append(String.join(", ", note.tags()));
+                        sb.append("📌 <b>").append(TaskService.esc(note.title())).append("</b>\n");
+                        sb.append("   📁 ").append(TaskService.esc(note.category()));
+                        if (!note.tags().isEmpty()) sb.append("  🏷 ").append(TaskService.esc(String.join(", ", note.tags())));
                         sb.append("  📅 ").append(note.created()).append("\n");
-                        if (!note.summary().isBlank()) sb.append("   ").append(note.summary()).append("\n");
+                        if (!note.summary().isBlank()) sb.append("   ").append(TaskService.esc(note.summary())).append("\n");
                         sb.append("\n");
                     }
                     sender.send(sb.toString().trim());
@@ -569,7 +537,7 @@ public class ClaudeService {
                     String pageId = str(input, "page_id");
                     String content = notionService.readNote(pageId);
                     if (content == null || content.isBlank()) yield "Note is empty or couldn't be read.";
-                    sender.send(content);
+                    sender.send(TaskService.esc(content));
                     yield "SENT_DIRECTLY";
                 }
 
@@ -591,12 +559,12 @@ public class ClaudeService {
                     StringBuilder sb = new StringBuilder("📧 Inbox (" + emails.size() + ")\n─────────────────\n\n");
                     for (int i = 0; i < emails.size(); i++) {
                         GmailService.EmailSummary e = emails.get(i);
-                        sb.append(i + 1).append(". ").append(e.subject()).append("\n");
-                        sb.append("   From: ").append(e.from()).append("\n");
+                        sb.append(i + 1).append(". <b>").append(TaskService.esc(e.subject())).append("</b>\n");
+                        sb.append("   From: ").append(TaskService.esc(e.from())).append("\n");
                         sb.append("   ").append(e.date()).append("\n");
                         if (e.snippet() != null && !e.snippet().isBlank())
-                            sb.append("   ").append(e.snippet()).append("\n");
-                        sb.append("   ID: ").append(e.id()).append("\n\n");
+                            sb.append("   ").append(TaskService.esc(e.snippet())).append("\n");
+                        sb.append("   <code>").append(e.id()).append("</code>\n\n");
                     }
                     sender.send(sb.toString().trim());
                     // Return IDs separately so Claude can reference them for replies
@@ -610,13 +578,13 @@ public class ClaudeService {
                     String messageId = str(input, "message_id");
                     GmailService.EmailContent email = gmailService.readEmailContent(messageId);
                     StringBuilder sb = new StringBuilder();
-                    sb.append("📧 ").append(email.subject()).append("\n");
-                    sb.append("From: ").append(email.from()).append("\n");
+                    sb.append("📧 <b>").append(TaskService.esc(email.subject())).append("</b>\n");
+                    sb.append("From: ").append(TaskService.esc(email.from())).append("\n");
                     sb.append("Date: ").append(email.date()).append("\n");
                     sb.append("─────────────────\n\n");
                     String body = email.body();
                     if (body.length() > 3000) body = body.substring(0, 3000) + "\n\n[truncated — email is long]";
-                    sb.append(body);
+                    sb.append(TaskService.esc(body));
                     sender.send(sb.toString().trim());
                     yield "Email content shown. Message ID for reply: " + email.id();
                 }
@@ -649,12 +617,11 @@ public class ClaudeService {
                     int days = intVal(input, "days", 7);
                     List<CalendarService.EventSummary> events = calendarService.getUpcomingEvents(days);
                     if (events.isEmpty()) yield "No events in the next " + days + " days.";
-                    StringBuilder sb = new StringBuilder("📅 Calendar (next " + days + " days)\n─────────────────\n\n");
+                    StringBuilder sb = new StringBuilder("<b>📅 Calendar</b> (next " + days + " days)\n─────────────────\n");
                     for (CalendarService.EventSummary e : events) {
-                        sb.append(e.start()).append("\n");
-                        sb.append("  📌 ").append(e.title()).append("\n");
+                        sb.append("📅 ").append(TaskService.esc(e.start())).append("  <b>").append(TaskService.esc(e.title())).append("</b>");
                         if (e.location() != null && !e.location().isBlank())
-                            sb.append("  📍 ").append(e.location()).append("\n");
+                            sb.append("  📍 ").append(TaskService.esc(e.location()));
                         sb.append("\n");
                     }
                     sender.send(sb.toString().trim());
@@ -777,7 +744,7 @@ public class ClaudeService {
                     if (countdownService == null) yield "Countdown service not available.";
                     var list = countdownService.getCountdowns(userId);
                     if (list.isEmpty()) yield "No countdowns set.";
-                    StringBuilder sb = new StringBuilder("\u23F3 Countdowns\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n");
+                    StringBuilder sb = new StringBuilder("<b>⏳ Countdowns</b>\n─────────────────\n\n");
                     list.forEach(cd -> sb.append(countdownService.formatCountdown(cd)).append("\n"));
                     sender.send(sb.toString().trim());
                     yield "Countdowns shown.";
@@ -799,7 +766,7 @@ public class ClaudeService {
                     if (goalService == null) yield "Goal service not available.";
                     var goals = goalService.getActiveGoals(userId);
                     if (goals.isEmpty()) yield "No active goals.";
-                    StringBuilder sb = new StringBuilder("\uD83C\uDFAF Goals\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n");
+                    StringBuilder sb = new StringBuilder("<b>🎯 Goals</b>\n─────────────────\n\n");
                     goals.forEach(g -> sb.append(goalService.formatGoal(g)).append("\n\n"));
                     sender.send(sb.toString().trim());
                     yield "Goals shown.";

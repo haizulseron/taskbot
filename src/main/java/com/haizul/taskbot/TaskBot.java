@@ -3,6 +3,7 @@ package com.haizul.taskbot;
 import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
+import org.telegram.telegrambots.meta.api.methods.ParseMode;
 import org.telegram.telegrambots.meta.api.methods.send.SendDocument;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
@@ -245,8 +246,8 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             pendingInputs.remove(userId);
             taskService.findTaskByTitleHint(userId, pending.target()).ifPresentOrElse(task -> {
                 taskService.setLocationReminder(userId, task.shortId(), lat, lng, 200);
-                sendText(chatId, "📍 Location reminder set for \"" + task.getTitle() + "\"!");
-            }, () -> sendText(chatId, "Couldn't find task \"" + pending.target() + "\"."));
+                sendText(chatId, "📍 Location reminder set for \"" + esc(task.getTitle()) + "\"!");
+            }, () -> sendText(chatId, "Couldn't find task \"" + esc(pending.target()) + "\"."));
             return;
         }
 
@@ -339,9 +340,9 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
         if (text.startsWith("/forget ")) {
             String key = text.substring(8).trim();
-            if (key.isBlank()) { sendText(chatId, "Usage: /forget <key>  (see /myprofile for key names)"); return; }
+            if (key.isBlank()) { sendText(chatId, "Usage: /forget &lt;key&gt;  (see /myprofile for key names)"); return; }
             boolean removed = claudeService != null && claudeService.forgetProfileKey(userId, key);
-            sendText(chatId, removed ? "🗑 Forgot \"" + key + "\"." : "No preference found with key \"" + key + "\"."); return;
+            sendText(chatId, removed ? "🗑 Forgot \"" + esc(key) + "\"." : "No preference found with key \"" + esc(key) + "\"."); return;
         }
         if (text.startsWith("/pomodoro")) {
             String[] parts = text.trim().split("\\s+");
@@ -357,25 +358,25 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             handleJournal(chatId, userId, text.substring(9).trim()); return;
         }
         if (text.equals("/journal")) {
-            sendText(chatId, "Usage: /journal <your entry>\n\nExample: /journal Had a productive morning..."); return;
+            sendText(chatId, "Usage: /journal &lt;your entry&gt;\n\nExample: /journal Had a productive morning..."); return;
         }
         if (text.startsWith("/countdown ")) {
             handleAddCountdown(chatId, userId, text.substring(11).trim()); return;
         }
         if (text.equals("/countdown")) {
-            sendText(chatId, "Usage: /countdown <name> <date>\n\nExample: /countdown birthday 2026-05-15"); return;
+            sendText(chatId, "Usage: /countdown &lt;name&gt; &lt;date&gt;\n\nExample: /countdown birthday 2026-05-15"); return;
         }
         if (text.startsWith("/goal ")) {
             handleAddGoal(chatId, userId, text.substring(6).trim()); return;
         }
         if (text.equals("/goal")) {
-            sendText(chatId, "Usage: /goal <title> [by <date>]\n\nExample: /goal Finish thesis by 2026-06-01"); return;
+            sendText(chatId, "Usage: /goal &lt;title&gt; [by &lt;date&gt;]\n\nExample: /goal Finish thesis by 2026-06-01"); return;
         }
         if (text.startsWith("/linktask ")) {
             handleLinkTask(chatId, userId, text.substring(10).trim()); return;
         }
         if (text.equals("/linktask")) {
-            sendText(chatId, "Usage: /linktask <goal#> <task hint>\n\nExample: /linktask 1 write chapter"); return;
+            sendText(chatId, "Usage: /linktask &lt;goal#&gt; &lt;task hint&gt;\n\nExample: /linktask 1 write chapter"); return;
         }
         if (text.startsWith("/timeblock")) {
             handleTimeBlock(chatId, userId); return;
@@ -413,7 +414,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             taskService.findTaskByTitleHint(userId, finalText).ifPresentOrElse(task -> {
                 pendingInputs.put(userId, new PendingInput(PendingKind.LOCATION_TASK_HINT, task.getTitle()));
                 pendingInputTimestamps.put(userId, System.currentTimeMillis());
-                sendText(chatId, "📍 Send me your location and I'll set a reminder for \"" + task.getTitle() + "\".");
+                sendText(chatId, "📍 Send me your location and I'll set a reminder for \"" + esc(task.getTitle()) + "\".");
             }, () -> routeToAgent(chatId, userId, finalText));
             return;
         }
@@ -441,7 +442,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         if (response != null && !response.isBlank()
                 && !response.equals("SENT_DIRECTLY")
                 && !response.contains("SENT_DIRECTLY")) {
-            sendText(chatId, response);
+            sendText(chatId, esc(response));
         }
     }
 
@@ -475,7 +476,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 syncCompleteToGoogle(task);
                 taskService.markDone(userId, id);
                 taskService.resetReminderIgnoredCount(task.getId());
-                try { answer(update, "Done!"); editMessage(chatId, messageId, "✅ " + task.getTitle(), null); }
+                try { answer(update, "Done!"); editMessage(chatId, messageId, "✅ " + esc(task.getTitle()), null); }
                 catch (TelegramApiException e) { throw new RuntimeException(e); }
             }, () -> sendText(chatId, "Task not found."));
             return;
@@ -485,7 +486,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             taskService.findTaskByShortId(userId, id).ifPresentOrElse(task -> {
                 syncDeleteToGoogle(task);
                 taskService.deleteTask(userId, id);
-                try { answer(update, "Deleted"); editMessage(chatId, messageId, "🗑 " + task.getTitle(), null); }
+                try { answer(update, "Deleted"); editMessage(chatId, messageId, "🗑 " + esc(task.getTitle()), null); }
                 catch (TelegramApiException e) { throw new RuntimeException(e); }
             }, () -> sendText(chatId, "Task not found."));
             return;
@@ -494,7 +495,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             String id = data.substring(9);
             taskService.findTaskByShortId(userId, id).ifPresentOrElse(task -> {
                 taskService.snoozeTask(userId, id, Duration.ofHours(24));
-                try { answer(update, "Snoozed 24h"); editMessage(chatId, messageId, "⏰ Snoozed: " + task.getTitle(), null); }
+                try { answer(update, "Snoozed 24h"); editMessage(chatId, messageId, "⏰ Snoozed: " + esc(task.getTitle()), null); }
                 catch (TelegramApiException e) { throw new RuntimeException(e); }
             }, () -> sendText(chatId, "Task not found."));
             return;
@@ -503,60 +504,45 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             int n = taskService.deleteAllDone(userId);
             answer(update, n > 0 ? "Cleared " + n : "Nothing");
             editMessage(chatId, messageId, n > 0 ? "🗑 Cleared " + n + " completed tasks." : "No completed tasks.", null);
+            return;
+        }
+        if (data.startsWith("filter:")) {
+            String filter = data.substring(7);
+            String title; List<Task> tasks;
+            switch (filter) {
+                case "today"   -> { title = "📅 Due Today"; tasks = taskService.getTodayTasks(userId); }
+                case "overdue" -> { title = "⚠️ Overdue"; tasks = taskService.getOverdueTasks(userId); }
+                case "done"    -> { title = "✅ Completed"; tasks = taskService.getDoneTasks(userId); }
+                default        -> { title = "📋 Active Tasks"; tasks = taskService.getActiveTasks(userId); }
+            }
+            answer(update, filter);
+            String html = taskService.formatTaskListHtml(title, tasks);
+            editMessage(chatId, messageId, html, buildFilterKeyboard());
         }
     }
 
     // ── Display ──────────────────────────────────────────────────────────────
 
     private void sendTaskList(long chatId, String title, List<Task> tasks) {
-        if (tasks.isEmpty()) { sendText(chatId, title + "\n\nNo tasks found."); return; }
+        sendTaskList(chatId, title, tasks, null);
+    }
 
-        List<Task> main  = tasks.stream().filter(t -> t.getPriority() != Task.Priority.DAILY).toList();
-        List<Task> daily = tasks.stream().filter(t -> t.getPriority() == Task.Priority.DAILY).toList();
-
-        long high = main.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
-        long med  = main.stream().filter(t -> t.getPriority() == Task.Priority.MEDIUM).count();
-        long low  = main.stream().filter(t -> t.getPriority() == Task.Priority.LOW).count();
-
-        StringBuilder sb = new StringBuilder();
-        sb.append(title).append("  (").append(tasks.size()).append(")\n");
-        if (high > 0) sb.append("🔴 ").append(high).append(" high   ");
-        if (med  > 0) sb.append("🟡 ").append(med).append(" medium   ");
-        if (low  > 0) sb.append("🟢 ").append(low).append(" low");
-        if (!daily.isEmpty()) sb.append("  🔵 ").append(daily.size()).append(" daily");
-        sb.append("\n─────────────────\n");
-
-        for (int i = 0; i < main.size(); i++) {
-            Task t = main.get(i);
-            String dot = dot(t);
-            String due = t.getDueAt() != null ? "  📅 " + taskService.friendlyDate(t.getDueAt()) : "";
-            String cat = "none".equals(t.getCategory()) ? "" : "  📁 " + t.getCategory();
-            sb.append(dot).append(" ").append(t.getTitle()).append("\n");
-            sb.append("   ").append(cat).append(due);
-            if (t.isHabit()) sb.append("  🔄");
-            sb.append("\n");
-            if (i < main.size() - 1) sb.append("\n");
+    private void sendTaskList(long chatId, String title, List<Task> tasks, InlineKeyboardMarkup keyboard) {
+        String html = taskService.formatTaskListHtml(title, tasks);
+        if (keyboard == null) {
+            // Add filter buttons to the main task list
+            keyboard = buildFilterKeyboard();
         }
-
-        if (!daily.isEmpty()) {
-            if (!main.isEmpty()) sb.append("\n");
-            sb.append("─────────────────\n🔵 Daily\n─────────────────\n");
-            for (Task t : daily) {
-                String due = t.getDueAt() != null ? "  📅 " + taskService.friendlyDate(t.getDueAt()) : "";
-                String cat = "none".equals(t.getCategory()) ? "" : "  📁 " + t.getCategory();
-                sb.append("🔵 ").append(t.getTitle()).append("\n");
-                sb.append("   ").append(cat).append(due).append("\n\n");
-            }
-        }
-
-        sendText(chatId, sb.toString().trim());
+        execute(SendMessage.builder().chatId(chatId).text(html)
+                .parseMode(ParseMode.HTML).replyMarkup(keyboard).build());
     }
 
     private void sendDoneList(long chatId, List<Task> tasks) {
-        if (tasks.isEmpty()) { sendText(chatId, "✅ Completed\n\nNo completed tasks."); return; }
-        StringBuilder sb = new StringBuilder("✅ Completed  (" + tasks.size() + ")\n─────────────────\n");
-        tasks.forEach(t -> sb.append("✅ ").append(t.getTitle()).append("\n"));
+        if (tasks.isEmpty()) { sendText(chatId, "✅ <b>Completed</b>\n\nNo completed tasks."); return; }
+        StringBuilder sb = new StringBuilder("✅ <b>Completed</b>  (" + tasks.size() + ")\n─────────────────\n");
+        tasks.forEach(t -> sb.append("✅ ").append(esc(t.getTitle())).append("\n"));
         execute(SendMessage.builder().chatId(chatId).text(sb.toString().trim())
+                .parseMode(ParseMode.HTML)
                 .replyMarkup(InlineKeyboardMarkup.builder().keyboard(List.of(new InlineKeyboardRow(
                         InlineKeyboardButton.builder().text("🗑 Clear All Completed").callbackData("cleardone").build()
                 ))).build()).build());
@@ -564,9 +550,10 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
     private void sendEditableTaskList(long chatId, List<Task> tasks) {
         if (tasks.isEmpty()) { sendText(chatId, "No active tasks."); return; }
-        sendText(chatId, "✏️ Active Tasks — tap to act:");
+        sendText(chatId, "✏️ <b>Active Tasks</b> — tap to act:");
         for (Task task : tasks) {
-            execute(SendMessage.builder().chatId(chatId).text(taskService.formatTask(task))
+            execute(SendMessage.builder().chatId(chatId).text(taskService.formatTaskHtml(task))
+                    .parseMode(ParseMode.HTML)
                     .replyMarkup(buildTaskKeyboard(task)).build());
         }
     }
@@ -574,10 +561,10 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private void sendHabitList(long chatId, long userId) {
         List<Task> habits = taskService.getHabits(userId);
         if (habits.isEmpty()) { sendText(chatId, "No habits yet.\n\nSay: \"mark gym as a habit\""); return; }
-        StringBuilder sb = new StringBuilder("🔄 Habits (" + habits.size() + ")\n─────────────────\n");
+        StringBuilder sb = new StringBuilder("🔄 <b>Habits</b> (" + habits.size() + ")\n─────────────────\n");
         habits.forEach(h -> {
             int streak = taskService.getHabitStreak(h.getId());
-            sb.append(dot(h)).append(" ").append(h.getTitle())
+            sb.append(dot(h)).append(" <b>").append(esc(h.getTitle())).append("</b>")
               .append("\n  🔥 ").append(streak).append(" day streak\n\n");
         });
         sendText(chatId, sb.toString().trim());
@@ -589,10 +576,10 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         try {
             List<NotionService.NoteResult> results = notionService.getRecentNotes(5);
             if (results.isEmpty()) { sendText(chatId, "No notes saved yet."); return; }
-            StringBuilder sb = new StringBuilder("📝 Recent Notes\n─────────────────\n\n");
-            results.forEach(n -> sb.append("📌 ").append(n.title()).append("\n")
-                    .append("   📁 ").append(n.category())
-                    .append(n.tags().isEmpty() ? "" : "  🏷 " + String.join(", ", n.tags()))
+            StringBuilder sb = new StringBuilder("📝 <b>Recent Notes</b>\n─────────────────\n\n");
+            results.forEach(n -> sb.append("📌 <b>").append(esc(n.title())).append("</b>\n")
+                    .append("   📁 ").append(esc(n.category()))
+                    .append(n.tags().isEmpty() ? "" : "  🏷 " + esc(String.join(", ", n.tags())))
                     .append("  📅 ").append(n.created()).append("\n\n"));
             sendText(chatId, sb.toString().trim());
         } catch (Exception e) { sendText(chatId, "Couldn't fetch notes right now."); }
@@ -617,7 +604,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         String pomConfig = "POMODORO:" + rounds + ":" + workMins + ":" + breakMins + ":1:work";
         UserSettings us = taskService.getUserSettings(userId);
         taskService.saveUserSettings(userId, us.getQuietStart(), us.getQuietEnd(), pomConfig);
-        sendText(chatId, "🍅 Pomodoro started!\n\nTask: " + taskTitle + "\nRound 1 of " + rounds
+        sendText(chatId, "🍅 <b>Pomodoro started!</b>\n\nTask: <b>" + esc(taskTitle) + "</b>\nRound 1 of " + rounds
                 + " — " + workMins + " min work\nBreak: " + breakMins + " min\n\nFocus up! 💪");
     }
 
@@ -633,6 +620,16 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         )).build();
     }
 
+    private InlineKeyboardMarkup buildFilterKeyboard() {
+        return InlineKeyboardMarkup.builder().keyboard(List.of(
+                new InlineKeyboardRow(
+                        InlineKeyboardButton.builder().text("📋 All").callbackData("filter:active").build(),
+                        InlineKeyboardButton.builder().text("📅 Today").callbackData("filter:today").build(),
+                        InlineKeyboardButton.builder().text("⚠️ Overdue").callbackData("filter:overdue").build(),
+                        InlineKeyboardButton.builder().text("✅ Done").callbackData("filter:done").build())
+        )).build();
+    }
+
     // ── Telegram helpers ──────────────────────────────────────────────────────
 
     private void answer(Update update, String text) throws TelegramApiException {
@@ -641,7 +638,8 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     }
 
     private void editMessage(long chatId, int messageId, String text, InlineKeyboardMarkup keyboard) throws TelegramApiException {
-        EditMessageText.EditMessageTextBuilder b = EditMessageText.builder().chatId(chatId).messageId(messageId).text(text);
+        EditMessageText.EditMessageTextBuilder b = EditMessageText.builder()
+                .chatId(chatId).messageId(messageId).text(text).parseMode(ParseMode.HTML);
         if (keyboard != null) b.replyMarkup(keyboard);
         telegramClient.execute(b.build());
     }
@@ -650,7 +648,8 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         if (text == null || text.isBlank()) return;
         // Telegram max message length is 4096 characters
         if (text.length() <= 4096) {
-            execute(SendMessage.builder().chatId(chatId).text(text).build());
+            execute(SendMessage.builder().chatId(chatId).text(text)
+                    .parseMode(ParseMode.HTML).build());
             return;
         }
         // Split into chunks, preferring line-break boundaries
@@ -662,7 +661,8 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 int newline = text.lastIndexOf('\n', end);
                 if (newline > start) end = newline + 1;
             }
-            execute(SendMessage.builder().chatId(chatId).text(text.substring(start, end)).build());
+            execute(SendMessage.builder().chatId(chatId).text(text.substring(start, end))
+                    .parseMode(ParseMode.HTML).build());
             start = end;
         }
     }
@@ -683,7 +683,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         } catch (Exception e) {
             System.err.println("sendDocument failed: " + e.getMessage());
             // Surface the real error to the user
-            try { sendText(chatId, "Couldn't send file \"" + filename + "\": " + e.getMessage()); }
+            try { sendText(chatId, "Couldn't send file \"" + esc(filename) + "\": " + esc(e.getMessage())); }
             catch (Exception ignored) {}
             // Re-throw so the tool reports failure to Claude instead of saying "sent"
             throw new RuntimeException("File send failed: " + e.getMessage(), e);
@@ -699,6 +699,11 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
     private String dot(Task t) {
         return switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; };
+    }
+
+    static String esc(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 
     // ── Group chat inbox (forwarded media) ─────────────────────────────────
@@ -761,8 +766,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                         title, pri, "inbox", dueAt, Task.Recurrence.NONE, classified.body());
                 Task task = taskService.createTask(userId, chatId, req);
                 autoSyncNewTaskToGoogle(task);
-                sendText(chatId, "✅ " + task.getTitle()
-                        + (task.getDueAt() != null ? "\n📅 " + taskService.friendlyDate(task.getDueAt()) : ""));
+                sendText(chatId, "✅ " + esc(task.getTitle()));
                 return;
             }
         }
@@ -772,7 +776,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             try {
                 String noteTitle = extracted.length() > 80 ? extracted.substring(0, 80) + "..." : extracted;
                 notionService.saveNote(noteTitle, "inbox", List.of("inbox"), extracted, null, "group-inbox");
-                sendText(chatId, "📝 " + noteTitle);
+                sendText(chatId, "📝 " + esc(noteTitle));
             } catch (Exception e) {
                 sendText(chatId, "📝 Couldn't save note: " + e.getMessage());
             }
@@ -783,7 +787,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                     title, Task.Priority.MEDIUM, "inbox", null, Task.Recurrence.NONE, null);
             Task task = taskService.createTask(userId, chatId, req);
             autoSyncNewTaskToGoogle(task);
-            sendText(chatId, "✅ " + title);
+            sendText(chatId, "✅ " + esc(title));
         }
     }
 
@@ -808,8 +812,8 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private void handleCountdowns(long chatId, long userId) {
         if (countdownService == null) { sendText(chatId, "Countdown service not available."); return; }
         var list = countdownService.getCountdowns(userId);
-        if (list.isEmpty()) { sendText(chatId, "No countdowns set.\n\nUse: /countdown <name> <date>"); return; }
-        StringBuilder sb = new StringBuilder("⏳ Countdowns\n─────────────────\n");
+        if (list.isEmpty()) { sendText(chatId, "No countdowns set.\n\nUse: /countdown &lt;name&gt; &lt;date&gt;"); return; }
+        StringBuilder sb = new StringBuilder("<b>⏳ Countdowns</b>\n─────────────────\n");
         list.forEach(c -> sb.append(countdownService.formatCountdown(c)).append("\n"));
         sendText(chatId, sb.toString().trim());
     }
@@ -818,14 +822,14 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         if (countdownService == null) { sendText(chatId, "Countdown service not available."); return; }
         // Parse: name date (e.g., "birthday 2026-05-15")
         int lastSpace = args.lastIndexOf(' ');
-        if (lastSpace <= 0) { sendText(chatId, "Usage: /countdown <name> <date>\nExample: /countdown birthday 2026-05-15"); return; }
+        if (lastSpace <= 0) { sendText(chatId, "Usage: /countdown &lt;name&gt; &lt;date&gt;\nExample: /countdown birthday 2026-05-15"); return; }
         String name = args.substring(0, lastSpace).trim();
         String dateStr = args.substring(lastSpace + 1).trim();
         try {
             java.time.LocalDate target = java.time.LocalDate.parse(dateStr);
             countdownService.addCountdown(userId, name, target);
             long days = java.time.temporal.ChronoUnit.DAYS.between(java.time.LocalDate.now(countdownService.getZoneId()), target);
-            sendText(chatId, "⏳ Countdown set: " + name + " — " + days + " days away!");
+            sendText(chatId, "⏳ Countdown set: <b>" + esc(name) + "</b> — " + days + " days away!");
         } catch (Exception e) {
             sendText(chatId, "Invalid date format. Use yyyy-MM-dd (e.g., 2026-05-15)");
         }
@@ -834,8 +838,8 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private void handleGoals(long chatId, long userId) {
         if (goalService == null) { sendText(chatId, "Goal tracking not available."); return; }
         var goals = goalService.getActiveGoals(userId);
-        if (goals.isEmpty()) { sendText(chatId, "No active goals.\n\nUse: /goal <title> [by <date>]"); return; }
-        StringBuilder sb = new StringBuilder("🎯 Active Goals\n─────────────────\n");
+        if (goals.isEmpty()) { sendText(chatId, "No active goals.\n\nUse: /goal &lt;title&gt; [by &lt;date&gt;]"); return; }
+        StringBuilder sb = new StringBuilder("<b>🎯 Active Goals</b>\n─────────────────\n");
         goals.forEach(g -> sb.append(goalService.formatGoal(g)).append("\n\n"));
         sendText(chatId, sb.toString().trim());
     }
@@ -852,7 +856,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             try { targetDate = java.time.LocalDate.parse(dateStr); } catch (Exception ignored) {}
         }
         goalService.createGoal(userId, title, targetDate);
-        sendText(chatId, "🎯 Goal created: " + title
+        sendText(chatId, "🎯 Goal created: " + esc(title)
                 + (targetDate != null ? "\n📅 Target: " + targetDate : ""));
     }
 
@@ -865,8 +869,8 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             String taskHint = parts[1].trim();
             taskService.findTaskByTitleHint(userId, taskHint).ifPresentOrElse(task -> {
                 goalService.linkTask(goalId, task.getId());
-                sendText(chatId, "🔗 Linked \"" + task.getTitle() + "\" to goal #" + goalId);
-            }, () -> sendText(chatId, "Task not found: " + taskHint));
+                sendText(chatId, "🔗 Linked \"" + esc(task.getTitle()) + "\" to goal #" + goalId);
+            }, () -> sendText(chatId, "Task not found: " + esc(taskHint)));
         } catch (NumberFormatException e) {
             sendText(chatId, "First argument must be a goal number. Use /goals to see IDs.");
         }

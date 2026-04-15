@@ -235,7 +235,7 @@ public class GoalService {
 
     public String formatGoal(Goal goal) {
         StringBuilder sb = new StringBuilder();
-        sb.append("\uD83C\uDFAF ").append(goal.title());
+        sb.append("🎯 <b>").append(TaskService.esc(goal.title())).append("</b>");
 
         // Days until target
         if (goal.targetDate() != null) {

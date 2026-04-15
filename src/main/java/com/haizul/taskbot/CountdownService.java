@@ -101,12 +101,13 @@ public class CountdownService {
     }
 
     public String formatCountdown(Countdown c) {
+        String name = TaskService.esc(c.name());
         if (c.daysRemaining() > 0) {
-            return "⏳ " + c.name() + " — " + c.daysRemaining() + " days to go";
+            return "⏳ <b>" + name + "</b> — " + c.daysRemaining() + " days to go";
         } else if (c.daysRemaining() == 0) {
-            return "🎉 " + c.name() + " — TODAY!";
+            return "🎉 <b>" + name + "</b> — TODAY!";
         } else {
-            return "✅ " + c.name() + " — completed " + Math.abs(c.daysRemaining()) + " days ago";
+            return "✅ <b>" + name + "</b> — completed " + Math.abs(c.daysRemaining()) + " days ago";
         }
     }
 }

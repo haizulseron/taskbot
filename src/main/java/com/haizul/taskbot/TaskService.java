@@ -537,6 +537,12 @@ public class TaskService {
 
     // ── Formatting ───────────────────────────────────────────────────────────
 
+    public static String esc(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    /** Plain-text single task (used by ClaudeService tool results for Claude's analysis). */
     public String formatTask(Task task) {
         String dot  = switch (task.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; };
         String cat  = "none".equals(task.getCategory()) ? "" : "  📁 " + task.getCategory();
@@ -550,6 +556,63 @@ public class TaskService {
                 + "\n" + cat + due + rec + interval + habit + location
                 + notes
                 + "\nID: " + task.shortId();
+    }
+
+    /** HTML single task detail (used in /edittasks with action buttons). */
+    public String formatTaskHtml(Task task) {
+        String dot  = dot(task);
+        String cat  = "none".equals(task.getCategory()) ? "" : "  📁 " + esc(task.getCategory());
+        String due  = task.getDueAt() == null ? "" : "  📅 " + friendlyDate(task.getDueAt());
+        String rec  = task.getRecurrence() == Task.Recurrence.NONE ? "" : "  🔁 " + capitalize(task.getRecurrence().name());
+        String notes = task.getNotes() != null ? "\n📝 " + esc(task.getNotes()) : "";
+        String interval = task.getReminderIntervalMinutes() != null ? "  ⏱ every " + task.getReminderIntervalMinutes() + "min" : "";
+        String habit = task.isHabit() ? "  🔄" : "";
+        String location = task.hasLocationReminder() ? "  📍" : "";
+        return dot + " <b>" + esc(task.getTitle()) + "</b>"
+                + "\n" + cat + due + rec + interval + habit + location
+                + notes
+                + "\n<code>" + task.shortId() + "</code>";
+    }
+
+    /**
+     * Compact HTML task list — one line per task.
+     * Format: 🔴 <b>Title</b>  📅 Due
+     */
+    public String formatTaskListHtml(String title, List<Task> tasks) {
+        if (tasks.isEmpty()) return title + "\n\nNo tasks found.";
+
+        List<Task> main  = tasks.stream().filter(t -> t.getPriority() != Task.Priority.DAILY).toList();
+        List<Task> daily = tasks.stream().filter(t -> t.getPriority() == Task.Priority.DAILY).toList();
+
+        long high = main.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
+        long med  = main.stream().filter(t -> t.getPriority() == Task.Priority.MEDIUM).count();
+        long low  = main.stream().filter(t -> t.getPriority() == Task.Priority.LOW).count();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("<b>").append(esc(title)).append("</b>  (").append(tasks.size()).append(")\n");
+        if (high > 0) sb.append("🔴 ").append(high).append("  ");
+        if (med  > 0) sb.append("🟡 ").append(med).append("  ");
+        if (low  > 0) sb.append("🟢 ").append(low);
+        if (!daily.isEmpty()) sb.append("  🔵 ").append(daily.size());
+        sb.append("\n─────────────────\n");
+
+        for (Task t : main) {
+            sb.append(dot(t)).append(" <b>").append(esc(t.getTitle())).append("</b>");
+            if (t.getDueAt() != null) sb.append("  📅 ").append(friendlyDate(t.getDueAt()));
+            if (t.isHabit()) sb.append("  🔄");
+            sb.append("\n");
+        }
+
+        if (!daily.isEmpty()) {
+            sb.append("─────────────────\n");
+            for (Task t : daily) {
+                sb.append("🔵 <b>").append(esc(t.getTitle())).append("</b>");
+                if (t.getDueAt() != null) sb.append("  📅 ").append(friendlyDate(t.getDueAt()));
+                sb.append("\n");
+            }
+        }
+
+        return sb.toString().trim();
     }
 
     public String friendlyDate(LocalDateTime dt) {
@@ -585,34 +648,34 @@ public class TaskService {
                 .collect(Collectors.groupingBy(t -> t.getCategory() == null ? "none" : t.getCategory(), Collectors.counting()));
         StringBuilder catBreakdown = new StringBuilder();
         byCategory.entrySet().stream().sorted(Map.Entry.<String, Long>comparingByValue().reversed())
-                .forEach(e -> catBreakdown.append("  📁 ").append(e.getKey()).append(": ").append(e.getValue()).append("\n"));
+                .forEach(e -> catBreakdown.append("  📁 ").append(esc(e.getKey())).append(": ").append(e.getValue()).append("\n"));
 
         // Habit streaks
         List<Task> habits = getHabits(userId);
         StringBuilder habitSection = new StringBuilder();
         if (!habits.isEmpty()) {
-            habitSection.append("─────────────────\n🔄 Habits:\n");
+            habitSection.append("─────────────────\n<b>🔄 Habits:</b>\n");
             habits.forEach(h -> {
                 int streak = getHabitStreak(h.getId());
-                habitSection.append("  ").append(h.getTitle()).append(": ").append(streak).append(" day streak\n");
+                habitSection.append("  ").append(esc(h.getTitle())).append(": <b>").append(streak).append("</b> day streak\n");
             });
         }
 
-        return "📊 Review\n"
+        return "<b>📊 Review</b>\n"
                 + "─────────────────\n"
-                + "Active:     " + active.size() + " task(s)\n"
+                + "Active:     <b>" + active.size() + "</b> task(s)\n"
                 + "  🔴 High   " + high + "\n"
                 + "  🟡 Medium " + med + "\n"
                 + "  🟢 Low    " + low + "\n"
                 + "  🔵 Daily  " + daily + "\n"
                 + "─────────────────\n"
-                + "📅 Due today:  " + today.size() + "\n"
-                + "⚠️ Overdue:   " + overdue.size() + "\n"
+                + "📅 Due today:  <b>" + today.size() + "</b>\n"
+                + "⚠️ Overdue:   <b>" + overdue.size() + "</b>\n"
                 + "🧊 Stale:     " + stale.size() + "\n"
                 + "✅ Done:      " + done.size() + "\n"
                 + "─────────────────\n"
-                + "📈 This week: " + score + " completion rate\n"
-                + (catBreakdown.length() > 0 ? "─────────────────\nBy category:\n" + catBreakdown : "")
+                + "📈 This week: <b>" + score + "</b> completion rate\n"
+                + (catBreakdown.length() > 0 ? "─────────────────\n<b>By category:</b>\n" + catBreakdown : "")
                 + habitSection;
     }
 
@@ -621,18 +684,18 @@ public class TaskService {
         List<Task> overdue = getOverdueTasks(userId);
         List<Task> stale   = getStaleTasks(userId);
         StringBuilder sb = new StringBuilder();
-        sb.append("☀️ Good morning! Here's your day:\n─────────────────\n")
-          .append("📅 Due today: ").append(today.size()).append("\n")
-          .append("⚠️ Overdue:  ").append(overdue.size()).append("\n")
-          .append("🧊 Stale:    ").append(stale.size()).append("\n");
+        sb.append("<b>☀️ Good morning!</b>\n─────────────────\n")
+          .append("📅 Due today: <b>").append(today.size()).append("</b>\n")
+          .append("⚠️ Overdue:  <b>").append(overdue.size()).append("</b>\n")
+          .append("🧊 Stale:    <b>").append(stale.size()).append("</b>\n");
         if (!today.isEmpty()) {
-            sb.append("\nDue today:\n");
-            today.forEach(t -> sb.append("  ").append(dot(t)).append(" ").append(t.getTitle())
-                    .append(t.getDueAt() != null ? " @ " + t.getDueAt().format(TIME_FMT) : "").append("\n"));
+            sb.append("\n<b>Due today:</b>\n");
+            today.forEach(t -> sb.append("  ").append(dot(t)).append(" <b>").append(esc(t.getTitle())).append("</b>")
+                    .append(t.getDueAt() != null ? "  " + t.getDueAt().format(TIME_FMT) : "").append("\n"));
         }
         if (!overdue.isEmpty()) {
-            sb.append("\nOverdue:\n");
-            overdue.forEach(t -> sb.append("  ").append(dot(t)).append(" ").append(t.getTitle()).append("\n"));
+            sb.append("\n<b>Overdue:</b>\n");
+            overdue.forEach(t -> sb.append("  ").append(dot(t)).append(" <b>").append(esc(t.getTitle())).append("</b>\n"));
         }
         return sb.toString().trim();
     }
@@ -647,33 +710,32 @@ public class TaskService {
         String score = total > 0 ? Math.round((done.size() * 100.0) / total) + "%" : "N/A";
 
         StringBuilder sb = new StringBuilder();
-        sb.append("📆 Weekly Digest\n─────────────────\n")
-          .append("✅ Completed this week: ").append(done.size()).append("\n")
-          .append("📋 Still active:        ").append(active.size()).append("\n")
-          .append("⚠️ Overdue:             ").append(overdue.size()).append("\n")
-          .append("📈 Completion rate:     ").append(score).append("\n");
+        sb.append("<b>📆 Weekly Digest</b>\n─────────────────\n")
+          .append("✅ Completed: <b>").append(done.size()).append("</b>\n")
+          .append("📋 Active:    <b>").append(active.size()).append("</b>\n")
+          .append("⚠️ Overdue:   <b>").append(overdue.size()).append("</b>\n")
+          .append("📈 Rate:      <b>").append(score).append("</b>\n");
 
         if (!done.isEmpty()) {
-            sb.append("\nCompleted:\n");
-            done.stream().limit(10).forEach(t -> sb.append("  ✅ ").append(t.getTitle()).append("\n"));
-            if (done.size() > 10) sb.append("  ... and ").append(done.size() - 10).append(" more\n");
+            sb.append("\n<b>Completed:</b>\n");
+            done.stream().limit(10).forEach(t -> sb.append("  ✅ ").append(esc(t.getTitle())).append("\n"));
+            if (done.size() > 10) sb.append("  … and ").append(done.size() - 10).append(" more\n");
         }
         return sb.toString().trim();
     }
 
-    private String dot(Task t) { return switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; }; }
+    public String dot(Task t) { return switch (t.getPriority()) { case HIGH -> "🔴"; case MEDIUM -> "🟡"; case LOW -> "🟢"; case DAILY -> "🔵"; }; }
 
     public static String usageText() {
         return """
-                Available commands:
+                <b>Available commands:</b>
                 /start · /help · /add · /tasks · /today
                 /overdue · /stale · /doneitems · /cleardone
-                /review · /habits · /categories · /addcategory <n>
-                /done <id> · /delete <id> · /snooze <id> <h>
-                /search <query> · /templates · /cancel
-                /recentnotes — see your last 5 saved notes
+                /review · /habits · /categories · /addcategory
+                /done · /delete · /snooze · /search · /templates
+                /recentnotes · /cancel
 
-                💡 Or just talk naturally:
+                💡 <b>Or just talk naturally:</b>
                 "show my high priority school tasks"
                 "move gym to tomorrow 9am"
                 "remind me about report every 30 minutes"
@@ -681,7 +743,6 @@ public class TaskService {
                 "mark gym as a habit"
                 "start a 25 min focus session for CEE report"
                 "change gym task to high priority"
-                "send me my location for the lab task reminder"
                 "save gym as a template called workout"
                 "undo"
                 """;

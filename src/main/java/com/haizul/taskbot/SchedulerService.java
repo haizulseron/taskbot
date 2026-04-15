@@ -118,8 +118,8 @@ public class SchedulerService {
             } catch (Exception ignored) {}
         }
 
-        String baseText = prefix + "\n\n" + taskService.formatTask(task);
-        return contextualMsg != null ? baseText + "\n\n💬 " + contextualMsg : baseText;
+        String baseText = prefix + "\n\n" + taskService.formatTaskHtml(task);
+        return contextualMsg != null ? baseText + "\n\n💬 " + TaskService.esc(contextualMsg) : baseText;
     }
 
     // ── Focus sessions ───────────────────────────────────────────────────────
@@ -130,8 +130,8 @@ public class SchedulerService {
             UserSettings settings = taskService.getUserSettings(session.getUserId());
             if (settings.getPomodoroState() != null && settings.getPomodoroState().startsWith("POMODORO:")) continue;
 
-            String msg = "🎯 Focus session complete!\n\n"
-                    + "You focused on: " + session.getTaskTitle() + "\n"
+            String msg = "🎯 <b>Focus session complete!</b>\n\n"
+                    + "You focused on: <b>" + TaskService.esc(session.getTaskTitle()) + "</b>\n"
                     + "Duration: " + session.getDurationMinutes() + " minutes\n\n"
                     + "Great work! Take a short break. 🌿";
             taskBot.sendText(session.getChatId(), msg);
@@ -147,8 +147,8 @@ public class SchedulerService {
             UserSettings settings = taskService.getUserSettings(task.getUserId());
             if (settings.isQuietHour(now)) continue;
             taskBot.sendText(task.getChatId(),
-                    "🧊 Stale task:\n\n" + taskService.formatTask(task)
-                    + "\n\nUse /done " + task.shortId() + " or /delete " + task.shortId());
+                    "🧊 <b>Stale task:</b>\n\n" + taskService.formatTaskHtml(task)
+                    + "\n\nUse <code>/done " + task.shortId() + "</code> or <code>/delete " + task.shortId() + "</code>");
             taskService.markStalePinged(task.getId());
         }
     }
@@ -245,8 +245,8 @@ public class SchedulerService {
                 if (phase.equals("work")) {
                     if (currentRound >= totalRounds) {
                         // All rounds done!
-                        taskBot.sendText(uc.chatId(), "🍅 Pomodoro complete!\n\n"
-                                + "You finished all " + totalRounds + " rounds for: " + taskTitle + "\n\n"
+                        taskBot.sendText(uc.chatId(), "🍅 <b>Pomodoro complete!</b>\n\n"
+                                + "You finished all " + totalRounds + " rounds for: <b>" + TaskService.esc(taskTitle) + "</b>\n\n"
                                 + "Excellent work! Take a proper break. 🎉");
                         taskService.saveUserSettings(uc.userId(), settings.getQuietStart(), settings.getQuietEnd(), null);
                     } else {
@@ -301,7 +301,7 @@ public class SchedulerService {
         StringBuilder sb = new StringBuilder();
 
         // 1. Greeting
-        sb.append("☀️ Good morning! Today is ")
+        sb.append("<b>☀️ Good morning!</b> ")
           .append(today.format(java.time.format.DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy")))
           .append("\n\n");
 
@@ -314,13 +314,14 @@ public class SchedulerService {
             }
         }
 
-        // 3. Calendar events
+        // 3. Calendar events — compact one-line format
         if (googleCalendarService != null) {
             try {
                 var events = googleCalendarService.getTodayEvents();
                 if (!events.isEmpty()) {
-                    sb.append("📅 Today's Calendar\n");
-                    events.forEach(e -> sb.append("  • ").append(e.startDate()).append(" — ").append(e.title()).append("\n"));
+                    sb.append("<b>📅 Calendar</b>\n");
+                    events.forEach(e -> sb.append("📅 ").append(TaskService.esc(e.startDate()))
+                            .append("  <b>").append(TaskService.esc(e.title())).append("</b>\n"));
                     sb.append("\n");
                 }
             } catch (Exception ignored) {}
@@ -329,43 +330,44 @@ public class SchedulerService {
         // 4. Overdue tasks (max 3)
         var overdue = taskService.getOverdueTasks(userId);
         if (!overdue.isEmpty()) {
-            sb.append("❗ Overdue\n");
+            sb.append("<b>❗ Overdue</b>\n");
             overdue.stream().limit(3).forEach(t ->
-                sb.append("  • ").append(t.getTitle())
-                  .append(t.getDueAt() != null ? " (due " + taskService.friendlyDate(t.getDueAt()) + ")" : "")
+                sb.append("  🔴 <b>").append(TaskService.esc(t.getTitle())).append("</b>")
+                  .append(t.getDueAt() != null ? "  📅 " + taskService.friendlyDate(t.getDueAt()) : "")
                   .append("\n"));
-            if (overdue.size() > 3) sb.append("  ... and ").append(overdue.size() - 3).append(" more\n");
+            if (overdue.size() > 3) sb.append("  … and ").append(overdue.size() - 3).append(" more\n");
             sb.append("\n");
         }
 
         // 5. Today's tasks
         var todayTasks = taskService.getTodayTasks(userId);
         if (!todayTasks.isEmpty()) {
-            sb.append("📋 Due Today\n");
-            todayTasks.forEach(t -> sb.append("  • ").append(t.getTitle()).append("\n"));
+            sb.append("<b>📋 Due Today</b>\n");
+            todayTasks.forEach(t -> sb.append("  ").append(taskService.dot(t))
+                    .append(" <b>").append(TaskService.esc(t.getTitle())).append("</b>\n"));
             sb.append("\n");
         }
 
         // 6. Habits with streaks
         var habits = taskService.getHabits(userId);
         if (!habits.isEmpty()) {
-            sb.append("🔄 Habits\n");
-            habits.forEach(h -> sb.append("  • ").append(h.getTitle())
-                    .append(" — 🔥 ").append(taskService.getHabitStreak(h.getId())).append(" day streak\n"));
+            sb.append("<b>🔄 Habits</b>\n");
+            habits.forEach(h -> sb.append("  🔵 <b>").append(TaskService.esc(h.getTitle()))
+                    .append("</b> — 🔥 ").append(taskService.getHabitStreak(h.getId())).append("\n"));
             sb.append("\n");
         }
 
         // 7. Mood trend
         if (moodService != null) {
             String moodNote = moodService.getMoodTrendNote(userId);
-            if (moodNote != null) sb.append(moodNote).append("\n\n");
+            if (moodNote != null) sb.append(TaskService.esc(moodNote)).append("\n\n");
         }
 
         // 8. Quick summary
         var active = taskService.getActiveTasks(userId);
         long high = active.stream().filter(t -> t.getPriority() == Task.Priority.HIGH).count();
-        sb.append("📊 ").append(active.size()).append(" active tasks");
-        if (high > 0) sb.append(" (").append(high).append(" high priority)");
+        sb.append("📊 <b>").append(active.size()).append("</b> active tasks");
+        if (high > 0) sb.append(" (<b>").append(high).append("</b> high priority)");
         sb.append("\n");
 
         return sb.toString().trim();
@@ -413,7 +415,7 @@ public class SchedulerService {
                     taskService.findByGoogleTaskId(uc.userId(), item.taskId()).ifPresent(task -> {
                         if (task.getStatus() == Task.Status.ACTIVE) {
                             taskService.markDone(uc.userId(), task.shortId());
-                            taskBot.sendText(uc.chatId(), "✅ \"" + task.getTitle() + "\" completed in Google Tasks.");
+                            taskBot.sendText(uc.chatId(), "✅ \"" + TaskService.esc(task.getTitle()) + "\" completed in Google Tasks.");
                         }
                     });
                 }
@@ -444,7 +446,7 @@ public class SchedulerService {
                             }
                             if (changed) {
                                 String displayTitle = item.title() != null ? item.title() : oldTitle;
-                                taskBot.sendText(uc.chatId(), "🔄 \"" + displayTitle + "\" updated from Google Tasks.");
+                                taskBot.sendText(uc.chatId(), "🔄 \"" + TaskService.esc(displayTitle) + "\" updated from Google Tasks.");
                             }
                         });
                     }
