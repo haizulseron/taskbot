@@ -20,8 +20,8 @@ application-local.properties
 src/main/resources/application.properties
 src/main/resources/application-local.properties
 supervisor/taskbot.local.conf
-/home/telegrambot/projects/taskbot/credentials
-/home/telegrambot/projects/taskbot/data/google_tokens
+credentials/
+data/google_tokens/
 
 # Database
 *.db
