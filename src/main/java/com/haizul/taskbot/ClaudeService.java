@@ -569,7 +569,8 @@ public class ClaudeService {
                 case "read_emails" -> {
                     if (gmailService == null) yield "Gmail not connected. Send /authorize to link your Google account.";
                     int count = intVal(input, "count", 5);
-                    List<GmailService.EmailSummary> emails = gmailService.getInbox(count);
+                    String query = str(input, "query");
+                    List<GmailService.EmailSummary> emails = gmailService.getInbox(count, query);
                     if (emails.isEmpty()) yield "No emails in inbox.";
                     StringBuilder sb = new StringBuilder("📧 Inbox (" + emails.size() + ")\n─────────────────\n\n");
                     for (int i = 0; i < emails.size(); i++) {
@@ -949,9 +950,10 @@ public class ClaudeService {
         ));
 
         // ── Email tools ─────────────────────────────────────────────────────────
-        tools.add(tool("read_emails", "List recent emails from Gmail inbox — shows subject, sender, snippet and ID only",
+        tools.add(tool("read_emails", "List recent emails from ALL Gmail folders (inbox, spam, trash, promotions, social) — shows subject, sender, snippet and ID",
                 props()
                     .opt("count", "integer", "Number of emails to fetch (default: 5, max: 10)")
+                    .opt("query", "string", "Gmail search query to filter (e.g. 'in:inbox', 'from:someone@gmail.com', 'is:unread', 'in:spam'). Omit for all recent emails.")
         ));
 
         tools.add(tool("read_email", "Read the full body of a specific email by message ID",

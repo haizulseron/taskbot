@@ -44,12 +44,13 @@ Haizul Ali Seron""";
 
     // ── Read inbox ─────────────────────────────────────────────────────────────
 
-    public List<EmailSummary> getInbox(int count) throws Exception {
-        ListMessagesResponse response = gmail.users().messages()
+    public List<EmailSummary> getInbox(int count, String query) throws Exception {
+        var req = gmail.users().messages()
                 .list("me")
                 .setMaxResults((long) Math.min(count, 10))
-                .setQ("in:inbox -category:promotions -category:social")
-                .execute();
+                .setIncludeSpamTrash(true);
+        if (query != null && !query.isBlank()) req.setQ(query);
+        ListMessagesResponse response = req.execute();
 
         List<EmailSummary> emails = new ArrayList<>();
         if (response.getMessages() == null) return emails;

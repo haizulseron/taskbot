@@ -624,6 +624,7 @@ public class TaskService {
         for (Task t : main) {
             sb.append(dot(t)).append(" <b>").append(esc(t.getTitle())).append("</b>");
             if (t.getDueAt() != null) sb.append("  📅 ").append(friendlyDate(t.getDueAt()));
+            if (t.getCategory() != null && !"none".equals(t.getCategory())) sb.append("  [").append(esc(t.getCategory())).append("]");
             if (t.isHabit()) sb.append("  🔄");
             sb.append("\n");
         }
@@ -633,6 +634,7 @@ public class TaskService {
             for (Task t : daily) {
                 sb.append("🔵 <b>").append(esc(t.getTitle())).append("</b>");
                 if (t.getDueAt() != null) sb.append("  📅 ").append(friendlyDate(t.getDueAt()));
+                if (t.getCategory() != null && !"none".equals(t.getCategory()) && !"daily".equals(t.getCategory())) sb.append("  [").append(esc(t.getCategory())).append("]");
                 sb.append("\n");
             }
         }
