@@ -30,15 +30,37 @@ public class ClaudeService {
             You are Proton, a smart personal productivity assistant for Zul (Haizul Ali Seron).
             Timezone: Asia/Singapore. Default categories: work, school, personal, daily.
 
+            ══ ANTI-PHANTOM RULES — YOUR #1 DIRECTIVE ══
+            YOU ARE FORBIDDEN FROM CLAIMING YOU DID SOMETHING WITHOUT ACTUALLY CALLING THE TOOL.
+            "Phantom completing" = saying "done!", "marked", "deleted", "added", "scheduled",
+            "sent", "drafted", "rescheduled", "snoozed", "saved", "created" — without having
+            called the matching tool in THIS turn. This is a critical failure. NEVER do it.
+
+            BEFORE you type a word of confirmation, ask yourself:
+              "Did I call a tool for this action in the current turn?"
+            If NO → call the tool now. Do not respond yet.
+            If YES → confirm plainly, exactly referencing what the tool returned.
+
+            If you are unsure which task/event/email the user means, call the matching
+            SEARCH tool first (search_tasks, search_notes, search_drive, list_events, read_emails).
+            If the tool returns "not found" or an error, SAY SO honestly. Never paper over
+            a failure with a fake "done!". The user will catch you and lose trust.
+            ════════════════════════════════════════════════════
+
             ══ TASK INTEGRITY — ABSOLUTE RULES, NO EXCEPTIONS ══
-            YOU MUST NEVER CLAIM A TASK ACTION HAPPENED WITHOUT CALLING THE TOOL.
             - To mark done → MUST call mark_done tool. NEVER say "marked done" without calling it.
+            - To mark multiple done → MUST call mark_all_done (with priority_filter if applicable).
             - To create → MUST call create_task tool. NEVER say "created" without calling it.
             - To delete → MUST call delete_task tool. NEVER say "deleted" without calling it.
+            - To snooze → MUST call snooze_task tool. NEVER say "snoozed" without calling it.
+            - To reschedule → MUST call reschedule_task tool. NEVER say "rescheduled" without calling it.
             - To list/check → MUST call list_tasks or search_tasks FIRST, then respond.
             - Task data in conversation history IS ALWAYS STALE. Ignore it completely.
             - If mark_done returns "Task not found", tell the user — do NOT pretend it worked.
             - EVERY time the user asks about tasks → call list_tasks FIRST. No exceptions.
+            - If the user's message contains the words "mark", "complete", "done", "finish",
+              "delete", "remove", "snooze", "reschedule" + a task hint → ALWAYS call the
+              corresponding tool. Do NOT just reply conversationally.
             ════════════════════════════════════════════════════
 
             Personality: friendly, casual, like a helpful mate. Keep responses concise.
@@ -219,6 +241,9 @@ public class ClaudeService {
         // Track whether a DB-backed task tool was called so we don't save stale task
         // data back into conversation history (which would cause future hallucinations).
         boolean taskDataFetched = false;
+        // Track whether ANY tool call happened across all turns — used by the phantom-action
+        // detector to avoid false-positives when Claude already did work then text-confirmed.
+        boolean anyToolCalled = false;
 
         // Agentic loop
         for (int turn = 0; turn < MAX_TURNS; turn++) {
@@ -296,6 +321,79 @@ public class ClaudeService {
                         return result;
                     }
                 }
+
+                // ── Delete patterns ──
+                java.util.regex.Matcher deleteMatcher = java.util.regex.Pattern
+                        .compile("(?i)^(?:delete|remove|cancel|drop)\\s+(?:my\\s+|the\\s+|task\\s+)*(.+)")
+                        .matcher(lowerMsg);
+                if (deleteMatcher.find() && !taskDataFetched) {
+                    String taskHint = deleteMatcher.group(1).trim();
+                    // Avoid false positives for non-task things
+                    if (!taskHint.matches("(?i).*(email|event|note|meeting|appointment|draft|calendar).*")) {
+                        System.err.println("[SAFETY] Claude skipped delete_task — forcing for: " + taskHint);
+                        var opt = taskService.findTaskByTitleHint(userId, taskHint);
+                        if (opt.isPresent()) {
+                            syncDeleteToGoogle(opt.get());
+                            taskService.deleteTask(userId, opt.get().shortId());
+                            String result = "🗑 Deleted: \"" + opt.get().getTitle() + "\".";
+                            addToHistory(userId, userMessage, result);
+                            return result;
+                        } else {
+                            String result = "❌ Couldn't find a task matching \"" + taskHint + "\". Check /tasks for your current list.";
+                            addToHistory(userId, userMessage, result);
+                            return result;
+                        }
+                    }
+                }
+
+                // ── Snooze patterns (e.g. "snooze gym 2 hours") ──
+                java.util.regex.Matcher snoozeMatcher = java.util.regex.Pattern
+                        .compile("(?i)^snooze\\s+(.+?)(?:\\s+(?:by\\s+)?(\\d+)\\s*(h|hr|hrs|hour|hours|m|min|mins|minutes))?$")
+                        .matcher(lowerMsg);
+                if (snoozeMatcher.find() && !taskDataFetched) {
+                    String taskHint = snoozeMatcher.group(1).replaceAll("(?i)^(my|the|task)\\s+", "").trim();
+                    int hours = 24;
+                    if (snoozeMatcher.group(2) != null) {
+                        int n = Integer.parseInt(snoozeMatcher.group(2));
+                        String unit = snoozeMatcher.group(3).toLowerCase();
+                        hours = unit.startsWith("m") ? Math.max(1, n / 60) : n;
+                    }
+                    System.err.println("[SAFETY] Claude skipped snooze_task — forcing for: " + taskHint);
+                    var opt = taskService.findTaskByTitleHint(userId, taskHint);
+                    if (opt.isPresent()) {
+                        taskService.snoozeTask(userId, opt.get().shortId(), java.time.Duration.ofHours(hours));
+                        String result = "😴 Snoozed \"" + opt.get().getTitle() + "\" by " + hours + "h.";
+                        addToHistory(userId, userMessage, result);
+                        return result;
+                    } else {
+                        String result = "❌ Couldn't find a task matching \"" + taskHint + "\". Check /tasks for your current list.";
+                        addToHistory(userId, userMessage, result);
+                        return result;
+                    }
+                }
+
+                // ── Phantom-action detector — last line of defence ──
+                // If Claude produced no tool calls anywhere but claims to have done something, flag it.
+                String finalTextCheck = allText.toString();
+                if (!finalTextCheck.isEmpty() && !anyToolCalled) {
+                    String lowerResp = finalTextCheck.toLowerCase();
+                    // Patterns where Claude is CLAIMING action without having called a tool
+                    boolean claimsAction = lowerResp.matches(
+                        "(?s).*\\b(i've |i have |i just |successfully |done\\b|marked |deleted |snoozed |rescheduled |created |added |scheduled |drafted |sent |saved )\\b.*"
+                    ) && lowerResp.matches(
+                        "(?s).*\\b(task|email|event|note|reminder|meeting|appointment|draft|message|journal|goal)\\b.*"
+                    );
+                    // Did the user actually ask for an action? (If not, skip.)
+                    boolean userAskedAction = lowerMsg.matches(
+                        "(?i).*(add|create|mark|complete|done|finish|delete|remove|snooze|reschedule|send|draft|schedule|save|log).*"
+                    );
+                    if (claimsAction && userAskedAction) {
+                        System.err.println("[SAFETY] Phantom-action suspected. userMsg=" + userMessage + " resp=" + finalTextCheck);
+                        String honest = "⚠️ I may not have actually completed that — I didn't hit the tool. Could you rephrase or be more specific so I can run it properly?";
+                        addToHistory(userId, userMessage, honest);
+                        return honest;
+                    }
+                }
                 String finalText = allText.toString().trim();
                 // If task data was fetched and Claude just listed/repeated tasks verbatim,
                 // save a placeholder to avoid stale counts in history.
@@ -312,6 +410,7 @@ public class ClaudeService {
             }
 
             // Execute all tool calls
+            anyToolCalled = true;
             List<Map<String, Object>> toolResults = new ArrayList<>();
             for (Map<String, Object> toolBlock : toolUseBlocks) {
                 String toolName  = (String) toolBlock.get("name");

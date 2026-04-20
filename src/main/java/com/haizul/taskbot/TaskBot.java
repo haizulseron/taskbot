@@ -795,41 +795,66 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
         if (content == null || content.isBlank()) return; // silently ignore unreadable content
 
-        // Use Claude to decide: task or note?
+        // Classify in priority order: Calendar → Task → Note.
         final String extracted = content;
-        if (inboxService != null) {
-            InboxService.ClassifiedContent classified = inboxService.classifyContent(extracted);
-            if (classified != null && "TASK".equalsIgnoreCase(classified.category())) {
-                // It's actionable — create a task
-                Task.Priority pri = classified.priority() != null
-                        ? Task.Priority.fromText(classified.priority()) : Task.Priority.MEDIUM;
-                java.time.LocalDateTime dueAt = null;
-                if (classified.dueDate() != null && !classified.dueDate().isBlank()) {
-                    try { dueAt = java.time.LocalDate.parse(classified.dueDate()).atTime(9, 0); }
-                    catch (Exception ignored) {}
-                }
+        InboxService.ClassifiedContent classified = (inboxService != null)
+                ? inboxService.classifyContent(extracted) : null;
+        String category = classified != null ? classified.category() : null;
+
+        // 1) CALENDAR — has an explicit event time.
+        if ("CALENDAR".equalsIgnoreCase(category) && classified.startDatetime() != null
+                && !classified.startDatetime().isBlank() && calendarService != null) {
+            try {
                 String title = classified.title() != null ? classified.title() : extracted;
                 if (title.length() > 100) title = title.substring(0, 100);
-                TaskService.AddTaskRequest req = new TaskService.AddTaskRequest(
-                        title, pri, "inbox", dueAt, Task.Recurrence.NONE, classified.body());
-                Task task = taskService.createTask(userId, chatId, req);
-                autoSyncNewTaskToGoogle(task);
-                sendText(chatId, "✅ " + esc(task.getTitle()));
+                var ev = calendarService.addEvent(title, classified.startDatetime(),
+                        classified.endDatetime(), classified.body(), false);
+                sendText(chatId, "📅 " + esc(ev.title()) + " — " + esc(ev.start()));
                 return;
+            } catch (Exception e) {
+                System.err.println("[GroupInbox] Calendar add failed, falling back to task: " + e.getMessage());
+                // fall through to TASK
             }
         }
 
-        // Not a task (or no InboxService) — save as quick note
+        // 2) TASK — actionable work. Also fall-through target if Calendar failed.
+        if (("TASK".equalsIgnoreCase(category) || "CALENDAR".equalsIgnoreCase(category))
+                && classified != null) {
+            Task.Priority pri = classified.priority() != null
+                    ? Task.Priority.fromText(classified.priority()) : Task.Priority.MEDIUM;
+            java.time.LocalDateTime dueAt = null;
+            // Prefer startDatetime (calendar-fallback), else due_date
+            String whenStr = classified.startDatetime() != null && !classified.startDatetime().isBlank()
+                    ? classified.startDatetime() : classified.dueDate();
+            if (whenStr != null && !whenStr.isBlank()) {
+                try {
+                    if (whenStr.contains("T")) dueAt = java.time.LocalDateTime.parse(whenStr);
+                    else dueAt = java.time.LocalDate.parse(whenStr.substring(0, Math.min(10, whenStr.length()))).atTime(9, 0);
+                } catch (Exception ignored) {}
+            }
+            String title = classified.title() != null ? classified.title() : extracted;
+            if (title.length() > 100) title = title.substring(0, 100);
+            TaskService.AddTaskRequest req = new TaskService.AddTaskRequest(
+                    title, pri, "inbox", dueAt, Task.Recurrence.NONE, classified.body());
+            Task task = taskService.createTask(userId, chatId, req);
+            autoSyncNewTaskToGoogle(task);
+            sendText(chatId, "✅ " + esc(task.getTitle()));
+            return;
+        }
+
+        // 3) NOTE — informational, non-actionable. Save as quick note.
         if (notionService != null) {
             try {
-                String noteTitle = extracted.length() > 80 ? extracted.substring(0, 80) + "..." : extracted;
+                String noteTitle = (classified != null && classified.title() != null)
+                        ? classified.title()
+                        : (extracted.length() > 80 ? extracted.substring(0, 80) + "..." : extracted);
                 notionService.saveNote(noteTitle, "inbox", List.of("inbox"), extracted, null, "group-inbox");
                 sendText(chatId, "📝 " + esc(noteTitle));
             } catch (Exception e) {
                 sendText(chatId, "📝 Couldn't save note: " + e.getMessage());
             }
         } else {
-            // No Notion — fall back to creating a task anyway
+            // No Notion — last-resort fallback: save as task anyway
             String title = extracted.length() > 100 ? extracted.substring(0, 100) : extracted;
             TaskService.AddTaskRequest req = new TaskService.AddTaskRequest(
                     title, Task.Priority.MEDIUM, "inbox", null, Task.Recurrence.NONE, null);

@@ -23,16 +23,36 @@ public class InboxService {
     private static final String MODEL_VISION   = "claude-sonnet-4-6";
 
     private static final String CLASSIFY_SYSTEM_PROMPT = """
-            You are a personal assistant. Given the following content, decide: is this an actionable \
-            task that someone needs to DO, or is it just information/a note? \
-            Return a JSON object with fields: { category, title, body, due_date, priority }. \
-            - category: "TASK" if it contains something actionable (a todo, errand, deadline, \
-              assignment, thing to buy, thing to fix, appointment to make, etc). "NOTE" for everything else. \
+            You are a personal assistant. Given the following content, classify it into ONE of three categories \
+            by trying them in strict priority order: CALENDAR → TASK → NOTE. \
+            Return a JSON object with fields: { category, title, body, start_datetime, end_datetime, due_date, priority }. \
+            \
+            CATEGORY RULES — try them in this order, pick the FIRST one that fits: \
+            1. CALENDAR — a scheduled event at a SPECIFIC date AND time: meetings, appointments, classes, \
+               flights, interviews, gatherings at a clock time (e.g. "lunch with mom tomorrow 1pm", \
+               "dentist 15 may 3:30pm", "flight to KL wed 8am"). Must have an explicit time-of-day or datetime. \
+               All-day events (like "mom's birthday 15 may") are CALENDAR only if clearly an event, not a todo. \
+            2. TASK — actionable work the user needs to DO: errands, assignments, deadlines, things to buy, \
+               things to fix, calls to make, reminders to do something. May have a due date (no specific time \
+               required). Examples: "buy milk", "finish report by friday", "call plumber", "CS2030 assignment \
+               due next tuesday". If it's work to be completed rather than attended, it's a TASK. \
+            3. NOTE — pure information, reference material, journal-style thought, or anything not actionable \
+               and not a scheduled event. If it doesn't fit CALENDAR or TASK, it's a NOTE. \
+            \
+            FIELD RULES: \
+            - category: exactly "CALENDAR", "TASK", or "NOTE" \
             - title: short summary (max 80 chars) \
-            - body: extra context or details (null if none) \
-            - due_date: ISO date yyyy-MM-dd if a date is mentioned, null otherwise \
-            - priority: HIGH, MEDIUM, or LOW (only if TASK, null otherwise) \
-            Only return JSON, no markdown fences.""";
+            - body: extra context/details (null if none) \
+            - start_datetime: ISO yyyy-MM-dd'T'HH:mm (e.g. "2026-04-21T13:00") if CALENDAR with a time, \
+              or yyyy-MM-dd if CALENDAR all-day. null for TASK and NOTE. \
+            - end_datetime: ISO yyyy-MM-dd'T'HH:mm if CALENDAR and end is known, else null \
+            - due_date: ISO yyyy-MM-dd if TASK with a deadline, else null \
+            - priority: HIGH, MEDIUM, or LOW — only for TASK, null otherwise \
+            \
+            Today's date context is provided with the content. Use it to resolve relative dates \
+            like "tomorrow", "next friday", etc. \
+            \
+            Only return JSON, no markdown fences, no commentary.""";
 
     private static final String VISION_SYSTEM_PROMPT =
             "You extract information from images. Return all visible text and key data points.";
@@ -40,6 +60,7 @@ public class InboxService {
     private static final int PDF_MAX_CHARS = 8000;
 
     public record ClassifiedContent(String category, String title, String body,
+                                    String startDatetime, String endDatetime,
                                     String dueDate, String priority) {}
 
     private final String claudeApiKey;
@@ -62,8 +83,14 @@ public class InboxService {
      */
     public ClassifiedContent classifyContent(String content) {
         try {
+            java.time.ZoneId sg = java.time.ZoneId.of("Asia/Singapore");
+            java.time.ZonedDateTime now = java.time.ZonedDateTime.now(sg);
+            String contextPrefix = "Today is " + now.format(java.time.format.DateTimeFormatter.ofPattern("EEEE, yyyy-MM-dd"))
+                    + " (current time " + now.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
+                    + " Asia/Singapore).\n\nContent to classify:\n";
+
             List<Map<String, Object>> messageContent = List.of(
-                    Map.of("type", "text", "text", content)
+                    Map.of("type", "text", "text", contextPrefix + content)
             );
 
             String raw = callClaude(CLASSIFY_SYSTEM_PROMPT, messageContent, MODEL_CLASSIFY, 512);
@@ -76,6 +103,8 @@ public class InboxService {
                     node.path("category").asText(null),
                     node.path("title").asText(null),
                     node.path("body").asText(null),
+                    node.path("start_datetime").isNull() ? null : node.path("start_datetime").asText(null),
+                    node.path("end_datetime").isNull() ? null : node.path("end_datetime").asText(null),
                     node.path("due_date").isNull() ? null : node.path("due_date").asText(null),
                     node.path("priority").isNull() ? null : node.path("priority").asText(null)
             );
