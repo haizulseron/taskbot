@@ -22,7 +22,7 @@ public class JournalService {
     private static final String BASE_URL       = "https://api.notion.com/v1";
     private static final String NOTION_VERSION = "2022-06-28";
     private static final String CLAUDE_API_URL = "https://api.anthropic.com/v1/messages";
-    private static final String CLAUDE_MODEL   = "claude-haiku-4-5-20251001";
+    private static final String CLAUDE_MODEL   = ModelRouting.REFLECTIONS;
 
     private final String notionApiKey;
     private final String journalDatabaseId;

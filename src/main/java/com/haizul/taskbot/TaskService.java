@@ -227,24 +227,37 @@ public class TaskService {
                 .findFirst();
         if (exact.isPresent()) return exact;
 
-        // 2. Word-based fuzzy match — handles word-order mismatches
+        // 2. Word-based fuzzy match — handles word-order mismatches and filler words.
         //    e.g. hint "mock cs2030de paper" matches title "CS2030DE Mock Paper"
+        //    e.g. hint "graduation gown matters" matches title "Graduation Gown Collection"
+        // Drop common filler words from the hint so they don't drag down the threshold.
+        Set<String> stop = Set.of("the","a","an","my","your","task","tasks","matter","matters",
+                "thing","things","item","items","with","for","of","to","on","and","or","please");
         String[] hintWords = lower.split("\\s+");
+        List<String> meaningful = new ArrayList<>();
+        for (String w : hintWords) {
+            if (w.length() >= 2 && !stop.contains(w)) meaningful.add(w);
+        }
+        if (meaningful.isEmpty()) meaningful = Arrays.asList(hintWords);
+
         Task best = null;
         int bestScore = 0;
         for (Task t : active) {
             String titleLower = t.getTitle().toLowerCase(Locale.ROOT);
             int score = 0;
-            for (String w : hintWords) {
-                if (w.length() >= 2 && titleLower.contains(w)) score++;
+            for (String w : meaningful) {
+                if (titleLower.contains(w)) score++;
             }
             if (score > bestScore) {
                 bestScore = score;
                 best = t;
             }
         }
-        // Require at least half the hint words to match (or at least 1 for short hints)
-        int minScore = Math.max(1, (hintWords.length + 1) / 2);
+        // Threshold relaxed: short hints (≤3 meaningful words) only need 1 match,
+        // longer hints still need ~half. Better to over-match and let user confirm
+        // than fail with "task not found" when intent is obvious.
+        int n = meaningful.size();
+        int minScore = n <= 3 ? 1 : (n + 1) / 2;
         return bestScore >= minScore ? Optional.of(best) : Optional.empty();
     }
 
@@ -264,6 +277,7 @@ public class TaskService {
         LocalDateTime now = LocalDateTime.now(zoneId);
         for (Task t : active) {
             updateTaskStatus(t.getId(), Task.Status.DONE, now);
+            if (t.isHabit()) logHabitCompletion(t.getId(), userId);
             if (t.getRecurrence() != Task.Recurrence.NONE) createNextRecurring(t, now);
         }
         return active.size();
@@ -305,6 +319,7 @@ public class TaskService {
         task.setUpdatedAt(LocalDateTime.now(zoneId));
         task.setReminderStage(0);
         task.setLastReminderAt(null);
+        task.setReminderIgnoredCount(0);
         updateTask(task);
         return true;
     }
@@ -333,6 +348,7 @@ public class TaskService {
         LocalDateTime now = LocalDateTime.now(zoneId);
         for (Task t : tasks) {
             updateTaskStatus(t.getId(), Task.Status.DONE, now);
+            if (t.isHabit()) logHabitCompletion(t.getId(), userId);
             if (t.getRecurrence() != Task.Recurrence.NONE) createNextRecurring(t, now);
         }
         return tasks.size();
@@ -499,6 +515,44 @@ public class TaskService {
             s.setString(6, pomodoroState);
             s.executeUpdate();
         } catch (SQLException e) { throw new RuntimeException("Failed to save user settings", e); }
+    }
+
+    // ── Pinned /tasks message tracking ───────────────────────────────────────
+
+    /** Returns the message ID of the most recently pinned /tasks list, or null if none. */
+    public Integer getPinnedTasksMessageId(long userId) {
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("SELECT pinned_tasks_message_id FROM user_settings WHERE user_id=?")) {
+            s.setLong(1, userId);
+            try (ResultSet rs = s.executeQuery()) {
+                if (rs.next()) {
+                    int v = rs.getInt(1);
+                    return rs.wasNull() ? null : v;
+                }
+            }
+        } catch (SQLException ignored) {}
+        return null;
+    }
+
+    /** Persist the message ID we just pinned (or null after unpinning). */
+    public void setPinnedTasksMessageId(long userId, Integer messageId) {
+        LocalDateTime now = LocalDateTime.now(zoneId);
+        try (Connection c = database.getConnection();
+             PreparedStatement s = c.prepareStatement("""
+                     INSERT INTO user_settings (user_id, weekly_digest, created_at, updated_at, pinned_tasks_message_id)
+                     VALUES (?, 1, ?, ?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET pinned_tasks_message_id=excluded.pinned_tasks_message_id,
+                         updated_at=excluded.updated_at
+                     """)) {
+            s.setLong(1, userId);
+            s.setString(2, now.toString());
+            s.setString(3, now.toString());
+            if (messageId == null) s.setNull(4, java.sql.Types.INTEGER);
+            else s.setInt(4, messageId);
+            s.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Failed to persist pinned tasks message id: " + e.getMessage());
+        }
     }
 
     // ── Templates ────────────────────────────────────────────────────────────
@@ -1064,6 +1118,10 @@ public class TaskService {
         Task next = createTask(completed.getUserId(), completed.getChatId(), req);
         next.setReminderIntervalMinutes(completed.getReminderIntervalMinutes());
         next.setRepeatReminder(completed.isRepeatReminder());
+        next.setHabit(completed.isHabit());
+        next.setReminderLat(completed.getReminderLat());
+        next.setReminderLng(completed.getReminderLng());
+        next.setReminderRadiusMeters(completed.getReminderRadiusMeters());
         updateTask(next);
     }
 

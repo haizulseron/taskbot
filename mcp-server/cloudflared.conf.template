@@ -1,0 +1,20 @@
+; Supervisor config for the Cloudflare Tunnel that fronts the MCP server.
+;
+; Replace PASTE_TUNNEL_TOKEN_HERE with the token from Cloudflare's
+; "If you already have cloudflared installed" pane.
+;
+; Install:
+;   sudo cp cloudflared.conf /etc/supervisor/conf.d/taskbot-cloudflared.conf
+;   sudo supervisorctl reread
+;   sudo supervisorctl update
+
+[program:taskbot-cloudflared]
+directory=/home/telegrambot
+command=/home/linuxbrew/.linuxbrew/bin/cloudflared --no-autoupdate tunnel run --token PASTE_TUNNEL_TOKEN_HERE
+user=telegrambot
+autostart=true
+autorestart=true
+startsecs=5
+startretries=10
+stderr_logfile=/home/telegrambot/projects/taskbot/mcp-server/logs/cloudflared.err.log
+stdout_logfile=/home/telegrambot/projects/taskbot/mcp-server/logs/cloudflared.out.log

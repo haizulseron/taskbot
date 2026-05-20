@@ -22,9 +22,15 @@ import java.util.concurrent.Executors;
 public class ClaudeService {
 
     private static final String API_URL     = "https://api.anthropic.com/v1/messages";
-    private static final String MODEL_FAST  = "claude-haiku-4-5-20251001";  // default: fast & cheap
-    private static final String MODEL_SMART = "claude-sonnet-4-6";           // complex tasks only
     private static final int    MAX_TURNS   = 8; // max tool call rounds per message
+
+    /** Tool names whose execution mutates the user's task list. After any of these
+     *  fires, TaskBot refreshes the pinned active-tasks summary. */
+    private static final java.util.Set<String> TASK_MUTATING_TOOLS = java.util.Set.of(
+            "create_task", "mark_done", "mark_all_done", "delete_task",
+            "snooze_task", "reschedule_task", "edit_task",
+            "set_reminder_interval", "toggle_habit", "sync_google_tasks"
+    );
 
     private static final String BASE_SYSTEM_PROMPT = """
             You are Proton, a smart personal productivity assistant for Zul (Haizul Ali Seron).
@@ -174,6 +180,60 @@ public class ClaudeService {
     private CountdownService countdownService;
     private GoalService goalService;
     private GoogleTasksService googleTasksService;
+    private ComposioService composio;
+    private KimiService kimi;
+
+    // ── Google offline tracking ───────────────────────────────────────────────
+    // When invalid_grant fires, we set googleOfflineSince to now. Every Google
+    // tool short-circuits with ERROR_AUTH_FAILED for the next 60 minutes instead
+    // of hammering Google with a dead token. Cleared by clearGoogleOffline()
+    // (called from TaskBot on successful /authorize).
+    private volatile long googleOfflineSince = 0L; // epoch millis, 0 = online
+    // Track whether we already notified the user this offline-window so we don't spam
+    private volatile boolean googleOfflineNotified = false;
+    private static final long GOOGLE_OFFLINE_TTL_MS = 60 * 60 * 1000L; // 1 hour
+
+    public void markGoogleOffline(String reason) {
+        if (googleOfflineSince == 0L) {
+            System.err.println("[GOOGLE OFFLINE] " + reason);
+        }
+        googleOfflineSince = System.currentTimeMillis();
+    }
+
+    public void clearGoogleOffline() {
+        googleOfflineSince = 0L;
+        googleOfflineNotified = false;
+        System.err.println("[GOOGLE OFFLINE] cleared");
+    }
+
+    public boolean isGoogleOffline() {
+        if (googleOfflineSince == 0L) return false;
+        if (System.currentTimeMillis() - googleOfflineSince > GOOGLE_OFFLINE_TTL_MS) {
+            // TTL expired — give it another chance
+            googleOfflineSince = 0L;
+            googleOfflineNotified = false;
+            return false;
+        }
+        return true;
+    }
+
+    /** If Google is offline, return a structured ERROR_AUTH_FAILED string and (once
+     *  per window) push a heads-up message to the user. Returns null if online. */
+    private String googleOfflineCheck(String toolName, MessageSender sender) {
+        if (!isGoogleOffline()) return null;
+        if (!googleOfflineNotified && sender != null) {
+            googleOfflineNotified = true;
+            try {
+                sender.send("⚠️ Your Google access has expired (token revoked). "
+                        + "Run /authorize to re-link your account. "
+                        + "Until then, I can't read or write Gmail, Calendar, Drive, or Google Tasks.");
+            } catch (Exception ignored) {}
+        }
+        return "ERROR_AUTH_FAILED: Google is offline — token revoked. "
+             + "Tool [" + toolName + "] did NOT execute. "
+             + "Tell the user the action did NOT happen and they need to run /authorize. "
+             + "Do NOT pretend it worked.";
+    }
 
     public void setExtraServices(MoodService mood, CountdownService countdown, GoalService goal) {
         this.moodService = mood;
@@ -183,6 +243,14 @@ public class ClaudeService {
 
     public void setGoogleTasksService(GoogleTasksService gts) {
         this.googleTasksService = gts;
+    }
+
+    public void setComposioService(ComposioService composio) {
+        this.composio = composio;
+    }
+
+    public void setKimiService(KimiService kimi) {
+        this.kimi = kimi;
     }
 
     private void syncCompleteToGoogle(Task task) {
@@ -224,12 +292,27 @@ public class ClaudeService {
 
     public String chat(long userId, long chatId, String userMessage,
                        TaskService taskService, NotionService notionService, NoteService noteService,
-                       GmailService gmailService, CalendarService calendarService, DriveService driveService,
-                       GoogleCalendarService googleCalendarService, JournalService journalService,
-                       List<GmailService.Attachment> pendingAttachments,
+                       JournalService journalService,
+                       List<Attachment> pendingAttachments,
                        MessageSender sender, FileSender fileSender) {
+        return chat(userId, chatId, userMessage, taskService, notionService, noteService,
+                journalService, pendingAttachments, sender, fileSender, null);
+    }
+
+    public String chat(long userId, long chatId, String userMessage,
+                       TaskService taskService, NotionService notionService, NoteService noteService,
+                       JournalService journalService,
+                       List<Attachment> pendingAttachments,
+                       MessageSender sender, FileSender fileSender,
+                       Runnable onTasksMutated) {
+        // Mutable single-element array so we can flip the flag from inside this method
+        // and have try/finally see the latest value regardless of which return fires.
+        final boolean[] tasksMutated = {false};
+        try {
         String now = LocalDateTime.now(zoneId).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
-        String systemWithDate = buildSystemPrompt(userId) + "\n\nCurrent date/time: " + now + " (" + zoneId + ")";
+        String systemWithDate = buildSystemPrompt(userId)
+                + "\n\nCurrent date/time: " + now + " (" + zoneId + ")"
+                + renderRecentActions(userId);
         String model = pickModel(userMessage);
 
         // Build messages list — rolling history + current message
@@ -244,6 +327,10 @@ public class ClaudeService {
         // Track whether ANY tool call happened across all turns — used by the phantom-action
         // detector to avoid false-positives when Claude already did work then text-confirmed.
         boolean anyToolCalled = false;
+        // Track the most recent tool error (ERROR_* prefix) seen in this conversation.
+        // If Claude then claims success in its assistant text, we override with the truth.
+        String lastToolError = null;
+        String lastErroredTool = null;
 
         // Agentic loop
         for (int turn = 0; turn < MAX_TURNS; turn++) {
@@ -295,6 +382,9 @@ public class ClaudeService {
                         result = n > 0 ? "✅ Marked all " + n + " task(s) done!"
                                        : "No active tasks to complete.";
                     }
+                    tasksMutated[0] = true;
+                    if (db != null) db.logAction(userId, "mark_all_done",
+                            "filter=" + qualifier + " (safety-forced)", "success", null, result);
                     addToHistory(userId, userMessage, result);
                     return result;
                 }
@@ -311,12 +401,17 @@ public class ClaudeService {
                         syncCompleteToGoogle(opt.get());
                         taskService.markDone(userId, opt.get().shortId());
                         taskService.resetReminderIgnoredCount(opt.get().getId());
+                        tasksMutated[0] = true;
                         String result = "✅ Done! \"" + opt.get().getTitle() + "\" is marked complete.";
+                        if (db != null) db.logAction(userId, "mark_done",
+                                "hint=" + taskHint + " (safety-forced)", "success", null, result);
                         addToHistory(userId, userMessage, result);
                         return result;
                     } else {
                         // Task not found — don't let Claude's hallucinated "done" through
                         String result = "❌ Couldn't find a task matching \"" + taskHint + "\". Check /tasks for your current list.";
+                        if (db != null) db.logAction(userId, "mark_done",
+                                "hint=" + taskHint + " (safety-forced)", "error", "ERROR_NOT_FOUND", result);
                         addToHistory(userId, userMessage, result);
                         return result;
                     }
@@ -373,35 +468,55 @@ public class ClaudeService {
                 }
 
                 // ── Phantom-action detector — last line of defence ──
-                // If Claude produced no tool calls anywhere but claims to have done something, flag it.
                 String finalTextCheck = allText.toString();
-                if (!finalTextCheck.isEmpty() && !anyToolCalled) {
-                    String lowerResp = finalTextCheck.toLowerCase();
-                    // Patterns where Claude is CLAIMING action without having called a tool
-                    boolean claimsAction = lowerResp.matches(
-                        "(?s).*\\b(i've |i have |i just |successfully |done\\b|marked |deleted |snoozed |rescheduled |created |added |scheduled |drafted |sent |saved )\\b.*"
-                    ) && lowerResp.matches(
-                        "(?s).*\\b(task|email|event|note|reminder|meeting|appointment|draft|message|journal|goal)\\b.*"
-                    );
-                    // Did the user actually ask for an action? (If not, skip.)
-                    boolean userAskedAction = lowerMsg.matches(
-                        "(?i).*(add|create|mark|complete|done|finish|delete|remove|snooze|reschedule|send|draft|schedule|save|log).*"
-                    );
-                    if (claimsAction && userAskedAction) {
-                        System.err.println("[SAFETY] Phantom-action suspected. userMsg=" + userMessage + " resp=" + finalTextCheck);
-                        String honest = "⚠️ I may not have actually completed that — I didn't hit the tool. Could you rephrase or be more specific so I can run it properly?";
-                        addToHistory(userId, userMessage, honest);
-                        return honest;
-                    }
+                String lowerResp = finalTextCheck.toLowerCase();
+                boolean claimsAction = !finalTextCheck.isEmpty() && lowerResp.matches(
+                    "(?s).*\\b(i've |i have |i just |successfully |done\\b|marked |deleted |snoozed |rescheduled |created |added |scheduled |drafted |sent |saved )\\b.*"
+                ) && lowerResp.matches(
+                    "(?s).*\\b(task|email|event|note|reminder|meeting|appointment|draft|message|journal|goal)\\b.*"
+                );
+                boolean userAskedAction = lowerMsg.matches(
+                    "(?i).*(add|create|mark|complete|done|finish|delete|remove|snooze|reschedule|send|draft|schedule|save|log).*"
+                );
+
+                // Case A: Claude called NO tool at all but claims action — original detector.
+                if (claimsAction && userAskedAction && !anyToolCalled) {
+                    System.err.println("[SAFETY] Phantom-action (no tool called). userMsg=" + userMessage + " resp=" + finalTextCheck);
+                    String honest = "⚠️ I may not have actually completed that — I didn't hit the tool. Could you rephrase or be more specific so I can run it properly?";
+                    addToHistory(userId, userMessage, honest);
+                    return honest;
+                }
+
+                // Case B: A tool returned an ERROR_* but Claude is still claiming success.
+                // This is the case that bit us on draft_email today. Replace Claude's text
+                // with an honest summary derived from the actual tool error.
+                if (claimsAction && lastToolError != null) {
+                    System.err.println("[SAFETY] Phantom-action (tool errored, Claude claimed success). tool=" + lastErroredTool
+                            + " err=" + lastToolError.substring(0, Math.min(120, lastToolError.length()))
+                            + " resp=" + finalTextCheck);
+                    String honest = honestErrorReply(lastErroredTool, lastToolError);
+                    addToHistory(userId, userMessage, honest);
+                    return honest;
                 }
                 String finalText = allText.toString().trim();
-                // If task data was fetched and Claude just listed/repeated tasks verbatim,
-                // save a placeholder to avoid stale counts in history.
-                // But if Claude generated real analysis/summary, save that — it's valuable.
+                // History grounding (item 7): when tools fired, prefer a compact action
+                // summary derived from the audit log over Claude's chatty prose. Stops
+                // the bot from reasoning off its own apologies and rationalisations
+                // when the conversation goes sideways.
                 String savedResponse;
-                if (taskDataFetched && finalText.isEmpty()) {
-                    savedResponse = "[Showed current task list from database]";
+                if (anyToolCalled) {
+                    String compact = buildCompactActionSummary(userId);
+                    if (compact != null && !compact.isBlank()) {
+                        savedResponse = compact;
+                    } else if (taskDataFetched && finalText.isEmpty()) {
+                        savedResponse = "[Showed current task list from database]";
+                    } else {
+                        // Fall back to Claude's text but trimmed
+                        savedResponse = finalText.isEmpty() ? "[tool ran, no text]"
+                                : (finalText.length() > 400 ? finalText.substring(0, 400) + "..." : finalText);
+                    }
                 } else {
+                    // Pure conversation — keep the prose
                     savedResponse = finalText.isEmpty() ? "OK" : finalText;
                 }
                 addToHistory(userId, userMessage, savedResponse);
@@ -421,9 +536,32 @@ public class ClaudeService {
                     taskDataFetched = true;
                 }
                 String result = executeTool(toolName, input, userId, taskService, notionService, noteService,
-                        gmailService, calendarService, driveService, googleCalendarService, journalService,
-                        pendingAttachments, sender, fileSender);
+                        journalService, pendingAttachments, sender, fileSender);
                 System.out.println("Tool [" + toolName + "] result: " + result.substring(0, Math.min(120, result.length())));
+                if (TASK_MUTATING_TOOLS.contains(toolName)) tasksMutated[0] = true;
+                // Track tool errors — phantom detector uses these to override false success claims.
+                String errCat = null;
+                if (result != null && result.startsWith("ERROR_")) {
+                    lastToolError = result;
+                    lastErroredTool = toolName;
+                    int colon = result.indexOf(':');
+                    errCat = colon > 0 ? result.substring(0, colon) : "ERROR_UNKNOWN";
+                } else {
+                    if (lastErroredTool != null && lastErroredTool.equals(toolName)) {
+                        lastToolError = null;
+                        lastErroredTool = null;
+                    }
+                }
+                // Persist to action_log — grounding source-of-truth for what actually happened.
+                if (db != null) {
+                    try {
+                        String inputSummary = summarizeInput(input);
+                        String status = errCat != null ? "error" : "success";
+                        String resultSummary = result == null ? null
+                                : (result.length() > 200 ? result.substring(0, 200) : result);
+                        db.logAction(userId, toolName, inputSummary, status, errCat, resultSummary);
+                    } catch (Exception ignored) {}
+                }
                 toolResults.add(Map.of("type", "tool_result", "tool_use_id", toolUseId, "content", result));
             }
 
@@ -431,15 +569,21 @@ public class ClaudeService {
         }
 
         return "I got a bit stuck on that one. Try rephrasing?";
+        } finally {
+            if (tasksMutated[0] && onTasksMutated != null) {
+                try { onTasksMutated.run(); } catch (Exception e) {
+                    System.err.println("onTasksMutated callback failed: " + e.getMessage());
+                }
+            }
+        }
     }
 
     // ── Tool execution ────────────────────────────────────────────────────────
 
     private String executeTool(String name, Map<String, Object> input, long userId,
                                 TaskService taskService, NotionService notionService, NoteService noteService,
-                                GmailService gmailService, CalendarService calendarService, DriveService driveService,
-                                GoogleCalendarService googleCalendarService, JournalService journalService,
-                                List<GmailService.Attachment> pendingAttachments,
+                                JournalService journalService,
+                                List<Attachment> pendingAttachments,
                                 MessageSender sender, FileSender fileSender) {
         try {
             return switch (name) {
@@ -666,133 +810,240 @@ public class ClaudeService {
 
                 // ── Email ──────────────────────────────────────────────────────────
                 case "read_emails" -> {
-                    if (gmailService == null) yield "Gmail not connected. Send /authorize to link your Google account.";
-                    int count = intVal(input, "count", 5);
+                    if (composio == null) yield "Gmail not configured. Set composio.api.key in application.properties.";
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("max_results", intVal(input, "count", 5));
+                    args.put("verbose", true);
                     String query = str(input, "query");
-                    List<GmailService.EmailSummary> emails = gmailService.getInbox(count, query);
-                    if (emails.isEmpty()) yield "No emails in inbox.";
-                    StringBuilder sb = new StringBuilder("📧 Inbox (" + emails.size() + ")\n─────────────────\n\n");
-                    for (int i = 0; i < emails.size(); i++) {
-                        GmailService.EmailSummary e = emails.get(i);
-                        sb.append(i + 1).append(". <b>").append(TaskService.esc(e.subject())).append("</b>\n");
-                        sb.append("   From: ").append(TaskService.esc(e.from())).append("\n");
-                        sb.append("   ").append(e.date()).append("\n");
-                        if (e.snippet() != null && !e.snippet().isBlank())
-                            sb.append("   ").append(TaskService.esc(e.snippet())).append("\n");
-                        sb.append("   <code>").append(e.id()).append("</code>\n\n");
+                    if (query != null && !query.isBlank()) args.put("query", query);
+                    ComposioService.Result r = composio.execute("GMAIL_FETCH_EMAILS", args);
+                    if (r.isError()) yield r.error();
+                    JsonNode msgs = r.data().path("messages");
+                    if (!msgs.isArray() || msgs.size() == 0) yield "No emails found.";
+                    StringBuilder sb = new StringBuilder("📧 Inbox (" + msgs.size() + ")\n─────────────────\n\n");
+                    StringBuilder ids = new StringBuilder("Emails shown. IDs for reply:\n");
+                    for (int i = 0; i < msgs.size(); i++) {
+                        JsonNode m = msgs.get(i);
+                        String id = m.path("messageId").asText("");
+                        String threadId = m.path("threadId").asText("");
+                        String subject = m.path("subject").asText("(no subject)");
+                        String from = m.path("sender").asText("");
+                        String date = m.path("messageTimestamp").asText("");
+                        String snippet = m.path("preview").path("body").asText("");
+                        if (snippet.isBlank()) snippet = m.path("preview").asText("");
+                        sb.append(i + 1).append(". <b>").append(TaskService.esc(subject)).append("</b>\n");
+                        sb.append("   From: ").append(TaskService.esc(from)).append("\n");
+                        sb.append("   ").append(date).append("\n");
+                        if (!snippet.isBlank()) sb.append("   ").append(TaskService.esc(snippet)).append("\n");
+                        sb.append("   <code>").append(id).append("</code>\n\n");
+                        ids.append("• ").append(subject).append(" → message_id=").append(id)
+                                .append(" thread_id=").append(threadId).append("\n");
                     }
                     sender.send(sb.toString().trim());
-                    // Return IDs separately so Claude can reference them for replies
-                    StringBuilder ids = new StringBuilder("Emails shown. Message IDs for reply:\n");
-                    emails.forEach(e -> ids.append("• ").append(e.subject()).append(" → ").append(e.id()).append("\n"));
                     yield ids.toString();
                 }
 
                 case "read_email" -> {
-                    if (gmailService == null) yield "Gmail not connected. Send /authorize to link your Google account.";
+                    if (composio == null) yield "Gmail not configured. Set composio.api.key in application.properties.";
                     String messageId = str(input, "message_id");
-                    GmailService.EmailContent email = gmailService.readEmailContent(messageId);
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("message_id", messageId);
+                    args.put("format", "full");
+                    ComposioService.Result r = composio.execute("GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID", args);
+                    if (r.isError()) yield r.error();
+                    JsonNode d = r.data();
+                    String subject = d.path("subject").asText("(no subject)");
+                    String from = d.path("sender").asText("");
+                    String date = d.path("messageTimestamp").asText("");
+                    String threadId = d.path("threadId").asText("");
+                    String body = d.path("messageText").asText("");
                     StringBuilder sb = new StringBuilder();
-                    sb.append("📧 <b>").append(TaskService.esc(email.subject())).append("</b>\n");
-                    sb.append("From: ").append(TaskService.esc(email.from())).append("\n");
-                    sb.append("Date: ").append(email.date()).append("\n");
+                    sb.append("📧 <b>").append(TaskService.esc(subject)).append("</b>\n");
+                    sb.append("From: ").append(TaskService.esc(from)).append("\n");
+                    sb.append("Date: ").append(date).append("\n");
                     sb.append("─────────────────\n\n");
-                    String body = email.body();
                     if (body.length() > 3000) body = body.substring(0, 3000) + "\n\n[truncated — email is long]";
                     sb.append(TaskService.esc(body));
                     sender.send(sb.toString().trim());
-                    yield "Email content shown. Message ID for reply: " + email.id();
+                    yield "Email content shown. message_id=" + messageId + " thread_id=" + threadId;
                 }
 
                 case "draft_email" -> {
-                    if (gmailService == null) yield "Gmail not connected. Send /authorize to link your Google account.";
+                    if (composio == null) yield "Gmail not configured. Set composio.api.key in application.properties.";
                     String to      = str(input, "to");
                     String cc      = str(input, "cc");
                     String subject = str(input, "subject");
                     String body    = str(input, "body");
-                    String draftId = gmailService.createDraft(to, cc, subject, body, pendingAttachments);
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("recipient_email", to);
+                    args.put("subject", subject);
+                    args.put("body", body);
+                    if (cc != null && !cc.isBlank()) args.put("cc", List.of(cc.split("\\s*,\\s*")));
+                    ComposioService.Result r = composio.execute("GMAIL_CREATE_EMAIL_DRAFT", args);
+                    if (r.isError()) yield r.error();
+                    String draftId = r.data().path("response_data").path("id").asText("");
                     String attNote = (pendingAttachments != null && !pendingAttachments.isEmpty())
-                            ? " (" + pendingAttachments.size() + " attachment(s) included)" : "";
-                    yield "Draft saved" + attNote + ". Open Gmail to review and send.";
+                            ? " — note: " + pendingAttachments.size() + " queued attachment(s) NOT included (attachments via brokered API not yet supported)" : "";
+                    String idNote = draftId.isBlank() ? "" : " [draft id: " + draftId + "]";
+                    yield "Draft saved" + idNote + ". Open Gmail to review and send." + attNote;
                 }
 
                 case "reply_email" -> {
-                    if (gmailService == null) yield "Gmail not connected. Send /authorize to link your Google account.";
-                    String messageId = str(input, "message_id");
+                    if (composio == null) yield "Gmail not configured. Set composio.api.key in application.properties.";
+                    String threadId = str(input, "thread_id");
+                    String recipient = str(input, "to");
                     String body      = str(input, "body");
-                    String draftId   = gmailService.replyToDraft(messageId, body, pendingAttachments);
-                    String attNote   = (pendingAttachments != null && !pendingAttachments.isEmpty())
-                            ? " (" + pendingAttachments.size() + " attachment(s) included)" : "";
-                    yield "Reply draft saved" + attNote + ". Open Gmail to review and send.";
+                    if (threadId == null || threadId.isBlank())
+                        yield "ERROR_BAD_INPUT: reply_email needs thread_id. Get it from read_emails first.";
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("thread_id", threadId);
+                    args.put("recipient_email", recipient);
+                    args.put("message_body", body);
+                    ComposioService.Result r = composio.execute("GMAIL_REPLY_TO_THREAD", args);
+                    if (r.isError()) yield r.error();
+                    String attNote = (pendingAttachments != null && !pendingAttachments.isEmpty())
+                            ? " — note: " + pendingAttachments.size() + " queued attachment(s) NOT included" : "";
+                    yield "Reply sent to thread " + threadId + "." + attNote;
                 }
 
                 // ── Calendar ───────────────────────────────────────────────────────
                 case "list_events" -> {
-                    if (calendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    if (composio == null) yield "Calendar not configured. Set composio.api.key in application.properties.";
                     int days = intVal(input, "days", 7);
-                    List<CalendarService.EventSummary> events = calendarService.getUpcomingEvents(days);
-                    if (events.isEmpty()) yield "No events in the next " + days + " days.";
+                    String timeMin = LocalDateTime.now(zoneId).format(DateTimeFormatter.ISO_LOCAL_DATE_TIME) + "Z";
+                    String timeMax = LocalDateTime.now(zoneId).plusDays(days).format(DateTimeFormatter.ISO_LOCAL_DATE_TIME) + "Z";
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("calendarId", "primary");
+                    args.put("timeMin", timeMin);
+                    args.put("timeMax", timeMax);
+                    args.put("singleEvents", true);
+                    args.put("orderBy", "startTime");
+                    args.put("maxResults", 25);
+                    ComposioService.Result r = composio.execute("GOOGLECALENDAR_EVENTS_LIST", args);
+                    if (r.isError()) yield r.error();
+                    JsonNode items = r.data().path("items");
+                    if (!items.isArray() || items.size() == 0) yield "No events in the next " + days + " days.";
                     StringBuilder sb = new StringBuilder("<b>📅 Calendar</b> (next " + days + " days)\n─────────────────\n");
-                    for (CalendarService.EventSummary e : events) {
-                        sb.append("📅 ").append(TaskService.esc(e.start())).append("  <b>").append(TaskService.esc(e.title())).append("</b>");
-                        if (e.location() != null && !e.location().isBlank())
-                            sb.append("  📍 ").append(TaskService.esc(e.location()));
+                    StringBuilder data = new StringBuilder("Calendar sent. Events for analysis:\n");
+                    for (JsonNode e : items) {
+                        String title = e.path("summary").asText("(no title)");
+                        String start = e.path("start").path("dateTime").asText(e.path("start").path("date").asText(""));
+                        String loc = e.path("location").asText("");
+                        sb.append("📅 ").append(TaskService.esc(start)).append("  <b>").append(TaskService.esc(title)).append("</b>");
+                        if (!loc.isBlank()) sb.append("  📍 ").append(TaskService.esc(loc));
                         sb.append("\n");
+                        data.append("• ").append(start).append(" — ").append(title)
+                            .append(" [id=").append(e.path("id").asText("")).append("]\n");
                     }
                     sender.send(sb.toString().trim());
-                    // Return event data to Claude for analysis
-                    StringBuilder data = new StringBuilder("Calendar sent. Events for analysis:\n");
-                    events.forEach(e -> data.append("• ").append(e.start()).append(" — ").append(e.title()).append("\n"));
                     yield data.toString();
                 }
 
                 case "add_event" -> {
-                    if (calendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    if (composio == null) yield "Calendar not configured. Set composio.api.key in application.properties.";
                     String title   = str(input, "title");
                     String startDt = str(input, "start_datetime");
                     String endDt   = str(input, "end_datetime");
                     String desc    = str(input, "description");
                     boolean allDay = boolVal(input, "all_day");
-                    CalendarService.EventSummary created = calendarService.addEvent(title, startDt, endDt, desc, allDay);
-                    yield "Added to calendar: \"" + created.title() + "\" — " + created.start();
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("calendar_id", "primary");
+                    args.put("summary", title);
+                    // Composio wants naive datetime (no Z, no offset) and a separate timezone field.
+                    args.put("start_datetime", startDt.replace("Z", "").replaceAll("\\+\\d{2}:\\d{2}$", ""));
+                    args.put("timezone", zoneId.getId());
+                    if (desc != null && !desc.isBlank()) args.put("description", desc);
+                    if (allDay) {
+                        args.put("event_duration_hour", 24);
+                    } else if (endDt != null && !endDt.isBlank()) {
+                        try {
+                            var s = LocalDateTime.parse(startDt.replace("Z","").replaceAll("\\+\\d{2}:\\d{2}$",""));
+                            var e = LocalDateTime.parse(endDt.replace("Z","").replaceAll("\\+\\d{2}:\\d{2}$",""));
+                            long mins = java.time.Duration.between(s, e).toMinutes();
+                            args.put("event_duration_hour", (int)(mins / 60));
+                            args.put("event_duration_minutes", (int)(mins % 60));
+                        } catch (Exception ex) {
+                            args.put("event_duration_hour", 1);
+                        }
+                    } else {
+                        args.put("event_duration_hour", 1);
+                    }
+                    ComposioService.Result r = composio.execute("GOOGLECALENDAR_CREATE_EVENT", args);
+                    if (r.isError()) yield r.error();
+                    String id = r.data().path("response_data").path("id").asText(r.data().path("id").asText(""));
+                    yield "Added to calendar: \"" + title + "\" — " + startDt + (id.isBlank() ? "" : " [event id: " + id + "]");
                 }
 
                 case "reschedule_event" -> {
-                    if (calendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    if (composio == null) yield "Calendar not configured. Set composio.api.key in application.properties.";
                     String hint  = str(input, "event_hint");
                     String newDt = str(input, "new_start_datetime");
-                    yield calendarService.rescheduleEvent(hint, newDt);
+                    String eventId = findEventId(hint);
+                    if (eventId == null) yield "ERROR_NOT_FOUND: No event matching \"" + hint + "\".";
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("calendar_id", "primary");
+                    args.put("event_id", eventId);
+                    args.put("start_time", newDt);
+                    args.put("timezone", zoneId.getId());
+                    ComposioService.Result r = composio.execute("GOOGLECALENDAR_PATCH_EVENT", args);
+                    if (r.isError()) yield r.error();
+                    yield "Rescheduled \"" + hint + "\" to " + newDt + ".";
                 }
 
                 case "edit_event" -> {
-                    if (calendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    if (composio == null) yield "Calendar not configured. Set composio.api.key in application.properties.";
                     String hint    = str(input, "event_hint");
                     String newTitle = str(input, "new_title");
                     String newDesc  = str(input, "new_description");
-                    yield calendarService.editEvent(hint, newTitle, newDesc);
+                    String eventId = findEventId(hint);
+                    if (eventId == null) yield "ERROR_NOT_FOUND: No event matching \"" + hint + "\".";
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("calendar_id", "primary");
+                    args.put("event_id", eventId);
+                    if (newTitle != null && !newTitle.isBlank()) args.put("summary", newTitle);
+                    if (newDesc != null && !newDesc.isBlank())  args.put("description", newDesc);
+                    ComposioService.Result r = composio.execute("GOOGLECALENDAR_PATCH_EVENT", args);
+                    if (r.isError()) yield r.error();
+                    yield "Updated event \"" + hint + "\".";
                 }
 
                 case "delete_event" -> {
-                    if (calendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
+                    if (composio == null) yield "Calendar not configured. Set composio.api.key in application.properties.";
                     String hint = str(input, "event_hint");
-                    yield calendarService.deleteEvent(hint);
+                    String eventId = findEventId(hint);
+                    if (eventId == null) yield "ERROR_NOT_FOUND: No event matching \"" + hint + "\".";
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("calendar_id", "primary");
+                    args.put("event_id", eventId);
+                    ComposioService.Result r = composio.execute("GOOGLECALENDAR_DELETE_EVENT", args);
+                    if (r.isError()) yield r.error();
+                    yield "Deleted event \"" + hint + "\".";
                 }
 
                 // ── Google Drive ───────────────────────────────────────────────────
                 case "search_drive" -> {
-                    if (driveService == null) yield "Drive not connected. Send /authorize to link your Google account.";
+                    if (composio == null) yield "Drive not configured. Set composio.api.key in application.properties.";
                     String query = str(input, "query");
-                    List<DriveService.FileSummary> files = driveService.searchFiles(query);
-                    if (files.isEmpty()) yield "No files found matching: " + query + ". Try a shorter or different keyword.";
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("q", "name contains '" + query.replace("'", "\\'") + "' and trashed=false");
+                    args.put("pageSize", 10);
+                    ComposioService.Result r = composio.execute("GOOGLEDRIVE_FIND_FILE", args);
+                    if (r.isError()) yield r.error();
+                    JsonNode files = r.data().path("files");
+                    if (!files.isArray() || files.size() == 0) yield "No files found matching: " + query + ".";
                     StringBuilder sb = new StringBuilder("📁 Drive Results\n─────────────────\n\n");
                     StringBuilder toolResult = new StringBuilder("Found " + files.size() + " file(s):\n");
                     for (int i = 0; i < files.size(); i++) {
-                        DriveService.FileSummary f = files.get(i);
-                        sb.append(i + 1).append(". ").append(f.name()).append("\n");
-                        sb.append("   ID: ").append(f.id()).append("\n");
-                        if (f.size() != null) sb.append("   ").append(f.size() / 1024).append(" KB\n");
-                        sb.append("   ").append(f.modifiedTime()).append("\n\n");
-                        toolResult.append(i + 1).append(". \"").append(f.name()).append("\" — id: ").append(f.id()).append("\n");
+                        JsonNode f = files.get(i);
+                        String fname = f.path("name").asText("");
+                        String fid = f.path("id").asText("");
+                        long fsize = f.path("size").asLong(0);
+                        String modTime = f.path("modifiedTime").asText("");
+                        sb.append(i + 1).append(". ").append(fname).append("\n");
+                        sb.append("   ID: ").append(fid).append("\n");
+                        if (fsize > 0) sb.append("   ").append(fsize / 1024).append(" KB\n");
+                        sb.append("   ").append(modTime).append("\n\n");
+                        toolResult.append(i + 1).append(". \"").append(fname).append("\" — id: ").append(fid).append("\n");
                     }
                     toolResult.append("\nNOW call send_drive_file with the correct file_id to deliver it.");
                     sender.send(sb.toString().trim());
@@ -800,13 +1051,9 @@ public class ClaudeService {
                 }
 
                 case "send_drive_file" -> {
-                    if (driveService == null) yield "Drive not connected. Send /authorize to link your Google account.";
+                    if (composio == null) yield "Drive not configured. Set composio.api.key in application.properties.";
                     String fileId = str(input, "file_id");
-                    DriveService.DriveFileResult file = driveService.downloadFile(fileId);
-                    if (file.data() == null || file.data().length == 0)
-                        yield "Downloaded file \"" + file.name() + "\" was empty. It may be a Google Workspace file that couldn't be exported, or access was denied.";
-                    fileSender.send(file.name(), file.data());
-                    yield "SENT_DIRECTLY";
+                    yield downloadAndSendDriveFile(fileId, fileSender);
                 }
 
                 case "save_preference" -> {
@@ -901,6 +1148,7 @@ public class ClaudeService {
 
                 case "sync_google_tasks" -> {
                     if (googleTasksService == null) yield "Google Tasks not connected. Send /authorize to link your Google account.";
+                    String off = googleOfflineCheck(name, sender); if (off != null) yield off;
                     List<Task> active = taskService.getActiveTasks(userId);
                     int synced = 0;
                     for (Task task : active) {
@@ -922,17 +1170,30 @@ public class ClaudeService {
                 }
 
                 case "time_block_suggestion" -> {
-                    if (googleCalendarService == null) yield "Calendar not connected. Send /authorize to link your Google account.";
-                    var events = googleCalendarService.getEventsForTimeBlocking(2);
+                    if (composio == null) yield "Calendar not configured. Set composio.api.key in application.properties.";
+                    String timeMin = LocalDateTime.now(zoneId).format(DateTimeFormatter.ISO_LOCAL_DATE_TIME) + "Z";
+                    String timeMax = LocalDateTime.now(zoneId).plusDays(2).format(DateTimeFormatter.ISO_LOCAL_DATE_TIME) + "Z";
+                    Map<String, Object> args = new LinkedHashMap<>();
+                    args.put("calendarId", "primary");
+                    args.put("timeMin", timeMin);
+                    args.put("timeMax", timeMax);
+                    args.put("singleEvents", true);
+                    args.put("orderBy", "startTime");
+                    args.put("maxResults", 50);
+                    ComposioService.Result evRes = composio.execute("GOOGLECALENDAR_EVENTS_LIST", args);
+                    if (evRes.isError()) yield evRes.error();
                     var tasks = taskService.getTopPendingTasks(userId, 5);
                     if (tasks.isEmpty()) yield "No pending tasks to schedule.";
                     StringBuilder prompt = new StringBuilder("Here are my calendar events for today/tomorrow:\n");
-                    events.forEach(e -> prompt.append("- ").append(e.startDate()).append(" to ").append(e.endDate()).append(": ").append(e.title()).append("\n"));
+                    for (JsonNode e : evRes.data().path("items")) {
+                        String s = e.path("start").path("dateTime").asText(e.path("start").path("date").asText(""));
+                        String en = e.path("end").path("dateTime").asText(e.path("end").path("date").asText(""));
+                        prompt.append("- ").append(s).append(" to ").append(en).append(": ").append(e.path("summary").asText("")).append("\n");
+                    }
                     prompt.append("\nHere are my top pending tasks:\n");
                     tasks.forEach(t -> prompt.append("- [").append(t.getPriority()).append("] ").append(t.getTitle())
                             .append(t.getDueAt() != null ? " (due " + taskService.friendlyDate(t.getDueAt()) + ")" : "").append("\n"));
                     prompt.append("\nIdentify free time gaps of 30 minutes or more. Suggest which tasks to schedule in which gaps, with reasoning. Return as a friendly, conversational message with specific time slots.");
-                    // Use main agent to generate the suggestion
                     yield prompt.toString();
                 }
 
@@ -940,9 +1201,247 @@ public class ClaudeService {
             };
         } catch (Exception e) {
             System.err.println("Tool execution error [" + name + "]: " + e.getMessage());
-            // Sanitize — don't leak SQL errors, file paths, or stack details to the LLM
-            return "Error: could not complete " + name + ". Please try again.";
+            return categorizeError(name, e);
         }
+    }
+
+    // ── Tool error categorization ─────────────────────────────────────────────
+    // Returns a structured, instruction-laden error string. The ERROR_<CATEGORY>:
+    // prefix is a hard signal to Claude that the action FAILED. The trailing
+    // instruction tells Claude exactly how to respond to the user — leaving no
+    // wiggle room for hallucinated success.
+
+    /** Resolve a Google Calendar event ID from a fuzzy text hint via FIND_EVENT.
+     *  Returns null if no event matches. */
+    private String findEventId(String hint) {
+        if (composio == null || hint == null || hint.isBlank()) return null;
+        Map<String, Object> args = new LinkedHashMap<>();
+        args.put("calendar_id", "primary");
+        args.put("query", hint);
+        args.put("max_results", 5);
+        args.put("single_events", true);
+        args.put("order_by", "startTime");
+        // Search recent + upcoming
+        args.put("timeMin", LocalDateTime.now(zoneId).minusDays(7).format(DateTimeFormatter.ISO_LOCAL_DATE_TIME) + "Z");
+        args.put("timeMax", LocalDateTime.now(zoneId).plusDays(30).format(DateTimeFormatter.ISO_LOCAL_DATE_TIME) + "Z");
+        ComposioService.Result r = composio.execute("GOOGLECALENDAR_FIND_EVENT", args);
+        if (r.isError()) return null;
+        JsonNode items = r.data().path("items");
+        if (!items.isArray() || items.size() == 0) {
+            items = r.data().path("events");
+            if (!items.isArray() || items.size() == 0) return null;
+        }
+        return items.get(0).path("id").asText(null);
+    }
+
+    /** Download a Drive file via Composio. Handles Workspace export by looking up
+     *  the mime type from metadata first. Pushes bytes to Telegram via fileSender. */
+    private String downloadAndSendDriveFile(String fileId, FileSender fileSender) {
+        // Fetch metadata to detect Workspace mime type + filename
+        Map<String, Object> metaArgs = new LinkedHashMap<>();
+        metaArgs.put("file_id", fileId);
+        ComposioService.Result meta = composio.execute("GOOGLEDRIVE_GET_FILE_METADATA", metaArgs);
+        String fname = "drive-file";
+        String mime  = "";
+        if (!meta.isError() && meta.data() != null) {
+            fname = meta.data().path("name").asText(fname);
+            mime  = meta.data().path("mimeType").asText("");
+        }
+        Map<String, Object> dlArgs = new LinkedHashMap<>();
+        dlArgs.put("file_id", fileId);
+        if (mime.startsWith("application/vnd.google-apps.")) {
+            String exportMime = switch (mime) {
+                case "application/vnd.google-apps.spreadsheet" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+                case "application/vnd.google-apps.presentation" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+                case "application/vnd.google-apps.document" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+                default -> "application/pdf";
+            };
+            dlArgs.put("mime_type", exportMime);
+            String ext = exportMime.contains("spreadsheet") ? ".xlsx"
+                       : exportMime.contains("presentation") ? ".pptx"
+                       : exportMime.contains("wordprocessing") ? ".docx"
+                       : ".pdf";
+            if (!fname.contains(".")) fname += ext;
+        }
+        ComposioService.Result r = composio.execute("GOOGLEDRIVE_DOWNLOAD_FILE", dlArgs);
+        if (r.isError()) return r.error();
+        // Composio returns file content either as base64 inline or as a download URL.
+        JsonNode d = r.data();
+        byte[] bytes = null;
+        String b64 = d.path("file_content").asText(d.path("file").asText(d.path("content").asText("")));
+        if (!b64.isBlank()) {
+            try { bytes = java.util.Base64.getDecoder().decode(b64); }
+            catch (Exception ignored) {
+                try { bytes = java.util.Base64.getUrlDecoder().decode(b64); } catch (Exception ignored2) {}
+            }
+        }
+        if (bytes == null || bytes.length == 0) {
+            String url = d.path("download_url").asText(d.path("url").asText(d.path("file_url").asText("")));
+            if (!url.isBlank()) {
+                try {
+                    HttpRequest dlReq = HttpRequest.newBuilder().uri(URI.create(url)).GET().build();
+                    HttpResponse<byte[]> dlRes = http.send(dlReq, HttpResponse.BodyHandlers.ofByteArray());
+                    if (dlRes.statusCode() == 200) bytes = dlRes.body();
+                } catch (Exception ex) {
+                    return "ERROR_TOOL: Failed to fetch Drive file from URL: " + ex.getMessage();
+                }
+            }
+        }
+        if (bytes == null || bytes.length == 0)
+            return "ERROR_TOOL: Drive download returned no content for file " + fileId + ".";
+        fileSender.send(fname, bytes);
+        return "SENT_DIRECTLY";
+    }
+
+    private String categorizeError(String toolName, Exception e) {
+        String msg = e.getMessage() == null ? "" : e.getMessage();
+        String low = msg.toLowerCase(java.util.Locale.ROOT);
+        Throwable cause = e.getCause();
+        String causeMsg = cause != null && cause.getMessage() != null ? cause.getMessage().toLowerCase() : "";
+
+        // Auth failure — refresh token revoked/expired. Most common Google failure.
+        if (low.contains("invalid_grant") || causeMsg.contains("invalid_grant")
+                || low.contains("token has been expired") || low.contains("token has been revoked")
+                || low.contains("unauthorized_client")) {
+            markGoogleOffline("invalid_grant on " + toolName);
+            return "ERROR_AUTH_FAILED: Google access token is revoked or expired. "
+                 + "STOP. The action did NOT happen. "
+                 + "Tell the user verbatim: \"Your Google access expired — please run /authorize to re-link your account.\" "
+                 + "Do NOT say the action succeeded. Do NOT retry with a different tool.";
+        }
+
+        // Bad input — malformed date, missing required field, etc.
+        if (e instanceof java.time.format.DateTimeParseException
+                || e instanceof IllegalArgumentException
+                || low.contains("invalid date") || low.contains("invalid time")
+                || low.contains("could not parse") || low.contains("unparseable")) {
+            return "ERROR_BAD_INPUT: " + toolName + " rejected the inputs. Reason: "
+                 + safeMsg(msg) + ". "
+                 + "Tell the user what was wrong (in plain English) and ask them to clarify. "
+                 + "Do NOT say the action succeeded.";
+        }
+
+        // Not found — task hint, event hint, file id didn't match anything.
+        if (low.contains("not found") || low.contains("no match") || low.contains("404")) {
+            return "ERROR_NOT_FOUND: " + toolName + " couldn't find what was requested. "
+                 + "Tell the user no match was found and suggest /tasks or /search. "
+                 + "Do NOT pretend the action succeeded.";
+        }
+
+        // Transient — network, rate limit, temporary 5xx. Retry-safe.
+        if (low.contains("timeout") || low.contains("timed out")
+                || low.contains("connection reset") || low.contains("503")
+                || low.contains("502") || low.contains("rate limit")
+                || low.contains("429") || low.contains("too many requests")) {
+            return "ERROR_TRANSIENT: " + toolName + " hit a temporary network/service issue. "
+                 + "Tell the user the system briefly hiccupped and you'll need them to try again in a moment. "
+                 + "Do NOT claim it succeeded.";
+        }
+
+        // Unknown — anything else. Don't leak details to the LLM.
+        return "ERROR_UNKNOWN: " + toolName + " failed for an unexpected reason. "
+             + "Tell the user the action did NOT complete and ask them to try again or rephrase. "
+             + "Do NOT pretend it worked.";
+    }
+
+    /** Convert a structured ERROR_* string into a user-facing honest message.
+     *  Used when the phantom detector catches Claude claiming success after a real failure. */
+    static String honestErrorReply(String toolName, String errorString) {
+        if (errorString == null) errorString = "";
+        if (errorString.startsWith("ERROR_AUTH_FAILED")) {
+            return "⚠️ I tried to do that, but Google rejected the request — your access has expired. "
+                 + "Please run /authorize to re-link your account, then try again. (I should not have said it succeeded — sorry.)";
+        }
+        if (errorString.startsWith("ERROR_NOT_FOUND")) {
+            return "⚠️ I couldn't find what you asked about — no match. "
+                 + "Try /tasks or be a bit more specific with the title. (I should not have claimed I did it — sorry.)";
+        }
+        if (errorString.startsWith("ERROR_BAD_INPUT")) {
+            return "⚠️ I couldn't run that — the input wasn't valid (e.g. the date or required field). "
+                 + "Could you rephrase? (I should not have claimed it worked — sorry.)";
+        }
+        if (errorString.startsWith("ERROR_TRANSIENT")) {
+            return "⚠️ Network or service hiccup on the way to running that. Try again in a moment. "
+                 + "(I should not have claimed success — sorry.)";
+        }
+        return "⚠️ The action did not actually go through (tool: " + (toolName == null ? "unknown" : toolName) + "). "
+             + "Could you try again? (I should not have claimed it worked — sorry.)";
+    }
+
+    /** One-line summary of tool inputs for the audit log. Truncates and avoids dumping huge bodies. */
+    private static String summarizeInput(Map<String, Object> input) {
+        if (input == null || input.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        for (Map.Entry<String, Object> e : input.entrySet()) {
+            if (i++ > 0) sb.append(", ");
+            String v = String.valueOf(e.getValue());
+            if (v.length() > 60) v = v.substring(0, 60) + "...";
+            sb.append(e.getKey()).append("=").append(v);
+            if (sb.length() > 300) { sb.append(",..."); break; }
+        }
+        return sb.toString();
+    }
+
+    /** Compact one-line-per-action summary of what the bot just did THIS turn.
+     *  Saved to conversation_history instead of Claude's chatty prose so the next
+     *  turn sees facts, not rationalizations. Looks at the last 30 seconds of action_log. */
+    private String buildCompactActionSummary(long userId) {
+        if (db == null) return null;
+        List<Database.ActionLogEntry> recent = db.getRecentActions(userId, 30, 6);
+        if (recent.isEmpty()) return null;
+        // Newest first; build oldest-first for readability
+        java.util.Collections.reverse(recent);
+        StringBuilder sb = new StringBuilder();
+        for (Database.ActionLogEntry a : recent) {
+            String mark = "error".equals(a.status()) ? "✗" : "✓";
+            sb.append("[").append(mark).append(" ").append(a.toolName());
+            if (a.inputSummary() != null && !a.inputSummary().isBlank()) {
+                String trimmed = a.inputSummary().length() > 80
+                        ? a.inputSummary().substring(0, 80) + "..." : a.inputSummary();
+                sb.append("(").append(trimmed).append(")");
+            }
+            if ("error".equals(a.status())) {
+                sb.append(" → ").append(a.errorCategory() == null ? "ERROR" : a.errorCategory());
+            }
+            sb.append("] ");
+        }
+        return sb.toString().trim();
+    }
+
+    /** Render the recent action log as a compact block for inclusion in the system prompt.
+     *  Gives Claude a factual record of what it actually did, separate from chatty history. */
+    private String renderRecentActions(long userId) {
+        if (db == null) return "";
+        List<Database.ActionLogEntry> recent = db.getRecentActions(userId, 1800, 8); // last 30 min, max 8
+        if (recent.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder("\n\n══ YOUR RECENT ACTIONS (source of truth — trust this over your own prose) ══\n");
+        long now = System.currentTimeMillis() / 1000;
+        for (Database.ActionLogEntry a : recent) {
+            long ago = now - a.ts();
+            String when = ago < 60 ? ago + "s ago" : (ago / 60) + "m ago";
+            String marker = "error".equals(a.status()) ? "❌ FAILED" : "✅ ok";
+            sb.append("• ").append(when).append(" — ").append(a.toolName())
+              .append(" (").append(marker).append(")");
+            if (a.inputSummary() != null && !a.inputSummary().isBlank()) {
+                sb.append(" — input: ").append(a.inputSummary());
+            }
+            if ("error".equals(a.status())) {
+                sb.append(" — ").append(a.errorCategory() == null ? "ERROR_UNKNOWN" : a.errorCategory());
+            }
+            sb.append("\n");
+        }
+        sb.append("If the user asks 'did you X?', refer to this log — never invent answers.\n");
+        sb.append("══════════════════════════════════════════════════════════════════\n");
+        return sb.toString();
+    }
+
+    /** Trim and sanitize an exception message for inclusion in error strings to Claude. */
+    private static String safeMsg(String msg) {
+        if (msg == null) return "(no detail)";
+        String trimmed = msg.length() > 200 ? msg.substring(0, 200) + "..." : msg;
+        // Strip newlines / SQL details
+        return trimmed.replaceAll("[\\r\\n]+", " ").replaceAll("\\s+", " ").trim();
     }
 
     // ── Tool definitions ──────────────────────────────────────────────────────
@@ -1068,10 +1567,11 @@ public class ClaudeService {
                     .req("body",    "string", "Full email body — always professional and polished, written by you")
         ));
 
-        tools.add(tool("reply_email", "Reply to an email as a draft in Gmail. Always use professional tone. YOU compose the reply body.",
+        tools.add(tool("reply_email", "Reply within an existing Gmail thread. Sends immediately (does NOT create a draft). Always use professional tone. YOU compose the reply body.",
                 props()
-                    .req("message_id", "string", "ID of the email to reply to (from read_emails results)")
-                    .req("body",       "string", "Professional reply body — written by you")
+                    .req("thread_id", "string", "Thread ID of the email to reply to (from read_emails or read_email results)")
+                    .req("to",        "string", "Primary recipient email address")
+                    .req("body",      "string", "Professional reply body — written by you")
         ));
 
         // ── Calendar tools ──────────────────────────────────────────────────────
@@ -1179,16 +1679,14 @@ public class ClaudeService {
      * Use Sonnet for tasks that need strong reasoning or long-form generation
      * (emails, complex analysis). Everything else uses Haiku.
      */
+    /**
+     * Foreground always goes to the Chat/Reasoning/Agentic slot (Sonnet) per
+     * routing-architecture.md. Per-message branching by content type is
+     * deliberately gone — coherence within a conversation beats marginal
+     * cost savings on simple messages.
+     */
     private String pickModel(String userMessage) {
-        String lower = userMessage.toLowerCase();
-        if (lower.contains("email") || lower.contains("draft") || lower.contains("reply")
-                || lower.contains("compose") || lower.contains("write")
-                || lower.contains("summarise") || lower.contains("summarize")
-                || lower.contains("explain") || lower.contains("analyse") || lower.contains("analyze")
-                || lower.contains("report")) {
-            return MODEL_SMART;
-        }
-        return MODEL_FAST;
+        return ModelRouting.AGENTIC;
     }
 
     // ── Async memory extraction (fires after every exchange) ──────────────────
@@ -1223,14 +1721,30 @@ public class ClaudeService {
                         + "- Be conservative — when in doubt, return [].\n"
                         + "Return JSON array: [{\"key\": \"snake_case_key\", \"value\": \"preference\"}] or [] if nothing new.\n"
                         + "Return ONLY the JSON array, no other text.";
-                Map<String, Object> body = new LinkedHashMap<>();
-                body.put("model", MODEL_FAST);
-                body.put("max_tokens", 200);
-                body.put("system", "You extract NEW user preferences from chat. Return only a valid JSON array. Be conservative — only extract clear, durable preferences not already stored.");
-                body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
-                String resp = postJson(body);
-                JsonNode root = mapper.readTree(resp);
-                String text = root.path("content").path(0).path("text").asText("").trim();
+                String sys = "You extract NEW user preferences from chat. Return only a valid JSON array. Be conservative — only extract clear, durable preferences not already stored.";
+
+                // Memory summarization slot → Kimi. Falls back to Haiku-on-Anthropic
+                // if Kimi isn't configured, so the bot still works without a Moonshot key.
+                String text;
+                if (kimi != null) {
+                    text = kimi.complete(ModelRouting.MEMORY_SUMMARIZATION, sys, prompt, 800);
+                    if (text == null) return; // Kimi error already logged
+                    text = text.trim();
+                } else {
+                    Map<String, Object> body = new LinkedHashMap<>();
+                    body.put("model", ModelRouting.REFLECTIONS);
+                    body.put("max_tokens", 800);
+                    body.put("system", sys);
+                    body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
+                    String resp = postJson(body);
+                    JsonNode root = mapper.readTree(resp);
+                    String stopReason = root.path("stop_reason").asText("");
+                    if ("max_tokens".equals(stopReason)) {
+                        System.err.println("Memory extraction skipped: model hit max_tokens (output truncated). Consider raising the cap.");
+                        return;
+                    }
+                    text = root.path("content").path(0).path("text").asText("").trim();
+                }
                 // Strip markdown code fences if Claude wraps JSON in ```json ... ```
                 if (text.startsWith("```")) {
                     text = text.replaceAll("^```[a-z]*\\s*", "").replaceAll("\\s*```$", "").trim();
@@ -1268,14 +1782,28 @@ public class ClaudeService {
                     + "5. Use clear, concise values — no redundancy\n"
                     + "Return JSON object: {\"key\": \"value\", ...} with only the consolidated facts.\n"
                     + "Return ONLY the JSON object, no other text.";
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("model", MODEL_FAST);
-            body.put("max_tokens", 600);
-            body.put("system", "You aggressively consolidate user profile data. Merge duplicates, remove redundancy. Target 15-20 entries max. Return only valid JSON.");
-            body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
-            String resp = postJson(body);
-            JsonNode root = mapper.readTree(resp);
-            String text = root.path("content").path(0).path("text").asText("").trim();
+            String sys = "You aggressively consolidate user profile data. Merge duplicates, remove redundancy. Target 15-20 entries max. Return only valid JSON.";
+            String text;
+            if (kimi != null) {
+                text = kimi.complete(ModelRouting.MEMORY_SUMMARIZATION, sys, prompt, 2500);
+                if (text == null) return;
+                text = text.trim();
+            } else {
+                Map<String, Object> body = new LinkedHashMap<>();
+                body.put("model", ModelRouting.REFLECTIONS);
+                body.put("max_tokens", 2500);
+                body.put("system", sys);
+                body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
+                String resp = postJson(body);
+                JsonNode root = mapper.readTree(resp);
+                String stopReason = root.path("stop_reason").asText("");
+                if ("max_tokens".equals(stopReason)) {
+                    System.err.println("Profile consolidation aborted: model hit max_tokens. "
+                            + "Profile has " + profile.size() + " entries — raise the cap.");
+                    return;
+                }
+                text = root.path("content").path(0).path("text").asText("").trim();
+            }
             if (text.startsWith("```")) {
                 text = text.replaceAll("^```[a-z]*\\s*", "").replaceAll("\\s*```$", "").trim();
             }
@@ -1286,7 +1814,10 @@ public class ClaudeService {
                 System.out.println("Profile consolidated: " + profile.size() + " → " + consolidated.size() + " entries");
             }
         } catch (Exception e) {
-            System.err.println("Profile consolidation error: " + e.getMessage());
+            // Include a snippet of what we got so future failures are debuggable.
+            String detail = e.getMessage();
+            if (detail != null && detail.length() > 250) detail = detail.substring(0, 250) + "...";
+            System.err.println("Profile consolidation error: " + detail);
         }
     }
 
@@ -1327,6 +1858,59 @@ public class ClaudeService {
 
     // ── Reminder message (used by SchedulerService) ───────────────────────────
 
+    /**
+     * Self-audit: one-shot Claude call (no history, no tools) that summarises the
+     * bot's last 24 hours of behaviour. Caller (SchedulerService) supplies the raw
+     * stats and log tail; this method formats and asks Claude for a brief verdict.
+     *
+     * @return the audit summary text, or null if the call failed (caller decides
+     *         whether to ping the user with a fallback "audit unavailable" message).
+     */
+    public String runDailyAudit(String actionStats, String errLogTail, String googleHealth) {
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("You're auditing the last 24 hours of a personal Telegram task-bot. ");
+        prompt.append("You won't fix anything — just produce a brief readable verdict.\n\n");
+
+        prompt.append("══ Action log stats (last 24h) ══\n");
+        prompt.append(actionStats == null || actionStats.isBlank() ? "(no actions logged)\n" : actionStats);
+        prompt.append("\n");
+
+        prompt.append("══ Error log tail (last ~200 lines) ══\n");
+        prompt.append(errLogTail == null || errLogTail.isBlank() ? "(empty)\n" : errLogTail);
+        prompt.append("\n");
+
+        prompt.append("══ Google service status ══\n");
+        prompt.append(googleHealth == null ? "unknown\n" : googleHealth + "\n");
+
+        prompt.append("\nProduce a report in this exact format (Telegram HTML, under 250 words):\n\n");
+        prompt.append("<b>🌙 Nightly Audit</b>  [STATUS]\n");
+        prompt.append("─────────────────\n");
+        prompt.append("Replace [STATUS] with 🟢 healthy / 🟡 watch / 🔴 issue.\n");
+        prompt.append("Then 1-3 short bullet points of what stood out (ONLY genuine concerns — don't pad).\n");
+        prompt.append("Then ONE concrete suggestion if applicable, else skip the section.\n\n");
+        prompt.append("If the day was clean, the entire report can be just '🟢 All clear — no notable issues.'\n");
+        prompt.append("Don't manufacture findings. Be terse.");
+
+        String sys = "You are a code/runtime auditor. You produce short, factual reports. " +
+                     "Never fabricate issues. Use the supplied data only — do not speculate about " +
+                     "things you can't see. Output is plain text + simple Telegram HTML (b, i, code).";
+
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("model", ModelRouting.REFLECTIONS); // periodic reflection over recent history
+            body.put("max_tokens", 600);
+            body.put("system", sys);
+            body.put("messages", List.of(Map.of("role", "user", "content", prompt.toString())));
+            String resp = postJson(body);
+            JsonNode root = mapper.readTree(resp);
+            String text = root.path("content").path(0).path("text").asText("").trim();
+            return text.isBlank() ? null : text;
+        } catch (Exception e) {
+            System.err.println("Daily audit call failed: " + e.getMessage());
+            return null;
+        }
+    }
+
     public String generateReminderMessage(Task task, String label, int ignoredCount, int habitStreak) {
         String urgency = switch (task.getPriority()) {
             case HIGH   -> "high priority";
@@ -1352,7 +1936,7 @@ public class ClaudeService {
         String sys = "You write short reminder messages. Return ONLY the message — no JSON, no quotes.";
         try {
             Map<String, Object> body = new LinkedHashMap<>();
-            body.put("model", MODEL_FAST);
+            body.put("model", ModelRouting.REFLECTIONS);
             body.put("max_tokens", 100);
             body.put("system", sys);
             body.put("messages", List.of(Map.of("role", "user", "content", prompt.toString())));
@@ -1370,7 +1954,7 @@ public class ClaudeService {
         try {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);
-            body.put("max_tokens", MODEL_SMART.equals(model) ? 4096 : 1024);
+            body.put("max_tokens", ModelRouting.AGENTIC.equals(model) ? 4096 : 1024);
 
             // Cache the system prompt — it's large and identical across turns
             body.put("system", List.of(Map.of(

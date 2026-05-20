@@ -6,6 +6,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 import java.util.Properties;
 
@@ -47,12 +50,17 @@ public class BotConfig {
     private final String notionJournalDbId;
     private final String googleCredentialsPath;
     private final String googleTokensPath;
+    private final String composioApiKey;
+    private final String composioUserId;
+    private final String moonshotApiKey;
     private final long allowedUserId;
     private final long groupChatId;
     private final ZoneId zoneId;
     private final LocalTime morningSummaryTime;
     private final LocalTime morningBriefTime;
     private final LocalTime moodCheckinTime;
+    private final List<LocalTime> auditTimes;
+    private final String errLogPath;
     private final int schedulerCheckIntervalSeconds;
     private final String dbPath;
     private final int defaultStaleDays;
@@ -61,9 +69,12 @@ public class BotConfig {
                       String notionApiKey, String notionDatabaseId,
                       String notionJournalApiKey, String notionJournalDbId,
                       String googleCredentialsPath, String googleTokensPath,
+                      String composioApiKey, String composioUserId,
+                      String moonshotApiKey,
                       long allowedUserId, long groupChatId,
                       ZoneId zoneId, LocalTime morningSummaryTime,
                       LocalTime morningBriefTime, LocalTime moodCheckinTime,
+                      List<LocalTime> auditTimes, String errLogPath,
                       int schedulerCheckIntervalSeconds, String dbPath, int defaultStaleDays) {
         this.botUsername = botUsername;
         this.botToken = botToken;
@@ -75,12 +86,17 @@ public class BotConfig {
         this.notionJournalDbId = notionJournalDbId;
         this.googleCredentialsPath = googleCredentialsPath;
         this.googleTokensPath = googleTokensPath;
+        this.composioApiKey = composioApiKey;
+        this.composioUserId = composioUserId;
+        this.moonshotApiKey = moonshotApiKey;
         this.allowedUserId = allowedUserId;
         this.groupChatId = groupChatId;
         this.zoneId = zoneId;
         this.morningSummaryTime = morningSummaryTime;
         this.morningBriefTime = morningBriefTime;
         this.moodCheckinTime = moodCheckinTime;
+        this.auditTimes = List.copyOf(auditTimes);
+        this.errLogPath = errLogPath;
         this.schedulerCheckIntervalSeconds = schedulerCheckIntervalSeconds;
         this.dbPath = dbPath;
         this.defaultStaleDays = defaultStaleDays;
@@ -102,12 +118,30 @@ public class BotConfig {
         String notionJrnlId = firstNonBlank(System.getenv("NOTION_JOURNAL_DB_ID"), properties.getProperty("notion.journal.db.id"));
         String googleCreds  = firstNonBlank(System.getenv("GOOGLE_CREDENTIALS_PATH"), properties.getProperty("google.credentials.path"));
         String googleTokens = firstNonBlank(System.getenv("GOOGLE_TOKENS_PATH"), properties.getProperty("google.tokens.path", "data/google_tokens"));
+        String composioKey  = firstNonBlank(System.getenv("COMPOSIO_API_KEY"), properties.getProperty("composio.api.key"));
+        String composioUser = firstNonBlank(System.getenv("COMPOSIO_USER_ID"), properties.getProperty("composio.user.id", "default"));
+        String moonshotKey  = firstNonBlank(System.getenv("MOONSHOT_API_KEY"), properties.getProperty("moonshot.api.key"));
         String allowedUser  = firstNonBlank(System.getenv("ALLOWED_USER_ID"),     properties.getProperty("allowed.user.id", "0"));
         String groupChat    = firstNonBlank(System.getenv("GROUP_CHAT_ID"),     properties.getProperty("group.chat.id", "0"));
         String timezone     = firstNonBlank(System.getenv("APP_TIMEZONE"),      properties.getProperty("app.timezone", "Asia/Singapore"));
         String morningTime  = firstNonBlank(System.getenv("APP_MORNING_SUMMARY_TIME"), properties.getProperty("app.morning.summary.time", "08:00"));
         String briefTime    = firstNonBlank(System.getenv("MORNING_BRIEF_TIME"), properties.getProperty("morning.brief.time", "08:00"));
         String moodTime     = firstNonBlank(System.getenv("MOOD_CHECKIN_TIME"), properties.getProperty("mood.checkin.time", "21:00"));
+        // Audit cadence: comma-separated HH:mm list. Default = twice daily (03:00 + 15:00).
+        // Backward compat: if AUDIT_TIMES is unset but the legacy NIGHTLY_AUDIT_TIME is, honor that single value.
+        String auditTimesRaw = firstNonBlank(System.getenv("AUDIT_TIMES"), properties.getProperty("audit.times"));
+        if (isBlank(auditTimesRaw)) {
+            String legacy = firstNonBlank(System.getenv("NIGHTLY_AUDIT_TIME"), properties.getProperty("nightly.audit.time"));
+            auditTimesRaw = isBlank(legacy) ? "03:00,15:00" : legacy;
+        }
+        List<LocalTime> auditTimes = new ArrayList<>();
+        for (String chunk : auditTimesRaw.split(",")) {
+            String t = chunk.trim();
+            if (!t.isEmpty()) auditTimes.add(LocalTime.parse(t));
+        }
+        if (auditTimes.isEmpty()) auditTimes = Arrays.asList(LocalTime.of(3, 0), LocalTime.of(15, 0));
+
+        String errLog       = firstNonBlank(System.getenv("APP_ERR_LOG_PATH"), properties.getProperty("app.err.log.path", "logs/taskbot.err.log"));
         String interval     = firstNonBlank(System.getenv("APP_SCHEDULER_INTERVAL_SECONDS"), properties.getProperty("app.scheduler.check.interval.seconds", "60"));
         String dbPath       = firstNonBlank(System.getenv("APP_DB_PATH"),       properties.getProperty("app.db.path", "data/taskbot.db"));
         String staleDays    = firstNonBlank(System.getenv("APP_DEFAULT_STALE_DAYS"), properties.getProperty("app.default.stale.days", "5"));
@@ -130,10 +164,14 @@ public class BotConfig {
                 notionJrnlId   != null ? notionJrnlId.trim()   : null,
                 googleCreds    != null ? googleCreds.trim()    : null,
                 googleTokens   != null ? googleTokens.trim()   : "data/google_tokens",
+                composioKey    != null ? composioKey.trim()    : null,
+                composioUser   != null ? composioUser.trim()   : "default",
+                moonshotKey    != null ? moonshotKey.trim()    : null,
                 allowedUser    != null ? Long.parseLong(allowedUser.trim()) : 0L,
                 groupChat      != null ? Long.parseLong(groupChat.trim())  : 0L,
                 ZoneId.of(timezone.trim()), LocalTime.parse(morningTime.trim()),
                 LocalTime.parse(briefTime.trim()), LocalTime.parse(moodTime.trim()),
+                auditTimes, errLog.trim(),
                 Integer.parseInt(interval.trim()), dbPath.trim(), Integer.parseInt(staleDays.trim()));
     }
 
@@ -150,12 +188,17 @@ public class BotConfig {
     public String getNotionJournalDbId()         { return notionJournalDbId; }
     public String getGoogleCredentialsPath()     { return googleCredentialsPath; }
     public String getGoogleTokensPath()          { return googleTokensPath; }
+    public String getComposioApiKey()            { return composioApiKey; }
+    public String getComposioUserId()            { return composioUserId; }
+    public String getMoonshotApiKey()            { return moonshotApiKey; }
     public long getAllowedUserId()                { return allowedUserId; }
     public long getGroupChatId()                 { return groupChatId; }
     public ZoneId getZoneId()                    { return zoneId; }
     public LocalTime getMorningSummaryTime()      { return morningSummaryTime; }
     public LocalTime getMorningBriefTime()        { return morningBriefTime; }
     public LocalTime getMoodCheckinTime()         { return moodCheckinTime; }
+    public List<LocalTime> getAuditTimes()         { return auditTimes; }
+    public String getErrLogPath()                 { return errLogPath; }
     public int getSchedulerCheckIntervalSeconds() { return schedulerCheckIntervalSeconds; }
     public String getDbPath()                    { return dbPath; }
     public int getDefaultStaleDays()             { return defaultStaleDays; }

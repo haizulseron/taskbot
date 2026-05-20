@@ -19,8 +19,8 @@ import java.util.Map;
 public class InboxService {
 
     private static final String CLAUDE_API_URL = "https://api.anthropic.com/v1/messages";
-    private static final String MODEL_CLASSIFY = "claude-haiku-4-5-20251001";
-    private static final String MODEL_VISION   = "claude-sonnet-4-6";
+    private static final String MODEL_CLASSIFY = ModelRouting.REFLECTIONS;
+    private static final String MODEL_VISION   = ModelRouting.REASONING;
 
     private static final String CLASSIFY_SYSTEM_PROMPT = """
             You are a personal assistant. Given the following content, classify it into ONE of three categories \

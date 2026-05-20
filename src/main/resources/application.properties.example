@@ -22,11 +22,22 @@ app.default.stale.days=3
 notion.api.key=YOUR_NOTION_API_KEY
 notion.database.id=YOUR_NOTION_DATABASE_ID
 
-# Google integration (Gmail, Calendar, Drive)
-# 1. Go to console.cloud.google.com → create project → enable Gmail, Calendar, Drive APIs
+# Google integration — only Google Tasks runs through the legacy hand-rolled
+# OAuth path. Gmail, Calendar, and Drive are now brokered via Composio (below).
+# 1. Go to console.cloud.google.com → create project → enable the Google Tasks API
 # 2. Create OAuth 2.0 credentials (Desktop app) → download as credentials.json
 # 3. Set the path to your credentials.json below
-# 4. Leave blank to disable Google features
-# 5. After starting the bot, send /authorize to complete the one-time OAuth flow
+# 4. After starting the bot, send /authorize to complete the one-time OAuth flow
 google.credentials.path=/path/to/credentials.json
 google.tokens.path=data/google_tokens
+
+# Composio brokered integrations (Gmail, Google Calendar, Google Drive)
+# Get your API key from https://app.composio.dev → Settings → API Keys
+# Connect Gmail, Google Calendar, and Google Drive under your default user_id
+# in the Composio dashboard before starting the bot.
+composio.api.key=YOUR_COMPOSIO_API_KEY
+composio.user.id=default
+
+# Moonshot/Kimi for high-volume background slots (memory summarization, subconscious).
+# Get key at platform.moonshot.ai. Leave blank to fall back to Haiku on Anthropic.
+moonshot.api.key=YOUR_MOONSHOT_API_KEY

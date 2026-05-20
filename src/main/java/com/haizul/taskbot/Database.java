@@ -127,6 +127,23 @@ public class Database {
                     """);
             s.executeUpdate(
                     "CREATE INDEX IF NOT EXISTS idx_profile_user ON user_profile(user_id)");
+            // Action audit log — every tool call (success or error) records a row.
+            // Used by the phantom-action detector and grounding logic so the bot
+            // reasons from "what actually happened" rather than from chatty prose.
+            s.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS action_log (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id         INTEGER NOT NULL,
+                        ts              INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                        tool_name       TEXT    NOT NULL,
+                        input_summary   TEXT,
+                        status          TEXT    NOT NULL,
+                        error_category  TEXT,
+                        result_summary  TEXT
+                    )
+                    """);
+            s.executeUpdate(
+                    "CREATE INDEX IF NOT EXISTS idx_action_user_ts ON action_log(user_id, ts DESC)");
         } catch (SQLException e) {
             throw new RuntimeException("Failed to initialize database", e);
         }
@@ -146,6 +163,10 @@ public class Database {
         migrate("ALTER TABLE tasks ADD COLUMN google_task_id TEXT");
         migrate("ALTER TABLE tasks ADD COLUMN google_tasklist_id TEXT");
         migrate("ALTER TABLE tasks ADD COLUMN google_event_id TEXT");
+
+        // Track the message ID of the currently-pinned /tasks summary so we can
+        // unpin the stale one and pin a fresh one on every task-related change.
+        migrate("ALTER TABLE user_settings ADD COLUMN pinned_tasks_message_id INTEGER");
 
         // Mood log table (Feature 4)
         try (Connection c = getConnection(); Statement s2 = c.createStatement()) {
@@ -325,6 +346,83 @@ public class Database {
         } catch (SQLException e) {
             System.err.println("Failed to open connection for replaceProfile: " + e.getMessage());
         }
+    }
+
+    // ── Action audit log ──────────────────────────────────────────────────────
+    // Records every tool execution so the bot can ground itself in "what actually
+    // happened" instead of relying on its own chatty descriptions in conversation
+    // history. The phantom-action detector and reflection prompts read from here.
+
+    public record ActionLogEntry(long ts, String toolName, String inputSummary,
+                                  String status, String errorCategory, String resultSummary) {}
+
+    /** Record one tool call. Status is "success" or "error". */
+    public void logAction(long userId, String toolName, String inputSummary,
+                          String status, String errorCategory, String resultSummary) {
+        String sql = "INSERT INTO action_log (user_id, tool_name, input_summary, status, error_category, result_summary) " +
+                     "VALUES (?, ?, ?, ?, ?, ?)";
+        try (Connection c = getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setString(2, toolName == null ? "?" : toolName);
+            ps.setString(3, truncate(inputSummary, 500));
+            ps.setString(4, status);
+            ps.setString(5, errorCategory);
+            ps.setString(6, truncate(resultSummary, 500));
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Failed to log action: " + e.getMessage());
+        }
+        // Keep last 500 actions per user — plenty for grounding without unbounded growth
+        pruneActionLog(userId, 500);
+    }
+
+    /** Recent actions for a user within the last `withinSeconds`, newest first. */
+    public List<ActionLogEntry> getRecentActions(long userId, int withinSeconds, int limit) {
+        String sql = """
+                SELECT ts, tool_name, input_summary, status, error_category, result_summary
+                FROM action_log
+                WHERE user_id = ? AND ts >= (strftime('%s','now') - ?)
+                ORDER BY ts DESC LIMIT ?
+                """;
+        List<ActionLogEntry> rows = new ArrayList<>();
+        try (Connection c = getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setInt(2, withinSeconds);
+            ps.setInt(3, limit);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                rows.add(new ActionLogEntry(
+                        rs.getLong("ts"),
+                        rs.getString("tool_name"),
+                        rs.getString("input_summary"),
+                        rs.getString("status"),
+                        rs.getString("error_category"),
+                        rs.getString("result_summary")));
+            }
+        } catch (SQLException e) {
+            System.err.println("Failed to load action log: " + e.getMessage());
+        }
+        return rows;
+    }
+
+    private void pruneActionLog(long userId, int keepCount) {
+        String sql = """
+                DELETE FROM action_log
+                WHERE user_id = ? AND id NOT IN (
+                    SELECT id FROM action_log WHERE user_id = ? ORDER BY id DESC LIMIT ?
+                )
+                """;
+        try (Connection c = getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setLong(2, userId);
+            ps.setInt(3, keepCount);
+            ps.executeUpdate();
+        } catch (SQLException ignored) {}
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return null;
+        return s.length() > max ? s.substring(0, max) + "..." : s;
     }
 
     // ── Migrations ────────────────────────────────────────────────────────────

@@ -27,3 +27,9 @@ data/google_tokens/
 *.db
 *.db-journal
 /data/
+
+# MCP server local state — secrets, venv, runtime logs
+mcp-server/auth-token.txt
+mcp-server/cloudflared.conf
+mcp-server/.venv/
+mcp-server/logs/

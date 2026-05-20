@@ -20,7 +20,7 @@ public class NoteService {
     ) {}
 
     private static final String API_URL = "https://api.anthropic.com/v1/messages";
-    private static final String MODEL   = "claude-haiku-4-5-20251001";
+    private static final String MODEL   = ModelRouting.REFLECTIONS;
 
     private static final String SYSTEM_PROMPT = """
             You are a note structuring assistant. The user sends a raw note (text or voice transcript).

@@ -4,9 +4,12 @@ import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.ParseMode;
+import org.telegram.telegrambots.meta.api.methods.pinnedmessages.PinChatMessage;
+import org.telegram.telegrambots.meta.api.methods.pinnedmessages.UnpinChatMessage;
 import org.telegram.telegrambots.meta.api.methods.send.SendDocument;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
+import org.telegram.telegrambots.meta.api.objects.message.Message;
 import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
@@ -43,18 +46,14 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private final GoogleAuthService googleAuthService;
     private final String botUsername;
 
-    private volatile GmailService gmailService;
-    private volatile CalendarService calendarService;
-    private volatile DriveService driveService;
-
     // New services (set via setter after construction)
-    private GoogleCalendarService googleCalendarService;
     private GoogleTasksService googleTasksService;
     private JournalService journalService;
     private InboxService inboxService;
     private MoodService moodService;
     private CountdownService countdownService;
     private GoalService goalService;
+    private ComposioService composioService;
 
     private final long allowedUserId;
     private final long groupChatId;
@@ -62,7 +61,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final Map<Long, PendingInput> pendingInputs = new ConcurrentHashMap<>();
     // Files sent by the user via Telegram, queued for email attachment
-    private final Map<Long, List<GmailService.Attachment>> pendingAttachments = new ConcurrentHashMap<>();
+    private final Map<Long, List<Attachment>> pendingAttachments = new ConcurrentHashMap<>();
     // Timestamps for pending data — used to expire stale entries
     private final Map<Long, Long> pendingInputTimestamps     = new ConcurrentHashMap<>();
     private final Map<Long, Long> pendingAttachmentTimestamps = new ConcurrentHashMap<>();
@@ -82,27 +81,19 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         this.botUsername      = config.getBotUsername();
         this.allowedUserId    = config.getAllowedUserId();
         this.groupChatId      = config.getGroupChatId();
-        initGoogleServices();
     }
 
-    public void setExtraServices(GoogleCalendarService gcal, GoogleTasksService gtasks,
+    public void setExtraServices(GoogleTasksService gtasks,
                                   JournalService journal, InboxService inbox,
-                                  MoodService mood, CountdownService countdown, GoalService goal) {
-        this.googleCalendarService = gcal;
+                                  MoodService mood, CountdownService countdown, GoalService goal,
+                                  ComposioService composio) {
         this.googleTasksService    = gtasks;
         this.journalService        = journal;
         this.inboxService          = inbox;
         this.moodService           = mood;
         this.countdownService      = countdown;
         this.goalService           = goal;
-    }
-
-    private void initGoogleServices() {
-        if (googleAuthService == null || !googleAuthService.isAuthorized()) return;
-        try { this.gmailService    = new GmailService(googleAuthService);    } catch (Exception e) { System.err.println("GmailService init failed: "    + e.getMessage()); }
-        try { this.calendarService = new CalendarService(googleAuthService, java.time.ZoneId.of("Asia/Singapore")); } catch (Exception e) { System.err.println("CalendarService init failed: " + e.getMessage()); }
-        try { this.driveService    = new DriveService(googleAuthService);    } catch (Exception e) { System.err.println("DriveService init failed: "    + e.getMessage()); }
-        System.out.println("Google services initialized (Gmail, Calendar, Drive).");
+        this.composioService       = composio;
     }
 
     @Override
@@ -179,7 +170,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         try {
             byte[] data = downloadTelegramFile(doc.getFileId());
             pendingAttachments.computeIfAbsent(userId, k -> new ArrayList<>())
-                    .add(new GmailService.Attachment(filename, data));
+                    .add(new Attachment(filename, data));
             pendingAttachmentTimestamps.put(userId, System.currentTimeMillis());
             int total = pendingAttachments.get(userId).size();
             sendText(chatId, "📎 Got \"" + filename + "\" (" + data.length / 1024 + " KB). " + total
@@ -202,7 +193,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             byte[] data = downloadTelegramFile(fileId);
             String filename = "photo_" + System.currentTimeMillis() + ".jpg";
             pendingAttachments.computeIfAbsent(userId, k -> new ArrayList<>())
-                    .add(new GmailService.Attachment(filename, data));
+                    .add(new Attachment(filename, data));
             pendingAttachmentTimestamps.put(userId, System.currentTimeMillis());
             int total = pendingAttachments.get(userId).size();
 
@@ -291,8 +282,11 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 sendText(chatId, "🔄 Authorizing...");
                 boolean ok = googleAuthService.exchangeCode(text.trim());
                 if (ok) {
-                    initGoogleServices();
-                    sendText(chatId, "✅ Google account linked! Gmail, Calendar, and Drive are now active.");
+                    if (claudeService != null) claudeService.clearGoogleOffline();
+                    sendText(chatId, "✅ Google account linked for Google Tasks sync.\n\n"
+                            + "⚠️ Restart the bot (<code>supervisorctl restart taskbot</code>) so Google Tasks "
+                            + "picks up the fresh credentials.\n\n"
+                            + "Note: Gmail / Calendar / Drive are now brokered via Composio — connect those in your Composio dashboard, not here.");
                 } else {
                     sendText(chatId, "❌ Authorization failed. Please try /authorize again.");
                 }
@@ -308,12 +302,12 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             case "/authorize"         -> { handleAuthorize(chatId, userId); return; }
             case "/myprofile"         -> { sendText(chatId, claudeService != null ? claudeService.getProfileText(userId) : "AI not configured."); return; }
             case "/clearattachments"  -> {
-                List<GmailService.Attachment> removed = pendingAttachments.remove(userId);
+                List<Attachment> removed = pendingAttachments.remove(userId);
                 sendText(chatId, removed != null && !removed.isEmpty()
                         ? "🗑 Cleared " + removed.size() + " queued attachment(s)." : "No attachments queued.");
                 return;
             }
-            case "/tasks"        -> { sendTaskList(chatId, "📋 Active Tasks", taskService.getActiveTasks(userId)); return; }
+            case "/tasks"        -> { refreshPinnedTaskList(chatId, userId); return; }
             case "/today"        -> { sendTaskList(chatId, "🗓 Due Today", taskService.getTodayTasks(userId)); return; }
             case "/overdue"      -> { sendTaskList(chatId, "⚠️ Overdue", taskService.getOverdueTasks(userId)); return; }
             case "/stale"        -> { sendTaskList(chatId, "🧊 Stale", taskService.getStaleTasks(userId)); return; }
@@ -410,7 +404,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
         // ── Java pre-processing: task completion ─────────────────────────────
         // Handle directly in Java — far more reliable than depending on LLM tool calls.
-        String bulkFilter = extractBulkDoneFilter(lower);
+        String bulkFilter = IntentPatterns.extractBulkDoneFilter(lower);
         if (bulkFilter != null) {
             if (bulkFilter.matches("(?i)daily|high|medium|low")) {
                 Task.Priority p = Task.Priority.fromText(bulkFilter);
@@ -422,10 +416,11 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 sendText(chatId, n > 0 ? "✅ Marked all " + n + " task(s) done!"
                                        : "No active tasks to complete.");
             }
+            refreshPinnedTaskList(chatId, userId);
             return;
         }
 
-        String doneHint = extractMarkDoneHint(lower);
+        String doneHint = IntentPatterns.extractMarkDoneHint(lower);
         if (doneHint != null) {
             var opt = taskService.findTaskByTitleHint(userId, doneHint);
             if (opt.isPresent()) {
@@ -434,6 +429,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 taskService.markDone(userId, task.shortId());
                 taskService.resetReminderIgnoredCount(task.getId());
                 sendText(chatId, "✅ Done! \"" + esc(task.getTitle()) + "\" marked complete.");
+                refreshPinnedTaskList(chatId, userId);
                 return;
             }
             // No match — fall through to Claude, it might interpret differently
@@ -458,14 +454,14 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
 
     private void routeToAgent(long chatId, long userId, String text) {
         if (claudeService == null) { sendText(chatId, "AI not configured. Set CLAUDE_API_KEY."); return; }
-        List<GmailService.Attachment> attachments = pendingAttachments.getOrDefault(userId, List.of());
+        List<Attachment> attachments = pendingAttachments.getOrDefault(userId, List.of());
         String response = claudeService.chat(userId, chatId, text,
                 taskService, notionService, noteService,
-                gmailService, calendarService, driveService,
-                googleCalendarService, journalService,
+                journalService,
                 attachments,
                 msg -> sendText(chatId, msg),
-                (filename, data) -> sendDocument(chatId, filename, data));
+                (filename, data) -> sendDocument(chatId, filename, data),
+                () -> refreshPinnedTaskList(chatId, userId));
         // Clear queued attachments after any email draft/reply was created
         if (response != null && (response.contains("Draft saved") || response.contains("Reply draft saved"))) {
             pendingAttachments.remove(userId);
@@ -483,14 +479,18 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         if (googleAuthService == null || !googleAuthService.isInitialized()) {
             sendText(chatId, "Google integration not configured.\n\nSet GOOGLE_CREDENTIALS_PATH in your config to enable Gmail, Calendar, and Drive."); return;
         }
-        if (googleAuthService.isAuthorized()) {
-            sendText(chatId, "✅ Google account already linked.\n\nGmail, Calendar, and Drive are active."); return;
-        }
+        // Always allow re-auth: a stored refresh token can be revoked server-side
+        // (Google's 6-month inactivity policy, password change, manual revoke), and we
+        // can't tell without calling the API. Letting the user re-run /authorize
+        // overwrites the dead token with a fresh one.
         String url = googleAuthService.getAuthorizationUrl();
         pendingInputs.put(userId, new PendingInput(PendingKind.GOOGLE_OAUTH_CODE, null));
         pendingInputTimestamps.put(userId, System.currentTimeMillis());
         sendText(chatId, "🔐 Authorize Google access:\n\n" + url
-                + "\n\n1. Open the link above\n2. Sign in and grant access\n3. Copy the code and send it here");
+                + "\n\n1. Open the link above\n"
+                + "2. Sign in and grant access\n"
+                + "3. The browser will try to load <code>http://localhost/?code=...</code> and fail — that's expected\n"
+                + "4. Copy the entire localhost URL from the address bar (or just the <code>code=...</code> value) and send it here");
     }
 
     // ── Callbacks ────────────────────────────────────────────────────────────
@@ -509,6 +509,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 taskService.resetReminderIgnoredCount(task.getId());
                 try { answer(update, "Done!"); editMessage(chatId, messageId, "✅ " + esc(task.getTitle()), null); }
                 catch (TelegramApiException e) { throw new RuntimeException(e); }
+                refreshPinnedTaskList(chatId, userId);
             }, () -> sendText(chatId, "Task not found."));
             return;
         }
@@ -519,6 +520,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 taskService.deleteTask(userId, id);
                 try { answer(update, "Deleted"); editMessage(chatId, messageId, "🗑 " + esc(task.getTitle()), null); }
                 catch (TelegramApiException e) { throw new RuntimeException(e); }
+                refreshPinnedTaskList(chatId, userId);
             }, () -> sendText(chatId, "Task not found."));
             return;
         }
@@ -528,6 +530,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 taskService.snoozeTask(userId, id, Duration.ofHours(24));
                 try { answer(update, "Snoozed 24h"); editMessage(chatId, messageId, "⏰ Snoozed: " + esc(task.getTitle()), null); }
                 catch (TelegramApiException e) { throw new RuntimeException(e); }
+                refreshPinnedTaskList(chatId, userId);
             }, () -> sendText(chatId, "Task not found."));
             return;
         }
@@ -535,6 +538,9 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
             int n = taskService.deleteAllDone(userId);
             answer(update, n > 0 ? "Cleared " + n : "Nothing");
             editMessage(chatId, messageId, n > 0 ? "🗑 Cleared " + n + " completed tasks." : "No completed tasks.", null);
+            // /cleardone doesn't change ACTIVE tasks, but refresh anyway so the pinned summary
+            // reflects "Done" count moving to 0.
+            refreshPinnedTaskList(chatId, userId);
             return;
         }
         if (data.startsWith("filter:")) {
@@ -566,6 +572,58 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
         }
         execute(SendMessage.builder().chatId(chatId).text(html)
                 .parseMode(ParseMode.HTML).replyMarkup(keyboard).build());
+    }
+
+    // ── Pinned active-tasks summary ───────────────────────────────────────────
+    // Sends the active-tasks list, pins it, and unpins whatever was previously
+    // pinned for this user. Called from /tasks and from any task-mutating action
+    // so the pinned summary always reflects current state.
+
+    public void refreshPinnedTaskList(long chatId, long userId) {
+        try {
+            List<Task> tasks = taskService.getActiveTasks(userId);
+            String html = taskService.formatTaskListHtml("📋 Active Tasks", tasks);
+            Message sent;
+            try {
+                sent = telegramClient.execute(SendMessage.builder()
+                        .chatId(chatId).text(html)
+                        .parseMode(ParseMode.HTML)
+                        .replyMarkup(buildFilterKeyboard())
+                        .build());
+            } catch (TelegramApiException e) {
+                // Fallback to plain text if HTML parse fails
+                String plain = html.replaceAll("<[^>]+>", "")
+                        .replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+                sent = telegramClient.execute(SendMessage.builder()
+                        .chatId(chatId).text(plain)
+                        .replyMarkup(buildFilterKeyboard())
+                        .build());
+            }
+            if (sent == null) return;
+            int newId = toIntExact(sent.getMessageId());
+
+            Integer prevId = taskService.getPinnedTasksMessageId(userId);
+            if (prevId != null && prevId != newId) {
+                try {
+                    telegramClient.execute(UnpinChatMessage.builder()
+                            .chatId(chatId).messageId(prevId).build());
+                } catch (TelegramApiException ignored) {
+                    // Old message may have been deleted or already unpinned — ignore
+                }
+            }
+            try {
+                telegramClient.execute(PinChatMessage.builder()
+                        .chatId(chatId).messageId(newId)
+                        .disableNotification(true)
+                        .build());
+                taskService.setPinnedTasksMessageId(userId, newId);
+            } catch (TelegramApiException e) {
+                // Lacking pin permission isn't fatal — just log and skip persisting
+                System.err.println("Pin task list failed: " + e.getMessage());
+            }
+        } catch (Exception e) {
+            System.err.println("refreshPinnedTaskList failed: " + e.getMessage());
+        }
     }
 
     private void sendDoneList(long chatId, List<Task> tasks) {
@@ -801,20 +859,19 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 ? inboxService.classifyContent(extracted) : null;
         String category = classified != null ? classified.category() : null;
 
-        // 1) CALENDAR — has an explicit event time.
+        // 1) CALENDAR — has an explicit event time. Route through Claude so the
+        // existing Composio-brokered add_event tool handles it (consistent path).
         if ("CALENDAR".equalsIgnoreCase(category) && classified.startDatetime() != null
-                && !classified.startDatetime().isBlank() && calendarService != null) {
-            try {
-                String title = classified.title() != null ? classified.title() : extracted;
-                if (title.length() > 100) title = title.substring(0, 100);
-                var ev = calendarService.addEvent(title, classified.startDatetime(),
-                        classified.endDatetime(), classified.body(), false);
-                sendText(chatId, "📅 " + esc(ev.title()) + " — " + esc(ev.start()));
-                return;
-            } catch (Exception e) {
-                System.err.println("[GroupInbox] Calendar add failed, falling back to task: " + e.getMessage());
-                // fall through to TASK
-            }
+                && !classified.startDatetime().isBlank()) {
+            String title = classified.title() != null ? classified.title() : extracted;
+            if (title.length() > 100) title = title.substring(0, 100);
+            String routed = "Add to calendar: \"" + title + "\" starting " + classified.startDatetime()
+                    + (classified.endDatetime() != null && !classified.endDatetime().isBlank()
+                        ? " until " + classified.endDatetime() : "")
+                    + (classified.body() != null && !classified.body().isBlank()
+                        ? "\nDetails: " + classified.body() : "");
+            routeToAgent(chatId, userId, routed);
+            return;
         }
 
         // 2) TASK — actionable work. Also fall-through target if Calendar failed.
@@ -997,7 +1054,7 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
     }
 
     private void handleTimeBlock(long chatId, long userId) {
-        if (googleCalendarService == null) { sendText(chatId, "Google Calendar not linked. Use /authorize first."); return; }
+        if (composioService == null) { sendText(chatId, "Calendar not configured. Set composio.api.key in application.properties."); return; }
         routeToAgent(chatId, userId, "Suggest time blocks for my pending tasks based on today's calendar gaps");
     }
 
@@ -1151,56 +1208,5 @@ public class TaskBot implements LongPollingSingleThreadUpdateConsumer {
                 """;
     }
 
-    // ── Task completion pattern matching ─────────────────────────────────────
-    // These run in Java BEFORE Claude sees the message — instant and reliable.
-
-    /**
-     * Extract a task hint from mark-done messages. Returns null if no pattern matches.
-     * Covers: "mark X done", "mark X as done", "complete X", "done X", "finish X",
-     * "done with X", "i'm done with X", "finished X", "completed X"
-     */
-    private static String extractMarkDoneHint(String lower) {
-        java.util.regex.Matcher m;
-        // "mark X done" / "mark X as done"
-        m = java.util.regex.Pattern.compile("^mark\\s+(.+?)\\s+(?:as\\s+)?done\\s*$").matcher(lower);
-        if (m.find()) return cleanHint(m.group(1));
-        // "complete X" / "done X" / "finish X" / "finished X" / "completed X"
-        m = java.util.regex.Pattern.compile("^(?:complete|done|finish|finished|completed)\\s+(.+?)\\s*$").matcher(lower);
-        if (m.find()) return cleanHint(m.group(1));
-        // "done with X" / "i'm done with X" / "i am done with X"
-        m = java.util.regex.Pattern.compile("^(?:i'?m\\s+|i\\s+am\\s+)?done\\s+with\\s+(.+?)\\s*$").matcher(lower);
-        if (m.find()) return cleanHint(m.group(1));
-        // "X is done" / "X done"
-        m = java.util.regex.Pattern.compile("^(.+?)\\s+(?:is\\s+)?done\\s*$").matcher(lower);
-        if (m.find()) {
-            String hint = m.group(1).trim();
-            // Avoid false positives on common phrases
-            if (!hint.matches("(?i)it|that|this|what|everything|all|nothing")) return cleanHint(hint);
-        }
-        return null;
-    }
-
-    /**
-     * Detect bulk completion patterns. Returns priority filter (e.g. "daily") or "all".
-     * Returns null if not a bulk pattern.
-     */
-    private static String extractBulkDoneFilter(String lower) {
-        java.util.regex.Matcher m;
-        // "complete all daily tasks" / "done all daily" / "mark all daily done" / "finish all daily tasks"
-        m = java.util.regex.Pattern.compile("^(?:complete|done|finish|mark)\\s+(?:all|both|every)\\s+(?:(?:my|the)\\s+)?(daily|high|medium|low)(?:\\s+tasks?)?(?:\\s+(?:as\\s+)?done)?\\s*$").matcher(lower);
-        if (m.find()) return m.group(1);
-        // "mark all daily tasks done" / "mark all daily as done"
-        m = java.util.regex.Pattern.compile("^mark\\s+(?:all|both|every)\\s+(?:(?:my|the)\\s+)?(daily|high|medium|low)(?:\\s+tasks?)?\\s+(?:as\\s+)?done\\s*$").matcher(lower);
-        if (m.find()) return m.group(1);
-        // "complete all tasks" / "done everything" / "mark all done" / "mark everything done"
-        m = java.util.regex.Pattern.compile("^(?:complete|done|finish|mark)\\s+(?:all(?:\\s+(?:my|the))?(?:\\s+tasks?)?|everything)(?:\\s+(?:as\\s+)?done)?\\s*$").matcher(lower);
-        if (m.find()) return "all";
-        return null;
-    }
-
-    private static String cleanHint(String hint) {
-        return hint.replaceAll("(?i)^(my|the|a|task|tasks)\\s+", "")
-                   .replaceAll("(?i)\\s+(task|tasks)$", "")
-                   .trim();
-    }
+    // Intent regex extraction lives in IntentPatterns.java — pure, testable, isolated.
 }

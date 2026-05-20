@@ -38,6 +38,26 @@ public class Main {
             }
         }
 
+        // ── Composio (brokers Gmail / Calendar / Drive) ──────────────────────
+        String composioKey = config.getComposioApiKey();
+        ComposioService composioService = (composioKey != null && !composioKey.isBlank())
+                ? new ComposioService(composioKey, config.getComposioUserId()) : null;
+        if (composioService != null) {
+            System.out.println("Composio initialized for user_id=" + config.getComposioUserId());
+        } else {
+            System.err.println("Composio not configured — Gmail/Calendar/Drive tools will be disabled.");
+        }
+
+        // ── Moonshot/Kimi (Memory summarization + Subconscious routing slots) ─
+        String moonshotKey = config.getMoonshotApiKey();
+        KimiService kimiService = (moonshotKey != null && !moonshotKey.isBlank())
+                ? new KimiService(moonshotKey) : null;
+        if (kimiService != null) {
+            System.out.println("Kimi (Moonshot) initialized. Memory summarization → " + ModelRouting.MEMORY_SUMMARIZATION);
+        } else {
+            System.err.println("Moonshot key missing — Memory summarization will fall back to " + ModelRouting.REFLECTIONS + " on Anthropic.");
+        }
+
         // ── New services ─────────────────────────────────────────────────────
         MoodService moodService = new MoodService(database, config.getZoneId());
         CountdownService countdownService = new CountdownService(database, config.getZoneId());
@@ -55,9 +75,8 @@ public class Main {
         InboxService inboxService = (claudeKey != null && !claudeKey.isBlank())
                 ? new InboxService(claudeKey, config.getBotToken()) : null;
 
-        // Google Tasks & Calendar — need Google auth
+        // Google Tasks — still hand-rolled (SQLite mirror, not migrated to Composio)
         GoogleTasksService googleTasksService = null;
-        GoogleCalendarService googleCalendarService = null;
         if (googleAuthService != null && googleAuthService.isAuthorized()) {
             try {
                 googleTasksService = new GoogleTasksService(googleAuthService);
@@ -65,25 +84,21 @@ public class Main {
             } catch (Exception e) {
                 System.err.println("Google Tasks init failed: " + e.getMessage());
             }
-            try {
-                googleCalendarService = new GoogleCalendarService(googleAuthService, config.getZoneId());
-                System.out.println("Google Calendar (v2) service initialized.");
-            } catch (Exception e) {
-                System.err.println("Google Calendar (v2) init failed: " + e.getMessage());
-            }
         }
 
         // ── Wire services into ClaudeService ─────────────────────────────────
         if (claudeService != null) {
             claudeService.setExtraServices(moodService, countdownService, goalService);
             if (googleTasksService != null) claudeService.setGoogleTasksService(googleTasksService);
+            if (composioService != null) claudeService.setComposioService(composioService);
+            if (kimiService != null) claudeService.setKimiService(kimiService);
         }
 
         // ── Create bot ───────────────────────────────────────────────────────
         TaskBot taskBot = new TaskBot(config, taskService, claudeService, whisperService, notionService, noteService,
                 googleAuthService);
-        taskBot.setExtraServices(googleCalendarService, googleTasksService, journalService,
-                inboxService, moodService, countdownService, goalService);
+        taskBot.setExtraServices(googleTasksService, journalService,
+                inboxService, moodService, countdownService, goalService, composioService);
 
         // ── Scheduler ────────────────────────────────────────────────────────
         SchedulerService schedulerService = new SchedulerService(
@@ -91,10 +106,11 @@ public class Main {
                 config.getZoneId(), config.getMorningSummaryTime(),
                 config.getSchedulerCheckIntervalSeconds(),
                 config.getMorningBriefTime(), config.getMoodCheckinTime(),
+                config.getAuditTimes(), config.getErrLogPath(), database,
                 config.getAllowedUserId()
         );
         schedulerService.setExtraServices(moodService, countdownService, goalService,
-                googleCalendarService, googleTasksService);
+                composioService, googleTasksService);
 
         try (TelegramBotsLongPollingApplication application = new TelegramBotsLongPollingApplication()) {
             application.registerBot(config.getBotToken(), taskBot);

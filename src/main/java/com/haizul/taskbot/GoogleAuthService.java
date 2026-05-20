@@ -24,10 +24,11 @@ import java.util.List;
 public class GoogleAuthService {
 
     private static final String TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
-    // NOTE: OOB redirect is deprecated by Google for new OAuth clients (Jan 2023).
-    // Existing clients still work, but new ones must use a loopback redirect (http://127.0.0.1:PORT).
-    // If Google disables this, switch to a local HTTP server redirect flow.
-    private static final String REDIRECT_URI   = "urn:ietf:wg:oauth:2.0:oob";
+    // OOB (urn:ietf:wg:oauth:2.0:oob) was fully disabled by Google in Oct 2022.
+    // We use the loopback redirect that's registered in credentials.json. The browser
+    // will fail to reach localhost (no server listening), but the code is in the URL bar
+    // for the user to copy back to the bot.
+    private static final String REDIRECT_URI   = "http://localhost";
     private static final List<String> SCOPES = List.of(
             "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/gmail.compose",
@@ -95,7 +96,8 @@ public class GoogleAuthService {
 
     public boolean exchangeCode(String code) {
         try {
-            String body = "code="          + encode(code.trim())
+            String extracted = extractCode(code);
+            String body = "code="          + encode(extracted)
                     + "&client_id="        + encode(clientId)
                     + "&client_secret="    + encode(clientSecret)
                     + "&redirect_uri="     + encode(REDIRECT_URI)
@@ -161,5 +163,17 @@ public class GoogleAuthService {
 
     private static String encode(String s) {
         return URLEncoder.encode(s, StandardCharsets.UTF_8);
+    }
+
+    /** Accept either a raw code or a full URL pasted from the browser address bar. */
+    private static String extractCode(String input) {
+        String s = input == null ? "" : input.trim();
+        int q = s.indexOf("code=");
+        if (q < 0) return s;
+        String tail = s.substring(q + 5);
+        int amp = tail.indexOf('&');
+        String raw = amp < 0 ? tail : tail.substring(0, amp);
+        try { return java.net.URLDecoder.decode(raw, StandardCharsets.UTF_8); }
+        catch (Exception e) { return raw; }
     }
 }
